@@ -1,5 +1,9 @@
 <script setup lang="ts">
 import HomeScreen from '../features/home/HomeScreen.vue';
+import ThemeSelector from './ThemeSelector.vue';
 </script>
 
-<template><HomeScreen /></template>
+<template>
+  <header class="app-toolbar"><ThemeSelector /></header>
+  <HomeScreen />
+</template>

@@ -19,6 +19,10 @@ pnpm package
 
 The initial scaffold exposes a health endpoint and a minimal desktop screen. No model credentials are stored or used yet.
 
+## Release
+
+Push a SemVer tag such as `v0.1.0`. The release workflow validates the tag and uses it as the version of all packaged manifests before Electron Builder creates platform artifacts.
+
 ## Architecture
 
 ```text

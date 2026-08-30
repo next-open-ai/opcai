@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "pnpm --filter @opcai/renderer build && pnpm --filter @opcai/api build",
-    "package": "pnpm build && electron-builder --publish never",
+    "stage": "node scripts/stage.mjs",
+    "package": "pnpm build && pnpm stage && electron-builder --publish never",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -23,8 +24,8 @@
     "appId": "com.opcai.desktop",
     "productName": "OPCAI",
     "directories": { "output": "release" },
-    "files": ["src/main/**", "src/preload/**", "../renderer/dist/**"],
-    "extraResources": [{ "from": "../api/dist", "to": "api" }],
+    "files": ["src/main/**", "src/preload/**", ".stage/renderer/**"],
+    "extraResources": [{ "from": ".stage/api", "to": "api" }],
     "mac": { "target": ["dmg", "zip"], "category": "public.app-category.productivity" },
     "win": { "target": ["nsis", "zip"] },
     "linux": { "target": ["AppImage", "deb"], "category": "Utility" }

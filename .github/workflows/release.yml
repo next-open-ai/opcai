@@ -2,6 +2,7 @@ name: Release desktop app
 
 on:
   push:
+    # 发布仅能由形如 v0.1.0 的 Git tag 触发；普通分支 push 不会打包。
     tags: ['v*']
 
 permissions:
@@ -15,25 +16,47 @@ jobs:
         include:
           - os: macos-14
             artifact: macos-arm64
+            arch: arm64
+            expected_extension: dmg
           - os: windows-latest
             artifact: windows-x64
+            arch: x64
+            expected_extension: exe
           - os: ubuntu-latest
             artifact: linux-x64
+            arch: x64
+            expected_extension: AppImage
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: 10 }
+        with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
+      - name: Enable Corepack (uses packageManager-pinned pnpm)
+        run: corepack enable
+      - name: Verify pnpm version
+        run: pnpm --version
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
       - run: pnpm install --frozen-lockfile
-      - run: pnpm package
+      - name: Sync application version from release tag
+        run: node scripts/sync-version.mjs "${GITHUB_REF_NAME}"
+      - name: Package ${{ matrix.artifact }}
+        run: pnpm package -- --${{ matrix.arch }}
+        env:
+          # Release builds are unsigned until signing secrets are configured.
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify platform artifacts
+        shell: bash
+        run: |
+          find apps/desktop/release -type f -name "*.${{ matrix.expected_extension }}" -print -quit | grep -q .
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: apps/desktop/release/*
+          path: apps/desktop/release/**
           if-no-files-found: error
 
   publish:
@@ -42,7 +65,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: release-assets }
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd release-assets
+          find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > checksums-sha256.txt
       - uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/**
+          files: |
+            release-assets/**
           generate_release_notes: true

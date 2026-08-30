@@ -49,7 +49,12 @@ async function createWindow() {
   });
   const rendererUrl = process.env.OPCAI_RENDERER_URL;
   if (rendererUrl) await mainWindow.loadURL(rendererUrl);
-  else await mainWindow.loadFile(path.resolve(__dirname, '../../../renderer/dist/index.html'));
+  else {
+    const rendererEntry = app.isPackaged
+      ? path.join(app.getAppPath(), '.stage', 'renderer', 'index.html')
+      : path.resolve(__dirname, '../../../renderer/dist/index.html');
+    await mainWindow.loadFile(rendererEntry);
+  }
   mainWindow.once('ready-to-show', () => mainWindow.show());
 }
 
