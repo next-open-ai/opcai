@@ -8,8 +8,8 @@ let apiProcess;
 
 function apiEntry() {
   return app.isPackaged
-    ? path.join(process.resourcesPath, 'api', 'main.js')
-    : path.resolve(__dirname, '../../../api/dist/main.js');
+    ? path.join(process.resourcesPath, 'api', 'main.cjs')
+    : path.resolve(__dirname, '../../../api/dist/main.cjs');
 }
 
 function startApi() {
@@ -18,9 +18,9 @@ function startApi() {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
       OPCAI_API_PORT: String(apiPort),
-      // The API is unpacked under Resources while its production dependencies
-      // remain inside app.asar. This makes Node's resolver explicit.
-      ...(app.isPackaged ? { NODE_PATH: path.join(app.getAppPath(), 'node_modules') } : {}),
+      // The API is unpacked under Resources together with its minimal
+      // production dependency closure, not the desktop workspace node_modules.
+      ...(app.isPackaged ? { NODE_PATH: path.join(process.resourcesPath, 'api', 'node_deps') } : {}),
     },
     stdio: 'inherit',
   });

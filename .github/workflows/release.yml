@@ -18,14 +18,17 @@ jobs:
             artifact: macos-arm64
             arch: arm64
             expected_extension: dmg
+            max_package_mb: 200
           - os: windows-latest
             artifact: windows-x64
             arch: x64
             expected_extension: exe
+            max_package_mb: 220
           - os: ubuntu-latest
             artifact: linux-x64
             arch: x64
             expected_extension: AppImage
+            max_package_mb: 230
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +59,8 @@ jobs:
         shell: bash
         run: |
           find apps/desktop/release -type f -name "*.${{ matrix.expected_extension }}" -print -quit | grep -q .
+      - name: Report and enforce package-size budget
+        run: node scripts/report-package-size.mjs apps/desktop/release ${{ matrix.max_package_mb }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
