@@ -1,0 +1,8 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #eaf0ff; background: #101522; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+.home-screen { min-height: 100vh; display: grid; align-content: center; gap: 1rem; max-width: 720px; padding: 3rem; margin: 0 auto; }
+.eyebrow { margin: 0; color: #89a7ff; font-size: .75rem; font-weight: 700; letter-spacing: .14em; }
+h1 { margin: 0; font-size: clamp(2.25rem, 7vw, 4.5rem); line-height: 1.1; }
+.description { margin: 0; color: #b9c4db; font-size: 1.1rem; line-height: 1.7; }
+.status { width: fit-content; margin: .5rem 0 0; padding: .65rem .9rem; border: 1px solid #2a426f; border-radius: 999px; color: #b9d1ff; background: #182642; }

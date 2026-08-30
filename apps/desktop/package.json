@@ -1,0 +1,32 @@
+{
+  "name": "@opcai/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/main/index.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "pnpm --filter @opcai/renderer build && pnpm --filter @opcai/api build",
+    "package": "pnpm build && electron-builder --publish never",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.0.0",
+    "fastify": "^5.3.0"
+  },
+  "devDependencies": {
+    "electron": "^37.2.4",
+    "electron-builder": "^24.13.3",
+    "electron-builder-squirrel-windows": "^24.13.3",
+    "typescript": "^5.8.3"
+  },
+  "build": {
+    "appId": "com.opcai.desktop",
+    "productName": "OPCAI",
+    "directories": { "output": "release" },
+    "files": ["src/main/**", "src/preload/**", "../renderer/dist/**"],
+    "extraResources": [{ "from": "../api/dist", "to": "api" }],
+    "mac": { "target": ["dmg", "zip"], "category": "public.app-category.productivity" },
+    "win": { "target": ["nsis", "zip"] },
+    "linux": { "target": ["AppImage", "deb"], "category": "Utility" }
+  }
+}
