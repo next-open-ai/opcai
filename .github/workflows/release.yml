@@ -43,7 +43,9 @@ jobs:
           [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
       - run: pnpm install --frozen-lockfile
       - name: Sync application version from release tag
-        run: node scripts/sync-version.mjs "${GITHUB_REF_NAME}"
+        # sync-version.mjs reads GITHUB_REF_NAME itself. Do not use shell interpolation:
+        # Windows runners use PowerShell, while macOS/Linux use Bash.
+        run: node scripts/sync-version.mjs
       - name: Package ${{ matrix.artifact }}
         # 每个 runner 都是目标架构原生环境，因此无需再把参数透传给 pnpm/electron-builder。
         run: pnpm package

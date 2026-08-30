@@ -3,8 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME;
 const dryRun = process.argv.includes('--dry-run');
+const tag = process.argv.slice(2).find((argument) => argument !== '--dry-run') ?? process.env.GITHUB_REF_NAME;
 
 // Accept SemVer release tags such as v0.1.0 and v0.1.0-rc.1.
 const match = typeof tag === 'string'
