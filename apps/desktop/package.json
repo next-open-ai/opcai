@@ -5,7 +5,7 @@
   "main": "src/main/index.cjs",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "build": "pnpm --filter @opcai/renderer build && pnpm --filter @opcai/api build",
+    "build": "pnpm --filter @opcai/contracts build && pnpm --filter @opcai/tools build && pnpm --filter @opcai/storage build && pnpm --filter @opcai/agent-core build && pnpm --filter @opcai/api build && pnpm --filter @opcai/renderer build",
     "stage": "node scripts/stage.mjs",
     "package": "pnpm build && pnpm stage && electron-builder --publish never",
     "typecheck": "tsc -p tsconfig.json --noEmit"

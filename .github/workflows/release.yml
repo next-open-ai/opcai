@@ -45,7 +45,8 @@ jobs:
       - name: Sync application version from release tag
         run: node scripts/sync-version.mjs "${GITHUB_REF_NAME}"
       - name: Package ${{ matrix.artifact }}
-        run: pnpm package -- --${{ matrix.arch }}
+        # 每个 runner 都是目标架构原生环境，因此无需再把参数透传给 pnpm/electron-builder。
+        run: pnpm package
         env:
           # Release builds are unsigned until signing secrets are configured.
           CSC_IDENTITY_AUTO_DISCOVERY: false
