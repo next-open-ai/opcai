@@ -61,10 +61,14 @@ jobs:
           find apps/desktop/release -type f -name "*.${{ matrix.expected_extension }}" -print -quit | grep -q .
       - name: Report and enforce package-size budget
         run: node scripts/report-package-size.mjs apps/desktop/release ${{ matrix.max_package_mb }}
+      - name: Collect final installers only
+        run: node scripts/collect-release-artifacts.mjs apps/desktop/release .release-assets ${{ matrix.expected_extension }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: apps/desktop/release/**
+          # Do not upload mac/win/linux-unpacked directories: they contain the
+          # raw Electron application and are not user-downloadable installers.
+          path: .release-assets/**
           if-no-files-found: error
 
   publish:
@@ -73,13 +77,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: release-assets }
-      - name: Generate SHA-256 checksums
+      - name: Prepare release assets and SHA-256 checksums
         shell: bash
         run: |
-          cd release-assets
-          find . -type f -print0 | sort -z | xargs -0 shasum -a 256 > checksums-sha256.txt
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/**
-          generate_release_notes: true
+          mkdir publish-assets
+          find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' \) -exec cp {} publish-assets/ \;
+          test "$(find publish-assets -type f | wc -l)" -eq 3
+          cd publish-assets
+          shasum -a 256 * > checksums-sha256.txt
+      - name: Create GitHub Release and upload final installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" publish-assets/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" publish-assets/* --generate-notes
+          fi
