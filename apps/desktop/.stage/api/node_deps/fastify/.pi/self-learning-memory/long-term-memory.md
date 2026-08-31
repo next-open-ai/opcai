@@ -1,0 +1,89 @@
+# Long-term Memory
+
+Complete history of durable learnings and recurring mistakes.
+Last updated: 2026-08-18T19:46:43.093Z
+
+## All learnings
+- Closed PR #1 without merging after confirming its head SHA was already the intended private `main` commit.
+- Fetched current `origin/main` and `origin/5.x`, verified each security commit’s parent exactly matched the corresponding remote tip, then used an atomic push.
+- Verified public and private `main`/`5.x` refs matched, fast-forwarded local `main`, deleted temporary security branches, and confirmed a clean synchronized checkout.
+- Obtained explicit approval before public disclosure, then atomically fast-forwarded `origin/main` to `af079bd4` and `origin/5.x` to `8acfea7e`, verifying both refs with `git ls-remote`.
+- Fast-forwarded local `main` to `origin/main` and confirmed a clean synchronized status.
+- Do not retry forbidden workspace GraphQL actions; use permitted repository operations or ask the user for an authorized alternative before attempting comments or metadata changes.
+- Before any security-fix push, explicitly ask whether targets are the private advisory fork, public `origin`, or both; treat a draft advisory as a warning, not implicit authorization policy.
+- Always state push destinations and exact resulting refs, e.g. `advisory-ghsa-3m5p/main` changed while `origin/main` remained at `6e95cb9f`.
+- Run workspace-sensitive PR operations separately: attempt the comment, record an expected permission denial, then independently close only if authorized.
+- Describe PR state from verified fields (`CLOSED`, `mergedAt: null`, head/base OIDs) rather than inferring that it is empty.
+- Keep local security branches until the user confirms the intended public/private publication state; delete them only after final authorization and ref verification.
+- Re-run markdownlint scoped strictly to docs/Reference/Request.md and docs/Reference/Routes.md.
+- Stage only those two paths (git add docs/Reference/Request.md docs/Reference/Routes.md); never git add .
+- Manually awk length>80 on changed files to confirm new lines stay ≤80 before commit.
+- Leave response.md untracked and verify git status/diff --stat before commit and PR.
+- Empirically print encodeURI output/charCodes: '%' → '%25', so static sees '/..%252ftop-secret.txt' (safe 404) not a '..' segment.
+- Reproduce with @fastify/send directly for raw percent, encodeURI(percent), and decoded '../' to map 403 vs 404 to normalize/root logic.
+- Keep reporter response framed as app-level path.join(param) misuse; cite static/sendFile containment and Express parity, not a core CVE.
+- Always log/compare the exact pathname string passed into send(), including after encodeURI
+- When statuses differ for "same" path, diff charCodes for % vs %25 double-encoding first
+- Instrument static handler vs router to separate callNotFound from unmatched routes
+- Trace full pipeline: raw.url → getPathnameForSend → dotDot guards → encodeURI → @fastify/send
+- Reproduce with send(root, p) using both raw and encodeURI(p) before changing triage conclusions
+- Updated `lib/validation.js` to retain and return coerced root values.
+- Added `test/fix-root-primitive-coercion.test.js` to prevent recurrence.
+- Pass parentData and parentDataProperty to Ajv validators so root primitive coercions update the request object.
+- Retain the direct-call path for validators without schemaEnv to avoid changing non-Ajv validator behavior.
+- Add a regression test asserting quoted numeric JSON reaches the handler as number 10.
+- Determine PR from the deployed route’s authentication requirements; use PR:N for unauthenticated endpoints.
+- Base C/I impact on the specific handler and data affected rather than assigning a universal Fastify score.
+- Pass request and parameter metadata as Ajv parentData/parentDataProperty so root coercions update the original request value.
+- Add a regression test asserting quoted numeric JSON becomes a number in the handler while out-of-range values remain rejected.
+- Verify targeted test execution separately from the full suite to avoid mistaking aggregate counts for focused coverage.
+- Honor soft tool-budget and interruption signals immediately; stop browsing and provide a bounded reflection.
+- Run only the single highest-value targeted test before the budget limit, then report if execution is blocked.
+- Reproduce root primitive coercion with the repository’s actual validatorCompiler path rather than relying on Ajv internals alone.
+- Add focused tests covering custom validator compilation, schemaEnv availability, and root primitive coercion.
+- Renamed PR #6833 to `ci: harden CITGM package workflow input handling` using `gh pr edit`, then watched checks until `pull-request-title-check` passed.
+- Pass workflow input through `env.NPM_PACKAGE` and read it from `process.env` inside the script.
+- Validate the package name with an npm package-name regex before using it.
+- Use `encodeURIComponent(packageName)` in the npm registry URL.
+- Check `response.ok` and throw explicit errors for failed registry fetches or unsupported repository URLs.
+
+## All watch-outs
+- Private PR #1 remained open after its head commit had already been placed on private `main`; its mergeability was `UNKNOWN` and it was no longer the correct landing path.
+- Local `main` and temporary security branches were left out of sync after updating the remote branches.
+- Direct public branch updates bypassed the repository’s pull-request-only rules, so ancestry and target refs required explicit validation to avoid unsafe rewrites.
+- Initially pushed the security fix only to the private advisory fork, leaving `origin/main` and `origin/5.x` unchanged without first confirming the intended publication target.
+- After pushing remote refs, local `main` remained one commit behind, creating temporary local/remote inconsistency.
+- A GraphQL `addComment` action was attempted despite workspace-repository restrictions; the denial indicates an intentional permission boundary that should not be bypassed.
+- Assumed the draft advisory meant `origin/main` and `origin/5.x` must remain untouched without first confirming whether the user expected public pushes.
+- Reported that the private branches were complete without clearly distinguishing advisory-fork refs from public `origin` refs, prompting the user to stop and verify deployment status.
+- Combined PR closing with an unsupported workspace-repository comment under `set -e`, causing the entire command to fail before the close could occur.
+- Called the PR “now-empty” even though GitHub still reported it as mergeable with different head and base OIDs.
+- Deleted local security branches before resolving whether the user wanted the commits pushed to public branches, reducing convenient recovery points.
+- Markdown lint invoked in a way that flooded output with unrelated files (AGENTS.md, .pi memory, response.md) instead of only the two edited docs.
+- Untracked response.md sat in the working tree and could have been staged if git add was too broad.
+- Relied on noisy repo-wide lint signal before confirming MD013 on the actual changed regions.
+- Assumed encodeURI leaves '%' intact on paths like '/..%2ftop-secret.txt', so static 404 vs raw '..' 403 looked inconsistent.
+- Treated encoded traversal and decoded param sinks as the same layer before separating find-my-way dual-decode from @fastify/send root checks.
+- Relied on log/message shape alone (callNotFound 'Route ... not found') to infer static failure mode without probing @fastify/send inputs.
+- Assumed /static/..%2f… 404 meant getPathnameForSend/route miss instead of later send pipeline behavior
+- Did not check that encodeURI() re-encodes residual % as %25 before blaming path guards
+- Conflated reply.callNotFound() JSON ("Route GET:… not found") with an actual find-my-way miss
+- Debugged isolated getPathnameForSend reimplementation before tracing pumpSendToReply → encodeURI(pathnameForSend) → @fastify/send
+- Compared send() on decoded ../ paths (403) to static outcomes without using the exact post-encodeURI string static passes
+- Validation coerced a root primitive but failed to preserve the coerced value for the caller.
+- The regression scenario was not covered by existing tests.
+- Ajv was called with a primitive root value without parentData context, so coerced values were not written back to request.body.
+- The regression scenario was initially vulnerable because the handler received string "10" after validation accepted it.
+- The CVSS rating assumed PR:L without repository evidence that authentication is required; many affected routes may be unauthenticated.
+- The impact rating was stated as application-dependent without defining the affected endpoint’s actual confidentiality and integrity consequences.
+- Root primitive request values were validated without a parent reference, so Ajv coercion changed only its local value and left request.body as a string.
+- Test command output was misread: Borp ran the broader suite despite a specific file argument, making targeted coverage unclear.
+- Continued initiating tool work after the tool-budget warning instead of stopping to assess the existing evidence.
+- Started a test command that was aborted, leaving the primitive-coercion fix unverified.
+- Investigated Ajv internals and custom compiler compatibility without first isolating the exact failing repository behavior.
+- Did not establish regression coverage for missing schemaEnv handling and root primitive coercion before changing direction.
+- PR title did not satisfy the repository's conventional title check before opening/updating the PR.
+- Interpolated `${{ inputs.package }}` directly into `actions/github-script` JavaScript, allowing malformed input to break or inject code.
+- Fetched npm metadata with the raw package name instead of URL-encoding it.
+- Assumed `data.repository.url` always existed and was a GitHub `.git` URL.
+- Used a brittle repository URL regex that missed scoped/modern GitHub URL formats and failed without a clear error.

@@ -6,7 +6,7 @@ import path from 'node:path';
 const desktopRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const appsRoot = path.resolve(desktopRoot, '..');
 const projectRoot = path.resolve(appsRoot, '..');
-const stageRoot = path.join(desktopRoot, '.stage');
+const stageRoot = path.join(desktopRoot, 'stage');
 const sources = [
   { from: path.join(appsRoot, 'renderer', 'dist'), to: path.join(stageRoot, 'renderer') },
   { from: path.join(appsRoot, 'api', 'dist'), to: path.join(stageRoot, 'api') },

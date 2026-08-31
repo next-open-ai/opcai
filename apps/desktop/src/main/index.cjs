@@ -47,11 +47,17 @@ async function createWindow() {
     show: false,
     webPreferences: { preload: path.join(__dirname, '../preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
+  mainWindow.webContents.on('did-fail-load', (_event, code, description, validatedUrl) => {
+    console.error(`[renderer] failed to load (${code}): ${description} (${validatedUrl})`);
+  });
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) console.error(`[renderer] ${sourceId}:${line} ${message}`);
+  });
   const rendererUrl = process.env.OPCAI_RENDERER_URL;
   if (rendererUrl) await mainWindow.loadURL(rendererUrl);
   else {
     const rendererEntry = app.isPackaged
-      ? path.join(app.getAppPath(), '.stage', 'renderer', 'index.html')
+      ? path.join(app.getAppPath(), 'stage', 'renderer', 'index.html')
       : path.resolve(__dirname, '../../../renderer/dist/index.html');
     await mainWindow.loadFile(rendererEntry);
   }

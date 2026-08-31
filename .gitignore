@@ -2,7 +2,7 @@ node_modules/
 dist/
 .vite/
 release/
-.stage/
+stage/
 *.log
 *.tsbuildinfo
 .DS_Store
