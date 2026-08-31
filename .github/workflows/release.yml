@@ -92,6 +92,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # The publish job only downloads artifacts and does not checkout the
+          # repository, so gh cannot infer a remote from .git.
+          GH_REPO: ${{ github.repository }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" publish-assets/* --clobber
