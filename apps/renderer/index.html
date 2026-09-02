@@ -4,10 +4,10 @@
     <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>OPCAI</title>
     <script>
       (() => {
-        const preference = localStorage.getItem('opcai.theme-preference') || 'system';
-        const theme = preference === 'system' ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : preference;
+        const theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
         document.documentElement.dataset.theme = theme;
-        document.documentElement.style.colorScheme = theme;
+        document.documentElement.style.colorScheme = ['dark', 'midnight', 'aurora'].includes(theme) ? 'dark' : 'light';
+        document.documentElement.lang = 'zh-CN';
       })();
     </script>
   </head>

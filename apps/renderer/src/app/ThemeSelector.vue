@@ -6,6 +6,8 @@ const labels: Record<ThemePreference, string> = {
   system: '跟随系统',
   light: '浅色',
   dark: '深色',
+  midnight: '午夜霓虹',
+  aurora: '极光玻璃',
 };
 </script>
 

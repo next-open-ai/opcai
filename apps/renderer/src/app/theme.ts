@@ -1,17 +1,33 @@
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, ref } from 'vue';
+import { readStored, writeStored } from './storage.js';
 
-export const themeOptions = ['system', 'light', 'dark'] as const;
+export const themeOptions = ['system', 'light', 'dark', 'midnight', 'aurora'] as const;
 export type ThemePreference = (typeof themeOptions)[number];
 type ResolvedTheme = Exclude<ThemePreference, 'system'>;
+
+/** Sidebar quick-switch glyphs (one per preference). */
+export const themeIconNames = {
+  system: 'theme-system',
+  light: 'theme-light',
+  dark: 'theme-dark',
+  midnight: 'theme-midnight',
+  aurora: 'theme-aurora',
+} as const satisfies Record<ThemePreference, string>;
+
+/** @deprecated Use themeIconNames with SidebarIcon */
+export const themeIcons: Record<ThemePreference, string> = {
+  system: '◐',
+  light: '○',
+  dark: '●',
+  midnight: '✦',
+  aurora: '◈',
+};
 
 const storageKey = 'opcai.theme-preference';
 const preference = ref<ThemePreference>(readPreference());
 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
-function readPreference(): ThemePreference {
-  const saved = window.localStorage.getItem(storageKey);
-  return themeOptions.includes(saved as ThemePreference) ? (saved as ThemePreference) : 'system';
-}
+function readPreference(): ThemePreference { return 'system'; }
 
 function resolveTheme(value: ThemePreference): ResolvedTheme {
   return value === 'system' ? (mediaQuery.matches ? 'dark' : 'light') : value;
@@ -20,7 +36,7 @@ function resolveTheme(value: ThemePreference): ResolvedTheme {
 function applyTheme(value: ThemePreference) {
   const resolved = resolveTheme(value);
   document.documentElement.dataset.theme = resolved;
-  document.documentElement.style.colorScheme = resolved;
+  document.documentElement.style.colorScheme = ['dark', 'midnight', 'aurora'].includes(resolved) ? 'dark' : 'light';
 }
 
 applyTheme(preference.value);
@@ -31,16 +47,20 @@ export function useTheme() {
 
   const setTheme = (value: ThemePreference) => {
     preference.value = value;
-    window.localStorage.setItem(storageKey, value);
+    void writeStored(storageKey, value);
     applyTheme(value);
   };
 
-  const onSystemThemeChange = () => {
-    if (preference.value === 'system') applyTheme('system');
+  const loadTheme = async () => { const saved = await readStored(storageKey); if (themeOptions.includes(saved as ThemePreference)) setTheme(saved as ThemePreference); };
+
+  const cycleTheme = () => {
+    const index = themeOptions.indexOf(preference.value);
+    setTheme(themeOptions[(index + 1) % themeOptions.length]);
   };
 
-  mediaQuery.addEventListener('change', onSystemThemeChange);
-  onBeforeUnmount(() => mediaQuery.removeEventListener('change', onSystemThemeChange));
-
-  return { preference, resolvedTheme, setTheme };
+  return { preference, resolvedTheme, setTheme, loadTheme, cycleTheme };
 }
+
+mediaQuery.addEventListener('change', () => {
+  if (preference.value === 'system') applyTheme('system');
+});

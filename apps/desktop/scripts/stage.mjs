@@ -10,6 +10,7 @@ const stageRoot = path.join(desktopRoot, 'stage');
 const sources = [
   { from: path.join(appsRoot, 'renderer', 'dist'), to: path.join(stageRoot, 'renderer') },
   { from: path.join(appsRoot, 'api', 'dist'), to: path.join(stageRoot, 'api') },
+  { from: path.dirname(createRequire(path.join(desktopRoot, 'package.json')).resolve('sql.js/dist/sql-wasm.js')), to: path.join(stageRoot, 'sqljs') },
 ];
 
 rmSync(stageRoot, { recursive: true, force: true });

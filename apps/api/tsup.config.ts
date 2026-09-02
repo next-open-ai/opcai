@@ -8,5 +8,5 @@ export default defineConfig({
   outDir: 'dist',
   clean: true,
   // Contracts are part of the API's executable boundary, not a separate runtime package.
-  noExternal: ['@opcai/contracts'],
+  noExternal: ['@opcai/contracts', '@opcai/agent-core', '@opcai/tools'],
 });

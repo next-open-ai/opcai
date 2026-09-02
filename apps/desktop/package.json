@@ -20,15 +20,41 @@
   "build": {
     "appId": "com.opcai.desktop",
     "productName": "OPCAI",
-    "directories": { "output": "release" },
-    "files": ["src/main/**", "src/preload/**", "stage/renderer/**"],
-    "extraResources": [{ "from": "stage/api", "to": "api" }],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/main/**",
+      "src/preload/**",
+      "stage/renderer/**",
+      "stage/sqljs/**"
+    ],
+    "extraResources": [
+      {
+        "from": "stage/api",
+        "to": "api"
+      }
+    ],
     "asar": true,
-    "mac": { "target": ["dmg"], "category": "public.app-category.productivity" },
-    "win": { "target": ["nsis"] },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
     "linux": {
-      "target": ["AppImage"],
+      "target": [
+        "AppImage"
+      ],
       "category": "Utility"
     }
+  },
+  "dependencies": {
+    "sql.js": "^1.14.2"
   }
 }
