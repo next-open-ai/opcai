@@ -18,9 +18,11 @@
     "@ai-sdk/google": "^3.0.119",
     "@ai-sdk/mcp": "^2.0.41",
     "@ai-sdk/openai": "^3.0.105",
+    "@lancedb/lancedb": "0.22.3",
     "@opcai/contracts": "workspace:*",
     "@opcai/tools": "workspace:*",
     "ai": "^7.0.85",
+    "apache-arrow": "18.1.0",
     "zod": "^3.24.4"
   }
 }

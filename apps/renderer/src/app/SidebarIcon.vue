@@ -4,6 +4,7 @@ defineProps<{
     | 'chat'
     | 'employees'
     | 'capabilities'
+    | 'knowledge'
     | 'automations'
     | 'assets'
     | 'projects'
@@ -34,6 +35,11 @@ defineProps<{
     <template v-else-if="name === 'capabilities'">
       <path d="M12 3 4 7v6l8 4 8-4V7l-8-4Z" />
       <path d="m4 7 8 4 8-4M12 11v10" />
+    </template>
+    <template v-else-if="name === 'knowledge'">
+      <path d="M5 5.5h6.5A2.5 2.5 0 0 1 14 8v11.5H7.5A2.5 2.5 0 0 1 5 17V5.5Z" />
+      <path d="M19 5.5h-6.5A2.5 2.5 0 0 0 10 8v11.5H16.5A2.5 2.5 0 0 0 19 17V5.5Z" />
+      <path d="M8 9h3.2M8 12h3.2M13.8 9H17M13.8 12H17" />
     </template>
     <template v-else-if="name === 'automations'">
       <circle cx="12" cy="12" r="8.25" />

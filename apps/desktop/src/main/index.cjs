@@ -1,9 +1,24 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, screen, protocol, net } = require('electron');
 const { fork, execFile } = require('node:child_process');
 const { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require('node:fs');
 const { createHash, randomUUID } = require('node:crypto');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'opcai-preview',
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      bypassCSP: true,
+      corsEnabled: true,
+      stream: true,
+    },
+  },
+]);
 
 const apiPort = Number(process.env.OPCAI_API_PORT || 4318);
 let mainWindow;
@@ -11,6 +26,8 @@ let apiProcess;
 let database;
 const storageRoot = () => path.join(app.getPath('home'), '.opcai');
 const databaseFile = () => path.join(storageRoot(), 'opcai.sqlite');
+/** @type {Map<string, string>} */
+const previewRoots = new Map();
 
 async function initializeDatabase() {
   mkdirSync(storageRoot(), { recursive: true, mode: 0o700 });
@@ -21,7 +38,22 @@ async function initializeDatabase() {
   database.run('CREATE TABLE IF NOT EXISTS app_kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL)');
   database.run('CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, relative_path TEXT NOT NULL, mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL, conversation_id TEXT, employee_id TEXT, run_id TEXT NOT NULL, sha256 TEXT NOT NULL)');
   database.run('CREATE INDEX IF NOT EXISTS assets_created_at ON assets(created_at DESC)');
+  migrateAssetsSchema();
   flushDatabase();
+}
+
+function assetColumnNames() {
+  const info = database.exec('PRAGMA table_info(assets)');
+  return new Set((info[0]?.values || []).map((row) => String(row[1])));
+}
+
+function migrateAssetsSchema() {
+  const cols = assetColumnNames();
+  if (!cols.has('project_id')) database.run('ALTER TABLE assets ADD COLUMN project_id TEXT');
+  if (!cols.has('workspace_relative')) database.run('ALTER TABLE assets ADD COLUMN workspace_relative TEXT');
+  database.run('CREATE INDEX IF NOT EXISTS assets_project_id ON assets(project_id)');
+  // Backfill workspace_relative from basename for legacy rows.
+  database.run(`UPDATE assets SET workspace_relative = name WHERE workspace_relative IS NULL OR workspace_relative = ''`);
 }
 
 function flushDatabase() { writeFileSync(databaseFile(), Buffer.from(database.export()), { mode: 0o600 }); }
@@ -30,10 +62,28 @@ function setStoredValue(key, value) { database.run('INSERT INTO app_kv (key, val
 
 function assetMimeType(name) {
   const extension = path.extname(name).toLowerCase();
-  return ({ '.pdf': 'application/pdf', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.csv': 'text/csv', '.json': 'application/json', '.txt': 'text/plain', '.md': 'text/markdown', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.zip': 'application/zip' })[extension] || 'application/octet-stream';
+  return ({ '.pdf': 'application/pdf', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.csv': 'text/csv', '.json': 'application/json', '.txt': 'text/plain', '.md': 'text/markdown', '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml', '.zip': 'application/zip' })[extension] || 'application/octet-stream';
 }
-function assetRows(result) { return (result[0]?.values || []).map(([id, name, relativePath, mimeType, sizeBytes, createdAt, conversationId, employeeId, runId, sha256]) => ({ id, name, relativePath, mimeType, sizeBytes, createdAt, conversationId, employeeId, runId, sha256 })); }
-function listAssets() { return assetRows(database.exec('SELECT id, name, relative_path, mime_type, size_bytes, created_at, conversation_id, employee_id, run_id, sha256 FROM assets ORDER BY created_at DESC')); }
+function mapAssetRow(row) {
+  const [id, name, relativePath, mimeType, sizeBytes, createdAt, conversationId, employeeId, runId, sha256, projectId, workspaceRelative] = row;
+  return {
+    id,
+    name,
+    relativePath,
+    mimeType,
+    sizeBytes,
+    createdAt,
+    conversationId,
+    employeeId,
+    runId,
+    sha256,
+    projectId: projectId || null,
+    workspaceRelative: workspaceRelative || name || null,
+  };
+}
+function assetRows(result) { return (result[0]?.values || []).map((row) => mapAssetRow(row)); }
+const ASSET_SELECT = 'SELECT id, name, relative_path, mime_type, size_bytes, created_at, conversation_id, employee_id, run_id, sha256, project_id, workspace_relative FROM assets';
+function listAssets() { return assetRows(database.exec(`${ASSET_SELECT} ORDER BY created_at DESC`)); }
 function archiveArtifact(value) {
   const runId = String(value?.runId || '');
   const relativePath = String(value?.relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
@@ -41,10 +91,10 @@ function archiveArtifact(value) {
   const workspaceRoot = path.resolve(storageRoot(), 'workspaces', runId);
   const source = path.resolve(workspaceRoot, relativePath);
   if (!source.startsWith(`${workspaceRoot}${path.sep}`) || !existsSync(source) || !statSync(source).isFile()) throw new Error('Generated artifact is no longer available.');
+  const name = path.basename(source);
   const sizeBytes = statSync(source).size;
   if (sizeBytes > 100 * 1024 * 1024) throw new Error('Generated artifact exceeds the 100 MB asset limit.');
   const id = randomUUID();
-  const name = path.basename(source);
   const targetFolder = path.join(storageRoot(), 'assets', id);
   mkdirSync(targetFolder, { recursive: true, mode: 0o700 });
   const target = path.join(targetFolder, name);
@@ -52,16 +102,64 @@ function archiveArtifact(value) {
   const sha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
   const relativeAssetPath = path.relative(storageRoot(), target).split(path.sep).join('/');
   const createdAt = Date.now();
-  database.run('INSERT INTO assets (id, name, relative_path, mime_type, size_bytes, created_at, conversation_id, employee_id, run_id, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, relativeAssetPath, assetMimeType(name), sizeBytes, createdAt, String(value?.conversationId || '') || null, String(value?.employeeId || '') || null, runId, sha256]);
+  const projectId = String(value?.projectId || '').trim() || null;
+  const workspaceRelative = relativePath;
+  const conversationId = String(value?.conversationId || '') || null;
+  const employeeId = String(value?.employeeId || '') || null;
+  database.run(
+    'INSERT INTO assets (id, name, relative_path, mime_type, size_bytes, created_at, conversation_id, employee_id, run_id, sha256, project_id, workspace_relative) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, name, relativeAssetPath, assetMimeType(name), sizeBytes, createdAt, conversationId, employeeId, runId, sha256, projectId, workspaceRelative],
+  );
   flushDatabase();
-  return { id, name, relativePath: relativeAssetPath, mimeType: assetMimeType(name), sizeBytes, createdAt, conversationId: String(value?.conversationId || '') || null, employeeId: String(value?.employeeId || '') || null, runId, sha256 };
+  return { id, name, relativePath: relativeAssetPath, mimeType: assetMimeType(name), sizeBytes, createdAt, conversationId, employeeId, runId, sha256, projectId, workspaceRelative };
 }
 function assetFile(assetId) {
-  const row = assetRows(database.exec('SELECT id, name, relative_path, mime_type, size_bytes, created_at, conversation_id, employee_id, run_id, sha256 FROM assets WHERE id = ?', [String(assetId)]))[0];
+  const row = assetRows(database.exec(`${ASSET_SELECT} WHERE id = ?`, [String(assetId)]))[0];
   if (!row) throw new Error('Asset not found.');
   const target = path.resolve(storageRoot(), row.relativePath);
   if (!target.startsWith(`${path.resolve(storageRoot(), 'assets')}${path.sep}`) || !existsSync(target)) throw new Error('Asset file is unavailable.');
   return { row, target };
+}
+
+function linkAssetsToProject(value) {
+  const projectId = String(value?.projectId || '').trim();
+  const assetIds = Array.isArray(value?.assetIds) ? value.assetIds.map((id) => String(id || '')).filter(Boolean) : [];
+  if (!projectId) throw new Error('projectId is required.');
+  if (!assetIds.length) return { updated: 0, copied: 0 };
+  let updated = 0;
+  for (const assetId of assetIds) {
+    database.run('UPDATE assets SET project_id = ? WHERE id = ?', [projectId, assetId]);
+    updated += 1;
+  }
+  flushDatabase();
+  let copied = 0;
+  const workspacePath = String(value?.workspacePath || '').trim();
+  if (workspacePath) {
+    const root = projectRoot(workspacePath);
+    for (const assetId of assetIds) {
+      try {
+        const { row, target: source } = assetFile(assetId);
+        const relative = String(row.workspaceRelative || row.name).replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!relative || relative.split('/').some((part) => !part || part === '.' || part === '..')) continue;
+        const dest = projectPath(root, relative);
+        mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+        copyFileSync(source, dest, 0);
+        copied += 1;
+      } catch (_) { /* Keep linking even if one file copy fails. */ }
+    }
+  }
+  return { updated, copied, projectId };
+}
+
+function unlinkAssetsFromProject(assetIds) {
+  const ids = Array.isArray(assetIds) ? assetIds.map((id) => String(id || '')).filter(Boolean) : [];
+  let updated = 0;
+  for (const assetId of ids) {
+    database.run('UPDATE assets SET project_id = NULL WHERE id = ?', [assetId]);
+    updated += 1;
+  }
+  flushDatabase();
+  return { updated };
 }
 
 function safeProjectFolderName(value) { return String(value || '').trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff-]+/gi, '-').replace(/(^-|-$)/g, '').slice(0, 64) || 'project'; }
@@ -105,23 +203,92 @@ function syncRunWorkspaceToProject(root, runId) {
   return listProjectFiles(target);
 }
 function materializeProjectAssets(root, assetIds) {
-  const target = projectRoot(root);
+  const targetRoot = projectRoot(root);
   const ids = Array.isArray(assetIds) ? assetIds.map((id) => String(id || '')).filter(Boolean) : [];
   for (const assetId of ids) {
     try {
       const { row, target: source } = assetFile(assetId);
-      let name = row.name;
-      let dest = path.join(target, name);
-      if (existsSync(dest)) {
-        const ext = path.extname(name);
-        const stem = path.basename(name, ext);
-        name = `${stem}-${assetId.slice(0, 8)}${ext}`;
-        dest = path.join(target, name);
-      }
+      const relative = String(row.workspaceRelative || row.name).replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!relative || relative.split('/').some((part) => !part || part === '.' || part === '..')) continue;
+      const dest = projectPath(targetRoot, relative);
+      mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
       copyFileSync(source, dest, 0);
     } catch (_) { /* Skip missing assets so one failure does not block the tree. */ }
   }
   return listProjectFiles(root);
+}
+
+function registerPreviewRoot(root) {
+  const resolved = projectRoot(root);
+  for (const [token, existing] of previewRoots.entries()) {
+    if (existing === resolved) return { token, origin: `opcai-preview://${token}` };
+  }
+  const token = randomUUID().replace(/-/g, '').slice(0, 16);
+  previewRoots.set(token, resolved);
+  return { token, origin: `opcai-preview://${token}` };
+}
+
+function revealProjectFile(root, relative) {
+  const file = projectPath(root, relative);
+  if (!existsSync(file)) throw new Error('Project file is unavailable.');
+  shell.showItemInFolder(file);
+  return true;
+}
+
+function previewBinaryLimit(name) {
+  if (/\.pdf$/i.test(name)) return 40 * 1024 * 1024;
+  return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(name) ? 12 * 1024 * 1024 : 2 * 1024 * 1024;
+}
+
+function readProjectPreview(root, relative) {
+  const file = projectPath(root, relative);
+  if (!existsSync(file) || !statSync(file).isFile()) throw new Error('Project file is unavailable.');
+  const name = path.basename(file);
+  const size = statSync(file).size;
+  if (size > previewBinaryLimit(name)) throw new Error('File is too large to preview.');
+  const textLike = /\.(md|markdown|txt|html?|css|js|mjs|cjs|ts|tsx|jsx|json|ya?ml|xml|svg|csv)$/i.test(name);
+  if (textLike) {
+    return { kind: 'text', name, relative: safePreviewRelative(relative), content: readFileSync(file, 'utf8'), bytes: size };
+  }
+  return { kind: 'binary', name, relative: safePreviewRelative(relative), base64: readFileSync(file).toString('base64'), bytes: size };
+}
+
+function safePreviewRelative(relative) {
+  return String(relative || '').replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function readAssetPreview(assetId) {
+  const { row, target } = assetFile(assetId);
+  const size = statSync(target).size;
+  if (size > previewBinaryLimit(row.name)) throw new Error('File is too large to preview.');
+  const textLike = /\.(md|markdown|txt|html?|css|js|mjs|cjs|ts|tsx|jsx|json|ya?ml|xml|svg|csv)$/i.test(row.name);
+  if (textLike) {
+    return { kind: 'text', name: row.name, mimeType: row.mimeType, content: readFileSync(target, 'utf8'), bytes: size };
+  }
+  return { kind: 'binary', name: row.name, mimeType: row.mimeType, base64: readFileSync(target).toString('base64'), bytes: size };
+}
+
+function registerAssetPreviewRoot(assetId) {
+  const { target } = assetFile(assetId);
+  return registerPreviewRoot(path.dirname(target));
+}
+
+/** Open a local file with the OS default app (no temp HTTP server). */
+async function openAbsolutePathInBrowser(absolutePath) {
+  const file = path.resolve(String(absolutePath || ''));
+  if (!existsSync(file) || !statSync(file).isFile()) throw new Error('File is unavailable.');
+  const error = await shell.openPath(file);
+  if (error) throw new Error(error);
+  return { ok: true, url: pathToFileURL(file).href };
+}
+
+function openAssetInBrowser(assetId) {
+  const { target } = assetFile(assetId);
+  return openAbsolutePathInBrowser(target);
+}
+
+function openProjectFileInBrowser(root, relative) {
+  return openAbsolutePathInBrowser(projectPath(root, relative));
 }
 
 function readModelConfig() {
@@ -129,17 +296,199 @@ function readModelConfig() {
     const stored = getStoredValue('model-settings');
     if (!stored) return {};
     const config = JSON.parse(stored);
-    if (Array.isArray(config.providers)) config.providers = config.providers.map((provider) => ({ ...provider, apiKey: provider.apiKey && safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(Buffer.from(provider.apiKey, 'base64')) : provider.apiKey || '' }));
-    else if (config.apiKey && safeStorage.isEncryptionAvailable()) config.apiKey = safeStorage.decryptString(Buffer.from(config.apiKey, 'base64'));
+    if (Array.isArray(config.providerInstances)) {
+      config.providerInstances = config.providerInstances.map((provider) => ({
+        ...provider,
+        apiKey: provider.apiKey && safeStorage.isEncryptionAvailable()
+          ? safeStorage.decryptString(Buffer.from(provider.apiKey, 'base64'))
+          : provider.apiKey || '',
+      }));
+      return config;
+    }
+    if (Array.isArray(config.providers)) {
+      config.providers = config.providers.map((provider) => ({
+        ...provider,
+        apiKey: provider.apiKey && safeStorage.isEncryptionAvailable()
+          ? safeStorage.decryptString(Buffer.from(provider.apiKey, 'base64'))
+          : provider.apiKey || '',
+      }));
+    } else if (config.apiKey && safeStorage.isEncryptionAvailable()) {
+      config.apiKey = safeStorage.decryptString(Buffer.from(config.apiKey, 'base64'));
+    }
     return config;
   } catch (_) { return {}; }
 }
 
 function writeModelConfig(value) {
-  const config = { activeProvider: String(value?.activeProvider || 'openai'), providers: Array.isArray(value?.providers) ? value.providers.map((provider) => ({ provider: String(provider.provider || ''), baseUrl: String(provider.baseUrl || ''), chatModel: String(provider.chatModel || ''), chatModels: Array.isArray(provider.chatModels) ? provider.chatModels.map((item) => String(item)) : [], imageModel: String(provider.imageModel || ''), embeddingModel: String(provider.embeddingModel || ''), asrModel: String(provider.asrModel || ''), ttsModel: String(provider.ttsModel || ''), apiKey: String(provider.apiKey || '') })) : [] };
-  const persisted = { ...config, providers: config.providers.map((provider) => ({ ...provider, apiKey: provider.apiKey && safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(provider.apiKey).toString('base64') : provider.apiKey })) };
+  if (Number(value?.version) === 2 || Array.isArray(value?.providerInstances)) {
+    const config = {
+      version: 2,
+      providerInstances: Array.isArray(value?.providerInstances)
+        ? value.providerInstances.map((provider) => ({
+            id: String(provider.id || ''),
+            type: String(provider.type || ''),
+            name: String(provider.name || ''),
+            baseUrl: String(provider.baseUrl || ''),
+            apiKey: String(provider.apiKey || ''),
+            disableThinking: Boolean(provider.disableThinking),
+          }))
+        : [],
+      models: Array.isArray(value?.models)
+        ? value.models.map((model) => ({
+            id: String(model.id || ''),
+            providerInstanceId: String(model.providerInstanceId || ''),
+            capability: String(model.capability || 'chat'),
+            modelId: String(model.modelId || ''),
+            label: model.label ? String(model.label) : undefined,
+            supportsBuiltinWebSearch: Boolean(model.supportsBuiltinWebSearch) || undefined,
+          }))
+        : [],
+      activeChatModelId: value?.activeChatModelId ? String(value.activeChatModelId) : null,
+      employeeDefaultModelIds: value?.employeeDefaultModelIds && typeof value.employeeDefaultModelIds === 'object'
+        ? Object.fromEntries(Object.entries(value.employeeDefaultModelIds).map(([key, modelId]) => [String(key), String(modelId)]))
+        : {},
+    };
+    const persisted = {
+      ...config,
+      providerInstances: config.providerInstances.map((provider) => ({
+        ...provider,
+        apiKey: provider.apiKey && safeStorage.isEncryptionAvailable()
+          ? safeStorage.encryptString(provider.apiKey).toString('base64')
+          : provider.apiKey,
+      })),
+    };
+    setStoredValue('model-settings', JSON.stringify(persisted));
+    return config;
+  }
+  const config = {
+    activeProvider: String(value?.activeProvider || 'openai'),
+    providers: Array.isArray(value?.providers)
+      ? value.providers.map((provider) => ({
+          provider: String(provider.provider || ''),
+          baseUrl: String(provider.baseUrl || ''),
+          chatModel: String(provider.chatModel || ''),
+          chatModels: Array.isArray(provider.chatModels) ? provider.chatModels.map((item) => String(item)) : [],
+          disableThinking: Boolean(provider.disableThinking),
+          imageModel: String(provider.imageModel || ''),
+          embeddingModel: String(provider.embeddingModel || ''),
+          asrModel: String(provider.asrModel || ''),
+          ttsModel: String(provider.ttsModel || ''),
+          apiKey: String(provider.apiKey || ''),
+        }))
+      : [],
+  };
+  const persisted = {
+    ...config,
+    providers: config.providers.map((provider) => ({
+      ...provider,
+      apiKey: provider.apiKey && safeStorage.isEncryptionAvailable()
+        ? safeStorage.encryptString(provider.apiKey).toString('base64')
+        : provider.apiKey,
+    })),
+  };
   setStoredValue('model-settings', JSON.stringify(persisted));
   return config;
+}
+
+function readSearchConfig() {
+  try {
+    const stored = getStoredValue('search-settings'); if (!stored) return {};
+    const config = JSON.parse(stored);
+    config.providers = Array.isArray(config.providers) ? config.providers.map((provider) => ({ ...provider, apiKey: provider.apiKey && safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(Buffer.from(provider.apiKey, 'base64')) : provider.apiKey || '' })) : [];
+    return config;
+  } catch (_) { return {}; }
+}
+function writeSearchConfig(value) {
+  const allowed = new Set(['bocha', 'tavily', 'brave', 'exa', 'zhipu', 'aliyun']);
+  const config = { version: 1, defaultProvider: allowed.has(String(value?.defaultProvider)) ? String(value.defaultProvider) : 'auto', providers: Array.isArray(value?.providers) ? value.providers.filter((provider) => allowed.has(String(provider?.id))).map((provider) => ({ id: String(provider.id), label: String(provider.label || provider.id), apiKey: String(provider.apiKey || ''), baseUrl: String(provider.baseUrl || ''), enabled: Boolean(provider.enabled) })) : [] };
+  const persisted = { ...config, providers: config.providers.map((provider) => ({ ...provider, apiKey: provider.apiKey && safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(provider.apiKey).toString('base64') : provider.apiKey })) };
+  setStoredValue('search-settings', JSON.stringify(persisted)); return config;
+}
+
+async function testProviderConnection(value) {
+  const type = String(value?.type || '');
+  const baseUrl = String(value?.baseUrl || '').trim();
+  const apiKey = String(value?.apiKey || '').trim();
+  if (type === 'ollama') {
+    const root = (baseUrl || 'http://127.0.0.1:11434/v1').replace(/\/v1\/?$/, '');
+    const response = await fetch(`${root}/api/tags`, { signal: AbortSignal.timeout(8000) });
+    if (!response.ok) throw new Error(`Ollama 返回 ${response.status}`);
+    const payload = await response.json();
+    const count = Array.isArray(payload.models) ? payload.models.length : 0;
+    return { ok: true, message: `已连接 Ollama，发现 ${count} 个本地模型。` };
+  }
+  if (type === 'anthropic') {
+    if (!apiKey) throw new Error('请填写 API Key');
+    const root = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+    const response = await fetch(`${root}/v1/models`, {
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!response.ok) throw new Error(`Anthropic 返回 ${response.status}`);
+    return { ok: true, message: 'Anthropic 连接成功。' };
+  }
+  if (type === 'google') {
+    if (!apiKey) throw new Error('请填写 API Key');
+    const root = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/$/, '');
+    const response = await fetch(`${root}/models?key=${encodeURIComponent(apiKey)}`, { signal: AbortSignal.timeout(12000) });
+    if (!response.ok) throw new Error(`Google 返回 ${response.status}`);
+    return { ok: true, message: 'Google 连接成功。' };
+  }
+  // OpenAI-compatible: openai / deepseek / qwen / openai-compatible
+  if (!baseUrl) throw new Error('请填写 API 地址');
+  if (type !== 'ollama' && !apiKey) throw new Error('请填写 API Key');
+  const root = baseUrl.replace(/\/$/, '');
+  const response = await fetch(`${root}/models`, {
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!response.ok) throw new Error(`接口返回 ${response.status}`);
+  const payload = await response.json();
+  const count = Array.isArray(payload?.data) ? payload.data.length : 0;
+  return { ok: true, message: count ? `连接成功，接口返回 ${count} 个模型。` : '连接成功。' };
+}
+
+async function listProviderModels(value) {
+  const type = String(value?.type || '');
+  const baseUrl = String(value?.baseUrl || '').trim();
+  const apiKey = String(value?.apiKey || '').trim();
+  if (type === 'ollama') {
+    const root = (baseUrl || 'http://127.0.0.1:11434/v1').replace(/\/v1\/?$/, '');
+    const response = await fetch(`${root}/api/tags`, { signal: AbortSignal.timeout(8000) });
+    if (!response.ok) throw new Error(`Ollama 返回 ${response.status}`);
+    const payload = await response.json();
+    return (payload.models ?? []).map((item) => String(item.name || '')).filter(Boolean);
+  }
+  if (type === 'anthropic') {
+    if (!apiKey) throw new Error('请填写 API Key');
+    const root = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+    const response = await fetch(`${root}/v1/models`, {
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!response.ok) throw new Error(`Anthropic 返回 ${response.status}`);
+    const payload = await response.json();
+    return (payload.data ?? []).map((item) => String(item.id || '')).filter(Boolean);
+  }
+  if (type === 'google') {
+    if (!apiKey) throw new Error('请填写 API Key');
+    const root = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/$/, '');
+    const response = await fetch(`${root}/models?key=${encodeURIComponent(apiKey)}`, { signal: AbortSignal.timeout(12000) });
+    if (!response.ok) throw new Error(`Google 返回 ${response.status}`);
+    const payload = await response.json();
+    return (payload.models ?? [])
+      .map((item) => String(item.name || '').replace(/^models\//, ''))
+      .filter(Boolean);
+  }
+  if (!baseUrl) throw new Error('请填写 API 地址');
+  const root = baseUrl.replace(/\/$/, '');
+  const response = await fetch(`${root}/models`, {
+    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    signal: AbortSignal.timeout(12000),
+  });
+  if (!response.ok) throw new Error(`接口返回 ${response.status}`);
+  const payload = await response.json();
+  return (payload.data ?? []).map((item) => String(item.id || '')).filter(Boolean);
 }
 
 function safeSkillName(value) { return String(value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 64); }
@@ -342,6 +691,8 @@ function startApi() {
       OPCAI_API_PORT: String(apiPort),
       OPCAI_SKILLS_DIR: path.join(storageRoot(), 'skills'),
       OPCAI_WORKSPACES_DIR: path.join(storageRoot(), 'workspaces'),
+      OPCAI_KNOWLEDGE_DIR: path.join(storageRoot(), 'knowledge'),
+      OPCAI_EXPERIENCE_DIR: path.join(storageRoot(), 'experience'),
       // The API is unpacked under Resources together with its minimal
       // production dependency closure, not the desktop workspace node_modules.
       ...(app.isPackaged ? { NODE_PATH: path.join(process.resourcesPath, 'api', 'node_deps') } : {}),
@@ -394,6 +745,33 @@ async function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  protocol.handle('opcai-preview', async (request) => {
+    try {
+      const url = new URL(request.url);
+      const root = previewRoots.get(url.hostname);
+      if (!root) return new Response('Forbidden', { status: 403 });
+      let relative = decodeURIComponent(url.pathname.replace(/^\//, ''));
+      if (!relative) relative = 'index.html';
+      if (relative.endsWith('/')) relative = `${relative}index.html`;
+      const file = projectPath(root, relative);
+      if (!existsSync(file) || !statSync(file).isFile()) return new Response('Not found', { status: 404 });
+      const name = path.basename(file);
+      // Explicit MIME helps Chromium's PDF viewer and SVG; file:// fetch alone is flaky for custom schemes.
+      if (/\.(pdf|svg)$/i.test(name)) {
+        const data = readFileSync(file);
+        return new Response(data, {
+          headers: {
+            'Content-Type': assetMimeType(name),
+            'Content-Length': String(data.length),
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+      return net.fetch(pathToFileURL(file).href);
+    } catch (error) {
+      return new Response(error instanceof Error ? error.message : String(error), { status: 400 });
+    }
+  });
   await initializeDatabase();
   startApi();
   ipcMain.handle('opcai:pick-file', async () => {
@@ -410,6 +788,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('opcai:write-project-file', (_, root, relative, content) => writeProjectFile(root, relative, content));
   ipcMain.handle('opcai:sync-project-workspace', (_, root, runId) => syncRunWorkspaceToProject(root, runId));
   ipcMain.handle('opcai:materialize-project-assets', (_, root, assetIds) => materializeProjectAssets(root, assetIds));
+  ipcMain.handle('opcai:register-preview-root', (_, root) => registerPreviewRoot(root));
+  ipcMain.handle('opcai:register-asset-preview-root', (_, assetId) => registerAssetPreviewRoot(assetId));
+  ipcMain.handle('opcai:read-project-preview', (_, root, relative) => readProjectPreview(root, relative));
+  ipcMain.handle('opcai:read-asset-preview', (_, assetId) => readAssetPreview(assetId));
+  ipcMain.handle('opcai:reveal-project-file', (_, root, relative) => revealProjectFile(root, relative));
+  ipcMain.handle('opcai:open-asset-in-browser', (_, assetId) => openAssetInBrowser(assetId));
+  ipcMain.handle('opcai:open-project-file-in-browser', (_, root, relative) => openProjectFileInBrowser(root, relative));
   ipcMain.handle('opcai:pick-skill', async () => {
     const result = await dialog.showOpenDialog(mainWindow, { title: 'Choose SKILL.md', filters: [{ name: 'Agent Skill manifest', extensions: ['md'] }], properties: ['openFile'] });
     return result.canceled ? null : readSkillManifest(result.filePaths[0]);
@@ -437,12 +822,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('opcai:open-external', (_, value) => shell.openExternal(String(value)));
   ipcMain.handle('opcai:get-model-config', () => readModelConfig());
   ipcMain.handle('opcai:save-model-config', (_, value) => writeModelConfig(value));
+  ipcMain.handle('opcai:get-search-config', () => readSearchConfig());
+  ipcMain.handle('opcai:save-search-config', (_, value) => writeSearchConfig(value));
+  ipcMain.handle('opcai:test-provider', (_, value) => testProviderConnection(value));
+  ipcMain.handle('opcai:list-provider-models', (_, value) => listProviderModels(value));
   ipcMain.handle('opcai:list-ollama-models', async (_, baseUrl) => {
-    const root = String(baseUrl || 'http://127.0.0.1:11434/v1').replace(/\/v1\/?$/, '');
-    const response = await fetch(`${root}/api/tags`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error(`Ollama 返回 ${response.status}`);
-    const payload = await response.json();
-    return (payload.models ?? []).map((item) => String(item.name || '')).filter(Boolean);
+    return listProviderModels({ type: 'ollama', baseUrl });
   });
   ipcMain.handle('opcai:pull-ollama-model', async (_, baseUrl, modelName) => {
     const root = String(baseUrl || 'http://127.0.0.1:11434/v1').replace(/\/v1\/?$/, '');
@@ -462,6 +847,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('opcai:storage-set', (_, key, value) => { setStoredValue(String(key), String(value)); });
   ipcMain.handle('opcai:list-assets', () => listAssets());
   ipcMain.handle('opcai:archive-artifact', (_, value) => archiveArtifact(value));
+  ipcMain.handle('opcai:link-assets-to-project', (_, value) => linkAssetsToProject(value));
+  ipcMain.handle('opcai:unlink-assets-from-project', (_, assetIds) => unlinkAssetsFromProject(assetIds));
   ipcMain.handle('opcai:save-asset', async (_, assetId) => {
     const { row, target } = assetFile(assetId);
     const result = await dialog.showSaveDialog(mainWindow, { title: '下载资产', defaultPath: row.name });

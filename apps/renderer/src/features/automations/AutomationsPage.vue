@@ -2,9 +2,12 @@
 import { computed, onMounted, ref } from 'vue';
 import type { Employee, EmployeeId, Conversation } from '../../app/workspace';
 import type { ProviderConfig, ProviderId } from '../../app/model-config';
+import { chatEndpointLabel } from '../../app/model-config';
 import type { AutomationRunTranscript } from '../../app/automations';
 import { useCapabilities } from '../../app/capabilities';
 import { useAutomations, type Automation, type AutomationRun, type AutomationSchedule } from '../../app/automations';
+import { employeeDisplayName } from '../../app/employees';
+import { useI18n } from '../../app/i18n';
 import AutomationRunDetail from './AutomationRunDetail.vue';
 
 const props = defineProps<{
@@ -15,6 +18,7 @@ const props = defineProps<{
   openConversation: (id: string) => void;
 }>();
 
+const { t } = useI18n();
 const { load: loadSkills, allowedSkillsFor } = useCapabilities();
 const { automations, runs, load, loadRuns, save, update, remove, beginRun, finishRun } = useAutomations();
 const creating = ref(false);
@@ -23,7 +27,7 @@ const running = ref('');
 const error = ref('');
 const tab = ref<'tasks' | 'runs'>('tasks');
 const selectedRun = ref<AutomationRun | null>(null);
-const form = ref({ name: '', prompt: '', employeeId: 'general' as EmployeeId, provider: '' as ProviderId | '', skillIds: [] as string[], kind: 'once' as 'once' | 'recurring', at: '', frequency: 'daily' as 'daily' | 'weekly' | 'monthly', time: '09:00', weekdays: [1] as number[], dayOfMonth: 1 });
+const form = ref({ name: '', prompt: '', employeeId: 'general' as EmployeeId, modelId: '', skillIds: [] as string[], kind: 'once' as 'once' | 'recurring', at: '', frequency: 'daily' as 'daily' | 'weekly' | 'monthly', time: '09:00', weekdays: [1] as number[], dayOfMonth: 1 });
 const availableSkills = computed(() => allowedSkillsFor(form.value.employeeId).filter((skill) => skill.status === 'ready'));
 const hasTasks = computed(() => automations.value.length > 0);
 const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
@@ -41,7 +45,7 @@ function templateScheduleHint(template: (typeof templates)[number]) {
 }
 
 function resetForm() {
-  form.value = { name: '', prompt: '', employeeId: 'general', provider: props.models[0]?.provider ?? '', skillIds: [], kind: 'recurring', at: '', frequency: 'daily', time: '09:00', weekdays: [1], dayOfMonth: 1 };
+  form.value = { name: '', prompt: '', employeeId: 'general', modelId: props.models[0]?.id ?? '', skillIds: [], kind: 'recurring', at: '', frequency: 'daily', time: '09:00', weekdays: [1], dayOfMonth: 1 };
 }
 
 function startCreate(blank = false) {
@@ -62,7 +66,7 @@ function cancelCreate() {
 }
 
 function applyTemplate(template: (typeof templates)[number]) {
-  form.value = { ...form.value, name: template.name, prompt: template.prompt, employeeId: template.employeeId, kind: 'recurring', frequency: template.frequency, time: template.time, weekdays: template.weekdays ? [...template.weekdays] : [1], dayOfMonth: template.dayOfMonth ?? 1, provider: form.value.provider || props.models[0]?.provider || '' };
+  form.value = { ...form.value, name: template.name, prompt: template.prompt, employeeId: template.employeeId, kind: 'recurring', frequency: template.frequency, time: template.time, weekdays: template.weekdays ? [...template.weekdays] : [1], dayOfMonth: template.dayOfMonth ?? 1, modelId: form.value.modelId || props.models[0]?.id || '' };
   createStep.value = 'configure';
   creating.value = true;
 }
@@ -102,7 +106,8 @@ function runStatusText(run: AutomationRun) {
 async function create() {
   const at = new Date(form.value.at).getTime();
   error.value = '';
-  if (!form.value.name.trim() || !form.value.prompt.trim() || !form.value.provider || (form.value.kind === 'once' && !Number.isFinite(at)) || (form.value.kind === 'recurring' && form.value.frequency === 'weekly' && !form.value.weekdays.length)) {
+  const selected = props.models.find((item) => item.id === form.value.modelId);
+  if (!form.value.name.trim() || !form.value.prompt.trim() || !selected || (form.value.kind === 'once' && !Number.isFinite(at)) || (form.value.kind === 'recurring' && form.value.frequency === 'weekly' && !form.value.weekdays.length)) {
     error.value = '请填写名称、任务指令、模型和有效的执行时间；每周任务至少选择一天。';
     return;
   }
@@ -110,7 +115,7 @@ async function create() {
     form.value.kind === 'once'
       ? { kind: 'once', at }
       : { kind: 'recurring', frequency: form.value.frequency, time: form.value.time, ...(form.value.frequency === 'weekly' ? { weekdays: form.value.weekdays } : {}), ...(form.value.frequency === 'monthly' ? { dayOfMonth: form.value.dayOfMonth } : {}) };
-  await save({ name: form.value.name.trim(), prompt: form.value.prompt.trim(), employeeId: form.value.employeeId, provider: form.value.provider as ProviderId, skillIds: [...form.value.skillIds], schedule, enabled: true });
+  await save({ name: form.value.name.trim(), prompt: form.value.prompt.trim(), employeeId: form.value.employeeId, provider: selected.provider as ProviderId, modelId: selected.id, skillIds: [...form.value.skillIds], schedule, enabled: true });
   cancelCreate();
 }
 
@@ -148,7 +153,7 @@ function onOpenConversation(id: string) {
 
 onMounted(async () => {
   await Promise.all([load(), loadRuns(), loadSkills()]);
-  form.value.provider = props.models[0]?.provider ?? '';
+  form.value.modelId = props.models[0]?.id ?? '';
 });
 </script>
 
@@ -270,9 +275,9 @@ onMounted(async () => {
               </details>
             <div class="grid gap-4 md:grid-cols-2">
               <label class="grid gap-1.5 text-sm font-semibold">名称<input v-model="form.name" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal outline-none focus:border-[var(--accent)]" placeholder="例如：每日行业简报"></label>
-              <label class="grid gap-1.5 text-sm font-semibold">数字员工<select v-model="form.employeeId" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal"><option v-for="employee in employees" :key="employee.id" :value="employee.id">{{ employee.id === 'general' ? '通用助理' : employee.id === 'research' ? '研究助理' : employee.id === 'code' ? '编程助理' : '系统管理员' }}</option></select></label>
+              <label class="grid gap-1.5 text-sm font-semibold">数字员工<select v-model="form.employeeId" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal"><option v-for="employee in employees" :key="employee.id" :value="employee.id">{{ employeeDisplayName(employee, t) }}</option></select></label>
               <label class="grid gap-1.5 text-sm font-semibold md:col-span-2">任务指令<textarea v-model="form.prompt" rows="4" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal outline-none focus:border-[var(--accent)]" placeholder="例如：汇总今天的项目风险，并生成一份 Markdown 简报。"></textarea></label>
-              <label class="grid gap-1.5 text-sm font-semibold">对话模型<select v-model="form.provider" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal"><option disabled value="">选择已配置模型</option><option v-for="model in models" :key="model.provider" :value="model.provider">{{ model.provider }} · {{ model.chatModel }}</option></select></label>
+              <label class="grid gap-1.5 text-sm font-semibold">对话模型<select v-model="form.modelId" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal"><option disabled value="">选择已配置模型</option><option v-for="model in models" :key="model.id" :value="model.id">{{ chatEndpointLabel(model) }}</option></select></label>
               <div class="grid gap-1.5 text-sm font-semibold"><span>调度方式</span><div class="flex gap-2"><button :class="['rounded-lg px-3 py-2 text-sm', form.kind === 'once' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)]']" type="button" @click="form.kind = 'once'">单次</button><button :class="['rounded-lg px-3 py-2 text-sm', form.kind === 'recurring' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)]']" type="button" @click="form.kind = 'recurring'">周期</button></div></div>
               <label v-if="form.kind === 'once'" class="grid gap-1.5 text-sm font-semibold"><span>执行时间</span><input v-model="form.at" type="datetime-local" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 font-normal"></label>
               <template v-else>

@@ -5,7 +5,7 @@ import type { ToolActivity, ToolApproval } from '../services/api.js';
 import { readStored, writeStored } from './storage.js';
 
 export type AutomationSchedule = { kind: 'once'; at: number } | { kind: 'interval'; everyMinutes: number } | { kind: 'recurring'; frequency: 'daily' | 'weekly' | 'monthly'; time: string; weekdays?: number[]; dayOfMonth?: number };
-export interface Automation { id: string; name: string; prompt: string; employeeId: EmployeeId; provider: ProviderId; skillIds: string[]; schedule: AutomationSchedule; enabled: boolean; createdAt: number; updatedAt: number; nextRunAt: number; lastRunAt?: number; lastStatus?: 'success' | 'failed'; lastError?: string; }
+export interface Automation { id: string; name: string; prompt: string; employeeId: EmployeeId; provider: ProviderId; modelId?: string; skillIds: string[]; schedule: AutomationSchedule; enabled: boolean; createdAt: number; updatedAt: number; nextRunAt: number; lastRunAt?: number; lastStatus?: 'success' | 'failed'; lastError?: string; }
 export interface AutomationRunTranscript {
   prompt: string;
   conversationId: string | null;

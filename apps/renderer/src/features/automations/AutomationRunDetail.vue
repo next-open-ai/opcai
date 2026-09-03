@@ -4,6 +4,7 @@ import type { Automation, AutomationRun, AutomationRunTranscript } from '../../a
 import type { Conversation, Employee } from '../../app/workspace';
 import type { ToolActivity, ToolApproval } from '../../services/api';
 import { useI18n } from '../../app/i18n';
+import { employeeDisplayName } from '../../app/employees';
 
 const props = defineProps<{ run: AutomationRun; employees: Employee[]; conversations: Conversation[]; automations: Automation[] }>();
 const emit = defineEmits<{ close: []; openConversation: [id: string] }>();
@@ -146,7 +147,7 @@ function formatBytes(value: number) {
         </div>
         <div class="mt-4 flex flex-wrap items-center gap-2">
           <span :class="['rounded-lg px-2.5 py-1 text-xs font-semibold', statusClass(run.status)]">{{ statusLabel(run.status) }}</span>
-          <span class="rounded-lg bg-[var(--surface-muted)] px-2.5 py-1 text-xs font-medium">{{ t(employee.nameKey) }}</span>
+          <span class="rounded-lg bg-[var(--surface-muted)] px-2.5 py-1 text-xs font-medium">{{ employeeDisplayName(employee, t) }}</span>
           <span class="rounded-lg bg-[var(--surface-muted)] px-2.5 py-1 text-xs font-medium text-[var(--muted)]">{{ run.provider }}</span>
         </div>
         <p v-if="run.error" class="mt-3 rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">{{ run.error }}</p>

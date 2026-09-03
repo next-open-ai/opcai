@@ -1,9 +1,14 @@
+import { employeeDisplayName } from '../../app/employees';
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import 'monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution';
 import type { Employee, EmployeeId } from "../../app/workspace.js";
+import {
+  deliverableEntries,
+  type ProjectFileEntry,
+} from "../../app/project-files.js";
 import type { Project } from "../../app/projects.js";
 
 const props = defineProps<{
@@ -28,7 +33,7 @@ const membersDockOpen = ref(false);
 const sending = ref(false);
 const refreshing = ref(false);
 const filesError = ref("");
-type FileEntry = { relative: string; type: 'directory' | 'file' };
+type FileEntry = ProjectFileEntry;
 const files = ref<FileEntry[]>([]);
 const selectedFile = ref('');
 const fileContent = ref('');
@@ -96,13 +101,15 @@ const statusDotClass = (status: string) =>
     failed: "bg-rose-500 ring-4 ring-rose-500/15",
     cancelled: "bg-amber-500",
   })[status] ?? "bg-slate-400";
-const employeeName = (id?: EmployeeId) =>
-  ({
-    general: "通用助理",
-    research: "研究助理",
-    code: "编程助理",
-    administrator: "系统管理员",
-  })[id ?? "general"];
+const employeeName = (id?: EmployeeId) => {
+  const employee = props.employees.find((item) => item.id === id);
+  return employeeDisplayName(employee, (key) => ({
+    'employee.general.name': '通用助理',
+    'employee.research.name': '研究助理',
+    'employee.code.name': '编程助理',
+    'employee.administrator.name': '系统管理员',
+  } as Record<string, string>)[key] || key) || id || '';
+};
 const date = (value: number) =>
   new Intl.DateTimeFormat("zh-CN", {
     hour: "2-digit",
@@ -112,28 +119,13 @@ const totalAssets = computed(() =>
   props.project.messages.flatMap((message) => message.assets ?? []),
 );
 const TREE_WIDTH_KEY = "opcai.project.tree-width";
+const TREE_COLLAPSED_KEY = "opcai.project.tree-collapsed";
 const treeWidth = ref(Number(localStorage.getItem(TREE_WIDTH_KEY)) || 260);
+const treeCollapsed = ref(localStorage.getItem(TREE_COLLAPSED_KEY) === "1");
 const resizingTree = ref(false);
 const MIN_TREE_WIDTH = 180;
 const MAX_TREE_WIDTH = 560;
-
-/** Agent process / scaffolding scripts — not shown as project deliverables. */
-function isAgentProcessFile(relative: string) {
-  const name = relative.split("/").pop() ?? relative;
-  if (/\.(py|sh)$/i.test(name)) return true;
-  if (/^(gen_|patch_|scaffold_|tmp_)/i.test(name) && /\.(js|mjs|cjs|ts)$/i.test(name) && !relative.includes("/")) return true;
-  return false;
-}
-
-function deliverableEntries(entries: FileEntry[]) {
-  const keptFiles = entries.filter((entry) => entry.type === "file" && !isAgentProcessFile(entry.relative));
-  const keptPaths = keptFiles.map((entry) => entry.relative);
-  return entries.filter((entry) => {
-    if (entry.type === "file") return !isAgentProcessFile(entry.relative);
-    if (entry.type !== "directory") return false;
-    return keptPaths.some((path) => path === entry.relative || path.startsWith(`${entry.relative}/`));
-  });
-}
+const COLLAPSED_TREE_WIDTH = 44;
 
 const deliverableFiles = computed(() => deliverableEntries(files.value));
 const fileCount = computed(() => deliverableFiles.value.filter((entry) => entry.type === "file").length);
@@ -146,8 +138,15 @@ const visibleFiles = computed(() =>
   ),
 );
 const editing = computed(() => Boolean(selectedFile.value));
+const effectiveTreeWidth = computed(() => (treeCollapsed.value ? COLLAPSED_TREE_WIDTH : treeWidth.value));
+
+function setTreeCollapsed(value: boolean) {
+  treeCollapsed.value = value;
+  localStorage.setItem(TREE_COLLAPSED_KEY, value ? "1" : "0");
+}
 
 function startTreeResize(event: PointerEvent) {
+  if (treeCollapsed.value) return;
   event.preventDefault();
   resizingTree.value = true;
   const originX = event.clientX;
@@ -324,48 +323,78 @@ onBeforeUnmount(() => editor?.dispose());
           ? 'xl:[grid-template-columns:var(--tree-width)_minmax(0,1.2fr)_minmax(340px,0.9fr)]'
           : 'xl:[grid-template-columns:var(--tree-width)_minmax(0,1fr)_300px]',
       ]"
-      :style="{ '--tree-width': `${treeWidth}px` }"
+      :style="{ '--tree-width': `${effectiveTreeWidth}px` }"
     >
-      <!-- 产出物目录树：始终左侧，可拖拽右边线调宽 -->
-      <aside class="relative min-h-0 overflow-y-auto border-r border-[var(--border)] bg-[var(--surface)] p-3">
-        <div class="mb-3 flex items-center justify-between gap-2 px-2">
-          <strong class="text-xs">项目产出物</strong>
+      <!-- 项目文件：默认展开；可向左收起，拖右边线调宽 -->
+      <aside
+        :class="[
+          'relative min-h-0 border-r border-[var(--border)] bg-[var(--surface)]',
+          treeCollapsed ? 'overflow-hidden' : 'overflow-y-auto p-3',
+        ]"
+      >
+        <template v-if="treeCollapsed">
+          <div class="flex h-full flex-col items-center gap-3 py-3">
+            <button
+              class="grid h-8 w-8 place-items-center rounded-lg border border-[var(--border)] text-sm font-bold text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+              type="button"
+              title="展开项目文件"
+              @click="setTreeCollapsed(false)"
+            >›</button>
+            <span
+              class="mt-2 text-[10px] font-bold tracking-[.18em] text-[var(--muted)]"
+              style="writing-mode: vertical-rl"
+            >项目文件</span>
+            <span v-if="fileCount" class="text-[10px] text-[var(--muted)]">{{ fileCount }}</span>
+          </div>
+        </template>
+        <template v-else>
+          <div class="mb-3 flex items-center justify-between gap-2 px-2">
+            <strong class="text-xs">项目文件</strong>
+            <div class="flex items-center gap-1">
+              <button
+                class="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-wait disabled:opacity-50"
+                type="button"
+                :disabled="refreshing || !project.workspacePath"
+                @click="loadFiles({ recover: true })"
+              >{{ refreshing ? '同步中…' : '刷新' }}</button>
+              <button
+                class="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--accent)]"
+                type="button"
+                title="向左收起，扩大右侧空间"
+                @click="setTreeCollapsed(true)"
+              >‹</button>
+            </div>
+          </div>
+          <p class="mb-1 px-2 text-[11px] leading-4 text-[var(--muted)] break-all">{{ project.workspacePath || '旧项目尚未配置项目空间。' }}</p>
+          <p v-if="fileCount" class="mb-3 px-2 text-[10px] text-[var(--muted)]">{{ fileCount }} 个交付文件</p>
           <button
-            class="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-wait disabled:opacity-50"
+            v-for="entry in visibleFiles"
+            :key="entry.relative"
             type="button"
-            :disabled="refreshing || !project.workspacePath"
-            @click="loadFiles({ recover: true })"
-          >{{ refreshing ? '同步中…' : '刷新' }}</button>
-        </div>
-        <p class="mb-1 px-2 text-[11px] leading-4 text-[var(--muted)] break-all">{{ project.workspacePath || '旧项目尚未配置项目空间。' }}</p>
-        <p v-if="fileCount" class="mb-3 px-2 text-[10px] text-[var(--muted)]">{{ fileCount }} 个交付文件</p>
-        <button
-          v-for="entry in visibleFiles"
-          :key="entry.relative"
-          type="button"
-          :style="{ paddingLeft: `${8 + fileDepth(entry) * 14}px` }"
-          :class="[
-            'flex w-full items-center gap-2 rounded-lg py-2 text-left text-sm',
-            entry.type === 'directory'
-              ? 'text-[var(--muted)] hover:bg-[var(--surface-muted)]'
-              : selectedFile === entry.relative
-                ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
-                : 'hover:bg-[var(--surface-muted)]',
-          ]"
-          @click="selectFile(entry)"
-        >
-          <span>{{ entry.type === 'directory' ? (collapsedDirectories.has(entry.relative) ? '›' : '⌄') : '▧' }}</span>
-          <span class="truncate">{{ fileName(entry) }}</span>
-        </button>
-        <p v-if="filesError" class="mt-4 px-2 text-xs leading-5 text-rose-600">{{ filesError }}</p>
-        <p v-else-if="!deliverableFiles.length" class="mt-6 px-2 text-xs leading-5 text-[var(--muted)]">
-          仅展示交付资产（页面、样式、文案等）。智能体过程脚本（如 .py / .sh）不会出现在此树中。
-        </p>
-        <div
-          class="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-[var(--accent)]/25 active:bg-[var(--accent)]/40"
-          title="拖动调整目录树宽度"
-          @pointerdown="startTreeResize"
-        />
+            :style="{ paddingLeft: `${8 + fileDepth(entry) * 14}px` }"
+            :class="[
+              'flex w-full items-center gap-2 rounded-lg py-2 text-left text-sm',
+              entry.type === 'directory'
+                ? 'text-[var(--muted)] hover:bg-[var(--surface-muted)]'
+                : selectedFile === entry.relative
+                  ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
+                  : 'hover:bg-[var(--surface-muted)]',
+            ]"
+            @click="selectFile(entry)"
+          >
+            <span>{{ entry.type === 'directory' ? (collapsedDirectories.has(entry.relative) ? '›' : '⌄') : '▧' }}</span>
+            <span class="truncate">{{ fileName(entry) }}</span>
+          </button>
+          <p v-if="filesError" class="mt-4 px-2 text-xs leading-5 text-rose-600">{{ filesError }}</p>
+          <p v-else-if="!deliverableFiles.length" class="mt-6 px-2 text-xs leading-5 text-[var(--muted)]">
+            仅展示交付资产（页面、样式、文案等）。智能体过程脚本（如 .py / .sh）不会出现在此树中。
+          </p>
+          <div
+            class="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-[var(--accent)]/25 active:bg-[var(--accent)]/40"
+            title="拖动调整目录树宽度"
+            @pointerdown="startTreeResize"
+          />
+        </template>
       </aside>
 
       <!-- 未选文件：对话居中；选中文件：编辑器居中 -->

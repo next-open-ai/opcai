@@ -5,9 +5,12 @@ import type {
   EmployeeId,
   ProjectTaskDraft,
 } from "../../app/workspace.js";
+import { employeeDisplayName } from "../../app/employees.js";
 import type { ProviderConfig, ProviderId } from "../../app/model-config.js";
+import { useModelConfig } from "../../app/model-config.js";
 import type { ToolActivity, ToolApproval } from "../../services/api.js";
 import { useCapabilities } from "../../app/capabilities.js";
+import { readStored, writeStored } from "../../app/storage.js";
 import {
   useProjects,
   type Project,
@@ -66,7 +69,10 @@ const error = ref("");
 const name = ref("");
 const goal = ref("");
 const mode = ref<ProjectMode>("parallel");
-const coordinator = ref<ProviderConfig | null>(props.models[0] ?? null);
+const coordinatorId = ref<string>(props.models[0]?.id ?? "");
+const coordinator = computed(
+  () => props.models.find((item) => item.id === coordinatorId.value) ?? props.models[0] ?? null,
+);
 const workspaceParent = ref("");
 const draftTasks = ref<ProjectTaskInput[]>([]);
 const detailTaskId = ref<string | null>(null);
@@ -212,27 +218,27 @@ const templates: Array<{
 const template = computed(
   () => templates.find((item) => item.id === mode.value) ?? templates[1],
 );
+const { modelForEmployee } = useModelConfig();
 const modelLabel = (model: ProviderConfig) =>
-  `${model.provider} · ${model.chatModel}`;
+  `${model.providerLabel || model.provider} · ${model.chatModel}`;
 function employeeName(id: EmployeeId) {
-  return (
-    {
-      general: "通用助理",
-      research: "研究助理",
-      code: "编程助理",
-      administrator: "系统管理员",
-    } as Record<string, string>
-  )[id];
+  const employee = props.employees.find((item) => item.id === id);
+  return employeeDisplayName(employee, (key) => ({
+    'employee.general.name': '通用助理',
+    'employee.research.name': '研究助理',
+    'employee.code.name': '编程助理',
+    'employee.administrator.name': '系统管理员',
+  } as Record<string, string>)[key] || key) || id;
 }
 function modelFor(task: ProjectTask) {
-  return (
+  const byTask =
     props.models.find(
       (item) =>
         item.provider === task.provider && item.chatModel === task.model,
     ) ??
     props.models.find((item) => item.provider === task.provider) ??
-    null
-  );
+    null;
+  return modelForEmployee(task.employeeId, byTask) ?? byTask ?? props.models[0] ?? null;
 }
 function statusStyle(status: string) {
   return (
@@ -291,7 +297,7 @@ function openCreate() {
   goal.value = "";
   mode.value = "parallel";
   draftTasks.value = templateTasks();
-  coordinator.value = props.models[0] ?? null;
+  coordinatorId.value = props.models[0]?.id ?? "";
   workspaceParent.value = "";
 }
 function closeCreate() {
@@ -645,6 +651,11 @@ async function dispatchProjectInstruction(
 }
 onMounted(async () => {
   await Promise.all([load(), loadSkills()]);
+  const focusId = await readStored("projects.focus-id");
+  if (focusId && projects.value.some((project) => project.id === focusId)) {
+    selectedId.value = focusId;
+    await writeStored("projects.focus-id", "");
+  }
 });
 </script>
 
@@ -807,14 +818,14 @@ onMounted(async () => {
                 <aside class="rounded-xl bg-[var(--surface-muted)] p-4">
                   <p class="text-sm font-bold">协调员模型</p>
                   <select
-                    v-model="coordinator"
+                    v-model="coordinatorId"
                     class="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
                   >
-                    <option :value="null">选择模型</option>
+                    <option disabled value="">选择模型</option>
                     <option
                       v-for="model in models"
-                      :key="modelLabel(model)"
-                      :value="model"
+                      :key="model.id"
+                      :value="model.id"
                     >
                       {{ modelLabel(model) }}
                     </option></select

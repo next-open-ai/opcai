@@ -56,9 +56,16 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('tool.completed'), runId: z.string(), toolName: z.string(), summary: z.string(), ok: z.boolean() }),
   z.object({ type: z.literal('tool.failed'), runId: z.string(), toolName: z.string(), summary: z.string() }),
   z.object({ type: z.literal('artifact.created'), runId: z.string(), path: z.string().min(1).max(240) }),
+  z.object({ type: z.literal('search.sources'), runId: z.string(), provider: z.string(), sources: z.array(z.object({ title: z.string(), url: z.string().url(), source: z.string().optional() })).max(10) }),
   z.object({ type: z.literal('tool.approval_required'), runId: z.string(), skillId: z.string(), capability: z.enum(['workspace-write', 'script-execution', 'network-access']), summary: z.string() }),
   z.object({ type: z.literal('run.completed'), runId: z.string() }),
   z.object({ type: z.literal('run.failed'), runId: z.string(), message: z.string() }),
+  z.object({
+    type: z.literal('run.cancelled'),
+    runId: z.string(),
+    reason: z.enum(['user', 'timeout']),
+    message: z.string(),
+  }),
 ]);
 
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
@@ -69,6 +76,11 @@ export const ModelConfigSchema = z.object({
   baseUrl: z.string().url().optional(),
   chatModel: z.string().min(1),
   disableThinking: z.boolean().optional(),
+  /**
+   * When true, DashScope-compatible chat requests inject `enable_search: true`
+   * (Bailian / Qwen built-in web search). Not an external search provider tool.
+   */
+  enableSearch: z.boolean().optional(),
   imageModel: z.string().optional(),
   embeddingModel: z.string().optional(),
   asrModel: z.string().optional(),
@@ -77,10 +89,163 @@ export const ModelConfigSchema = z.object({
 }).refine((value) => value.provider === 'ollama' || value.apiKey.trim().length > 0, { message: 'API key is required for this provider.' });
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
 
+export const SearchProviderIdSchema = z.enum(['bocha', 'tavily', 'brave', 'exa', 'zhipu', 'aliyun']);
+export type SearchProviderId = z.infer<typeof SearchProviderIdSchema>;
+export const SearchProviderRuntimeSchema = z.object({
+  id: SearchProviderIdSchema,
+  label: z.string().min(1).max(80),
+  apiKey: z.string().min(1),
+  /** Optional provider endpoint override; Aliyun requires its workspace service endpoint. */
+  baseUrl: z.string().url().optional(),
+  enabled: z.boolean().default(true),
+  preferred: z.boolean().default(false),
+});
+export type SearchProviderRuntime = z.infer<typeof SearchProviderRuntimeSchema>;
+
+const McpRemoteRuntimeSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1).max(120),
+  transport: z.enum(['http', 'sse']).default('http'),
+  url: z.string().url(),
+  enabled: z.boolean().default(true),
+  apiKey: z.string().optional(),
+  description: z.string().max(500).optional(),
+});
+
+const McpStdioRuntimeSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1).max(120),
+  transport: z.literal('stdio'),
+  command: z.string().min(1).max(240),
+  args: z.array(z.string().max(500)).max(64).default([]),
+  env: z.record(z.string().max(2000)).optional(),
+  cwd: z.string().max(1000).optional(),
+  enabled: z.boolean().default(true),
+  description: z.string().max(500).optional(),
+});
+
+export const McpConnectionRuntimeSchema = z.union([McpRemoteRuntimeSchema, McpStdioRuntimeSchema]);
+export type McpConnectionRuntime = z.infer<typeof McpConnectionRuntimeSchema>;
+
+export const McpProbeRequestSchema = z.object({
+  connection: McpConnectionRuntimeSchema,
+  timeoutMs: z.number().int().min(3_000).max(60_000).optional(),
+});
+export type McpProbeRequest = z.infer<typeof McpProbeRequestSchema>;
+
+/** Phase-1 knowledge base providers: local LanceDB + selected cloud engines. */
+export const KnowledgeProviderIdSchema = z.enum(['lancedb', 'bailian', 'dify', 'qdrant', 'pinecone']);
+export type KnowledgeProviderId = z.infer<typeof KnowledgeProviderIdSchema>;
+
+export const KnowledgeBaseRuntimeSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1).max(120),
+  provider: KnowledgeProviderIdSchema,
+  enabled: z.boolean().default(true),
+  description: z.string().max(500).optional(),
+  /** Local LanceDB directory (absolute). */
+  dataDir: z.string().max(1000).optional(),
+  /** Cloud API base URL (Dify / Qdrant / custom Bailian endpoint). */
+  baseUrl: z.string().url().optional(),
+  apiKey: z.string().optional(),
+  /** External dataset / index / collection / knowledge-base id. */
+  externalId: z.string().max(240).optional(),
+  /** Bailian datacenter category id (required for cloud upload). */
+  categoryId: z.string().max(120).optional(),
+  /** Bailian / Model Studio workspace id (e.g. llm-xxxx). */
+  workspaceId: z.string().max(120).optional(),
+  /** Optional Aliyun AccessKey for Bailian OpenAPI Retrieve (preferred for console knowledge bases). */
+  accessKeyId: z.string().max(120).optional(),
+  accessKeySecret: z.string().max(120).optional(),
+  /** Optional OpenAI-compatible embedding endpoint override for vector providers. */
+  embeddingBaseUrl: z.string().url().optional(),
+  embeddingApiKey: z.string().optional(),
+  embeddingModel: z.string().max(120).optional(),
+});
+export type KnowledgeBaseRuntime = z.infer<typeof KnowledgeBaseRuntimeSchema>;
+
+export const KnowledgeIngestRequestSchema = z.object({
+  knowledgeBase: KnowledgeBaseRuntimeSchema,
+  title: z.string().min(1).max(240),
+  /** Plain-text content (LanceDB). Optional when fileBase64 is provided for Bailian. */
+  content: z.string().max(200_000).optional(),
+  /** Base64-encoded file bytes for Bailian lease upload. */
+  fileBase64: z.string().max(8_000_000).optional(),
+  fileName: z.string().max(240).optional(),
+  source: z.string().max(500).optional(),
+  model: ModelConfigSchema.optional(),
+}).refine((value) => Boolean(value.content?.trim() || value.fileBase64?.trim()), {
+  message: 'Either content or fileBase64 is required.',
+});
+export type KnowledgeIngestRequest = z.infer<typeof KnowledgeIngestRequestSchema>;
+
+export const KnowledgeSearchRequestSchema = z.object({
+  knowledgeBase: KnowledgeBaseRuntimeSchema,
+  query: z.string().min(2).max(800),
+  topK: z.number().int().min(1).max(8).default(5),
+  model: ModelConfigSchema.optional(),
+});
+export type KnowledgeSearchRequest = z.infer<typeof KnowledgeSearchRequestSchema>;
+
+export const BailianCreateKnowledgeRequestSchema = z.object({
+  accessKeyId: z.string().min(1).max(120),
+  accessKeySecret: z.string().min(1).max(120),
+  workspaceId: z.string().min(1).max(120),
+  name: z.string().min(1).max(20),
+  description: z.string().max(1000).optional(),
+  embeddingModelName: z.string().max(120).optional(),
+});
+export type BailianCreateKnowledgeRequest = z.infer<typeof BailianCreateKnowledgeRequestSchema>;
+
+export const BailianDeleteKnowledgeRequestSchema = z.object({
+  accessKeyId: z.string().min(1).max(120),
+  accessKeySecret: z.string().min(1).max(120),
+  workspaceId: z.string().min(1).max(120),
+  indexId: z.string().min(1).max(120),
+});
+export type BailianDeleteKnowledgeRequest = z.infer<typeof BailianDeleteKnowledgeRequestSchema>;
+
+export const KnowledgeManageRequestSchema = z.object({
+  knowledgeBase: KnowledgeBaseRuntimeSchema,
+  model: ModelConfigSchema.optional(),
+});
+export type KnowledgeManageRequest = z.infer<typeof KnowledgeManageRequestSchema>;
+
+export const KnowledgeChunksRequestSchema = KnowledgeManageRequestSchema.extend({
+  documentId: z.string().min(1).max(240).optional(),
+  query: z.string().max(400).optional(),
+  offset: z.number().int().min(0).max(100_000).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
+export type KnowledgeChunksRequest = z.infer<typeof KnowledgeChunksRequestSchema>;
+
+export const KnowledgeDeleteDocumentRequestSchema = KnowledgeManageRequestSchema.extend({
+  documentId: z.string().min(1).max(240),
+});
+export type KnowledgeDeleteDocumentRequest = z.infer<typeof KnowledgeDeleteDocumentRequestSchema>;
+
+export const KnowledgeDeleteChunkRequestSchema = KnowledgeManageRequestSchema.extend({
+  chunkId: z.string().min(1).max(240),
+});
+export type KnowledgeDeleteChunkRequest = z.infer<typeof KnowledgeDeleteChunkRequestSchema>;
+
+export const KnowledgeJobStatusRequestSchema = KnowledgeManageRequestSchema.extend({
+  jobId: z.string().min(1).max(240),
+});
+export type KnowledgeJobStatusRequest = z.infer<typeof KnowledgeJobStatusRequestSchema>;
 export const ChatRequestSchema = z.object({
   profile: AgentProfileSchema,
   messages: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string().min(1) })).min(1),
   model: ModelConfigSchema,
   skills: z.array(AgentSkillRuntimeSchema).max(24).default([]),
+  searchProviders: z.array(SearchProviderRuntimeSchema).max(6).default([]),
+  mcpConnections: z.array(McpConnectionRuntimeSchema).max(12).default([]),
+  knowledgeBases: z.array(KnowledgeBaseRuntimeSchema).max(12).default([]),
+  /** Soft ceiling for tool/LLM steps in one run. */
+  maxSteps: z.number().int().min(4).max(64).optional(),
+  /** Wall-clock budget for the whole agent run (ms). */
+  runTimeoutMs: z.number().int().min(15_000).max(1_800_000).optional(),
+  /** Per MCP tool call budget (ms). */
+  mcpToolTimeoutMs: z.number().int().min(3_000).max(300_000).optional(),
 });
 export type ChatRequest = z.infer<typeof ChatRequestSchema>;

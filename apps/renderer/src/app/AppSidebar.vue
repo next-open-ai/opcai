@@ -10,13 +10,14 @@ const emit = defineEmits<{ toggle: []; navigate: [view: View]; newChat: []; sele
 const { t } = useI18n();
 const { preference, cycleTheme } = useTheme();
 
-type NavItem = { id: View; labelKey: string; icon: 'chat' | 'employees' | 'capabilities' | 'automations' | 'assets' | 'projects' };
+type NavItem = { id: View; labelKey: string; icon: 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'automations' | 'assets' | 'projects' };
 
 const navItems: NavItem[] = [
   { id: 'chat', labelKey: 'nav.workspace', icon: 'chat' },
   { id: 'employees', labelKey: 'nav.employees', icon: 'employees' },
   { id: 'projects', labelKey: 'nav.projects', icon: 'projects' },
   { id: 'capabilities', labelKey: 'nav.capabilities', icon: 'capabilities' },
+  { id: 'knowledge', labelKey: 'nav.knowledge', icon: 'knowledge' },
   { id: 'automations', labelKey: 'nav.automations', icon: 'automations' },
   { id: 'assets', labelKey: 'nav.assets', icon: 'assets' },
 ];

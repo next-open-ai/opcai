@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import type {
   CollaborationDelivery,
   CollaborationRun,
@@ -14,6 +14,8 @@ import type { ToolActivity, ToolApproval } from "../../services/api";
 import type { ExecutionLevel } from "../../app/capabilities";
 import type { Asset } from "../../app/assets";
 import { useI18n } from "../../app/i18n";
+import { useNotify } from "../../app/notify";
+import { employeeDisplayDescription, employeeDisplayName } from "../../app/employees";
 
 const props = defineProps<{
   employee: Employee;
@@ -29,7 +31,9 @@ const props = defineProps<{
     content: string,
     collaboratorIds?: EmployeeId[],
     collaborationDelivery?: CollaborationDelivery,
+    onlineSearch?: boolean,
   ) => Promise<void>;
+  abortMessage?: () => void;
   approve: (
     conversationId: string,
     approval: ToolApproval,
@@ -46,6 +50,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const notify = useNotify();
 const draft = ref("");
 const menuOpen = ref(false);
 const collaboratorMenuOpen = ref(false);
@@ -53,6 +58,7 @@ const collaboratorIds = ref<EmployeeId[]>([]);
 const mentionMenuOpen = ref(false);
 const mentionActiveIndex = ref(0);
 const collaborationDelivery = ref<CollaborationDelivery>("direct");
+const onlineSearch = ref(true);
 const sending = ref(false);
 const approving = ref("");
 const approvalLabel: Record<ToolApproval["capability"], string> = {
@@ -101,11 +107,19 @@ async function submit() {
   collaborationDelivery.value = "direct";
   mentionMenuOpen.value = false;
   sending.value = true;
+  stickToBottom.value = true;
+  void nextTick(() => scrollMessagesToBottom(true));
   try {
-    await props.sendMessage(text, selected, delivery);
+    await props.sendMessage(text, selected, delivery, onlineSearch.value);
+  } catch (cause) {
+    notify.error(cause);
   } finally {
     sending.value = false;
   }
+}
+function stopGeneration() {
+  if (!sending.value) return;
+  props.abortMessage?.();
 }
 async function approve(item: ToolApproval, scope: "session" | "always") {
   if (!props.conversation) return;
@@ -195,7 +209,7 @@ function handleDraftKeydown(event: KeyboardEvent) {
   }
 }
 function collaboratorName(id: EmployeeId) {
-  return t(props.employees.find((item) => item.id === id)?.nameKey ?? id);
+  return employeeDisplayName(props.employees.find((item) => item.id === id), t) || id;
 }
 function collaborationState(item: CollaborationRun) {
   return item.status === "running"
@@ -225,6 +239,85 @@ function isAwaitingReply(message: Message) {
     message.role === "assistant" && pendingAssistantId.value === message.id
   );
 }
+
+const messageScrollRef = ref<HTMLElement | null>(null);
+const messageListRef = ref<HTMLElement | null>(null);
+const stickToBottom = ref(true);
+const SCROLL_NEAR_BOTTOM_PX = 96;
+let listResizeObserver: ResizeObserver | null = null;
+
+function isNearBottom(el: HTMLElement) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_NEAR_BOTTOM_PX;
+}
+
+function scrollMessagesToBottom(force = false) {
+  const el = messageScrollRef.value;
+  if (!el) return;
+  if (!force && !stickToBottom.value && !sending.value) return;
+  el.scrollTo({ top: el.scrollHeight, behavior: force ? "auto" : "smooth" });
+}
+
+function onMessageScroll() {
+  const el = messageScrollRef.value;
+  if (!el) return;
+  stickToBottom.value = isNearBottom(el);
+}
+
+const chatScrollSignal = computed(() => {
+  const conv = props.conversation;
+  if (!conv?.messages.length) return `empty:${conv?.id ?? ""}`;
+  const last = conv.messages[conv.messages.length - 1];
+  const activities = (last.activities ?? [])
+    .map((item) => `${item.toolName}:${item.status}:${item.summary.length}`)
+    .join("|");
+  const collaborations = (last.collaborations ?? [])
+    .map((item) => `${item.employeeId}:${item.status}:${item.summary.length}`)
+    .join("|");
+  return [
+    conv.id,
+    conv.messages.length,
+    last.id,
+    last.role,
+    last.content.length,
+    activities,
+    collaborations,
+    last.assets?.length ?? 0,
+    last.approvals?.length ?? 0,
+    sending.value,
+    pendingAssistantId.value ?? "",
+  ].join("\0");
+});
+
+watch(
+  () => props.conversation?.id,
+  () => {
+    stickToBottom.value = true;
+    void nextTick(() => scrollMessagesToBottom(true));
+  },
+);
+
+watch(chatScrollSignal, () => {
+  void nextTick(() => scrollMessagesToBottom(sending.value || stickToBottom.value));
+});
+
+watch(messageListRef, (el, _, onCleanup) => {
+  listResizeObserver?.disconnect();
+  listResizeObserver = null;
+  if (!el) return;
+  listResizeObserver = new ResizeObserver(() => {
+    if (stickToBottom.value || sending.value) scrollMessagesToBottom(false);
+  });
+  listResizeObserver.observe(el);
+  onCleanup(() => {
+    listResizeObserver?.disconnect();
+    listResizeObserver = null;
+  });
+});
+
+onBeforeUnmount(() => {
+  listResizeObserver?.disconnect();
+  listResizeObserver = null;
+});
 </script>
 
 <template>
@@ -242,7 +335,7 @@ function isAwaitingReply(message: Message) {
             :style="{ background: employee.color }"
             >{{ employee.initials }}</span
           ><span
-            ><strong class="block text-[13px]">{{ t(employee.nameKey) }}</strong
+            ><strong class="block text-[13px]">{{ employeeDisplayName(employee, t) }}</strong
             ><small class="block text-[11px] text-[var(--muted)]">{{
               t("employee.default")
             }}</small></span
@@ -261,7 +354,7 @@ function isAwaitingReply(message: Message) {
               menuOpen = false;
             "
           >
-            {{ t(item.nameKey) }}
+            {{ employeeDisplayName(item, t) }}
           </button>
         </div>
       </div>
@@ -306,8 +399,14 @@ function isAwaitingReply(message: Message) {
       <h1 class="text-4xl font-bold">{{ t("chat.greeting") }}</h1>
       <p class="mt-3 text-[var(--muted)]">{{ t("chat.subheading") }}</p>
     </div>
-    <div v-else class="min-h-0 flex-1 overflow-y-auto">
+    <div
+      v-else
+      ref="messageScrollRef"
+      class="min-h-0 flex-1 overflow-y-auto"
+      @scroll="onMessageScroll"
+    >
       <div
+        ref="messageListRef"
         class="mx-auto flex w-full max-w-[1240px] flex-col gap-6 px-6 py-9 lg:px-10"
       >
         <article
@@ -513,6 +612,15 @@ function isAwaitingReply(message: Message) {
               </article>
             </section>
             <section
+              v-if="message.role === 'assistant' && message.sources?.length"
+              class="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3"
+            >
+              <div class="mb-2 flex items-center gap-2 text-xs"><span class="grid h-5 w-5 place-items-center rounded-md bg-[var(--accent-soft)] text-[var(--accent)]">↗</span><strong>联网来源</strong><span class="text-[var(--muted)]">{{ message.sources.length }} 个可核查链接</span></div>
+              <div class="space-y-1.5">
+                <a v-for="source in message.sources" :key="source.url" :href="source.url" target="_blank" rel="noreferrer" class="flex items-center justify-between gap-3 rounded-lg bg-[var(--surface-muted)] px-2.5 py-2 text-xs hover:text-[var(--accent)]"><span class="min-w-0 truncate">{{ source.title }}</span><span class="shrink-0 text-[10px] text-[var(--muted)]">{{ source.source || source.provider }} ↗</span></a>
+              </div>
+            </section>
+            <section
               v-if="message.role === 'assistant' && message.assets?.length"
               class="mt-3 space-y-2"
             >
@@ -596,10 +704,10 @@ function isAwaitingReply(message: Message) {
                 :style="{ background: item.color }"
                 >{{ item.initials }}</span
               ><span class="min-w-0 flex-1"
-                ><strong class="block">{{ t(item.nameKey) }}</strong
+                ><strong class="block">{{ employeeDisplayName(item, t) }}</strong
                 ><small
                   class="block truncate text-[11px] text-[var(--muted)]"
-                  >{{ t(item.descriptionKey) }}</small
+                  >{{ employeeDisplayDescription(item, t) }}</small
                 ></span
               >
             </button>
@@ -685,10 +793,10 @@ function isAwaitingReply(message: Message) {
                     :style="{ background: item.color }"
                     >{{ item.initials }}</span
                   ><span class="min-w-0 flex-1"
-                    ><strong class="block">{{ t(item.nameKey) }}</strong
+                    ><strong class="block">{{ employeeDisplayName(item, t) }}</strong
                     ><small
                       class="block truncate text-[11px] text-[var(--muted)]"
-                      >{{ t(item.descriptionKey) }}</small
+                      >{{ employeeDisplayDescription(item, t) }}</small
                     ></span
                   ><span v-if="collaboratorIds.includes(item.id)">✓</span>
                 </button>
@@ -708,6 +816,13 @@ function isAwaitingReply(message: Message) {
               </div>
             </div>
           </div>
+          <label
+            class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-2.5 py-2 text-xs font-semibold"
+            :title="t('chat.onlineSearchHelp')"
+          >
+            <input v-model="onlineSearch" type="checkbox" :disabled="sending" />
+            <span :class="onlineSearch ? 'text-[var(--accent)]' : 'text-[var(--muted)]'">{{ t('chat.onlineSearch') }}</span>
+          </label>
           <select
             v-if="availableModels.length"
             class="max-w-[min(100%,280px)] truncate rounded-lg bg-[var(--surface-muted)] px-2 py-2 text-xs"
@@ -718,16 +833,27 @@ function isAwaitingReply(message: Message) {
           >
             <option
               v-for="item in availableModels"
-              :key="`${item.provider}::${item.chatModel}`"
-              :value="`${item.provider}::${item.chatModel}`"
+              :key="item.id"
+              :value="item.id"
             >
-              {{ t(`provider.${item.provider}`) }} · {{ item.chatModel }}
+              {{ item.providerLabel }} · {{ item.chatModel }}
             </option></select
           ><button
-            class="ml-auto grid h-9 w-9 place-items-center rounded-[10px] bg-[var(--accent)] text-xl text-white disabled:opacity-35"
-            :disabled="!draft.trim() || !modelConfigured || sending"
+            v-if="sending"
+            type="button"
+            class="ml-auto grid h-9 w-9 place-items-center rounded-[10px] bg-[var(--danger,#c0392b)] text-sm font-semibold text-white"
+            :title="t('chat.stop')"
+            @click="stopGeneration"
           >
-            {{ sending ? "…" : "↑" }}
+            ■
+          </button>
+          <button
+            v-else
+            type="submit"
+            class="ml-auto grid h-9 w-9 place-items-center rounded-[10px] bg-[var(--accent)] text-xl text-white disabled:opacity-35"
+            :disabled="!draft.trim() || !modelConfigured"
+          >
+            ↑
           </button>
         </div>
       </form>
