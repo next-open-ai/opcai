@@ -164,7 +164,30 @@ export class ProjectService {
           tasksTouched += 1;
         }
       }
-      if (!changed) continue;
+
+      // Scheduler orphan: project still "running" but no live execute() and no
+      // task currently running — remaining queued work will never start.
+      const hasLiveAttempt = project.tasks.some((task) => this.taskAborts.has(task.id));
+      const hasRunningTask = project.tasks.some((task) => task.status === 'running');
+      if (!hasLiveAttempt && !hasRunningTask && project.activeRunId) {
+        for (const task of project.tasks) {
+          if (task.status !== 'queued') continue;
+          task.status = 'failed';
+          task.error = '调度进程已中断，排队任务未执行。可点击「再次调度」继续。';
+          task.finishedAt = Date.now();
+          changed = true;
+          tasksTouched += 1;
+        }
+      }
+
+      if (!changed && hasLiveAttempt) continue;
+      if (!changed && hasRunningTask) continue;
+      // Even with no task mutations, close a project whose tasks are all terminal.
+      const allTerminal = project.tasks.every(
+        (task) => task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled',
+      );
+      if (!changed && !(allTerminal && project.activeRunId)) continue;
+
       projectsTouched += 1;
       await this.saveProject(project);
       this.hub.publish(`project:${project.id}`, { type: 'project.updated', projectId: project.id });

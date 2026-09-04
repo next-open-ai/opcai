@@ -187,12 +187,12 @@ async function refreshManaged(projectId: string): Promise<boolean> {
   const sp = await orch.getProject(projectId);
   const index = projects.value.findIndex((item) => item.id === projectId);
   if (!sp || index < 0) { stopManagedPoll(projectId); return false; }
-  // 服务端已不存在活动运行（或无 activeRunId）即视为终态，停止轮询。
-  if (!sp.activeRunId) { stopManagedPoll(projectId); return false; }
+
+  // Always adopt server truth first. Previously we returned early when
+  // `activeRunId` was cleared at finish — local UI stayed stuck on「执行中」.
   const next = adoptServerProject(sp, projects.value[index]);
   projects.value = [...projects.value.slice(0, index), next, ...projects.value.slice(index + 1)];
-  // Hydrate transcripts for settled tasks, and also for long-running tasks so
-  // mid-run checkpoints (activities/transcript) appear in member detail.
+
   for (const task of next.tasks) {
     if (task.status === "completed" && !task.transcript) {
       void hydrateManagedTask(next, task.id);
@@ -204,8 +204,16 @@ async function refreshManaged(projectId: string): Promise<boolean> {
       void hydratePendingApprovals(next, task);
     }
   }
-  if (sp.status === "completed" || sp.status === "failed" || sp.status === "cancelled") {
+
+  const settled =
+    !sp.activeRunId ||
+    sp.status === "completed" ||
+    sp.status === "failed" ||
+    sp.status === "cancelled";
+  if (settled) {
     await finishManagedRun(next);
+    stopManagedPoll(projectId);
+    return false;
   }
   return sp.status === "running";
 }
@@ -882,6 +890,8 @@ function openProject(project: Project) {
     project.tasks[0]?.id ??
     null;
   autoStartIfDraft(project);
+  // Re-sync managed projects so a finished server status is not stuck as「执行中」.
+  if (project.managedServer) void refreshManaged(project.id);
 }
 function updateTask(task: ProjectTask, patch: Partial<ProjectTask>) {
   Object.assign(task, patch);
