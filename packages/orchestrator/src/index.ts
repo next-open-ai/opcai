@@ -8,6 +8,14 @@ export type { KeyValueStore } from './storage/kv.js';
 export { RunEngine, RUN_NS } from './run-engine.js';
 export { ChatSessionService, SESSION_KEY_PREFIX } from './chat-session.js';
 export type { ChatRunContext, SendUserMessageInput, ResolveApprovalInput } from './chat-session.js';
+export {
+  buildSessionModelMessages,
+  canonicalTurns,
+  estimateSessionMemoryChars,
+  rollSessionMemory,
+  shouldRollSessionMemory,
+  uncoveredMessages,
+} from './session-memory.js';
 export { ProjectService, PROJECT_KEY_PREFIX, PROJECT_RUN_KEY_PREFIX } from './project.js';
 export type {
   CreateProjectDraftInput,
@@ -22,6 +30,7 @@ export type { ScriptedRunnerMode } from './echo-runner.js';
 export type {
   ChatMessage,
   ChatSession,
+  SessionMemory,
   GrantCapability,
   RunRecord,
   RunStatus,

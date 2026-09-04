@@ -13,6 +13,7 @@ export type OrcEvent =
   | { type: 'run.activity'; runId: string; activity: RunActivity }
   | { type: 'run.approval'; runId: string; approval: RunApproval }
   | { type: 'run.artifact'; runId: string; artifact: { path: string } }
+  | { type: 'project.file.published'; runId: string; path: string; projectPath: string; projectId?: string }
   | { type: 'run.sources'; runId: string; sources: RunRecord['sources'] }
   | { type: 'run.settled'; runId: string; sessionId: string; status: RunStatus; error?: string }
   /* chat sessions */

@@ -17,6 +17,7 @@ import { getSecrets } from './secrets.js';
  */
 
 const EMPLOYEES_KEY = 'workspace.custom-employees';
+const OVERRIDES_KEY = 'workspace.employee-overrides';
 const SKILLS_KEY = 'capabilities.skills.v2';
 const POLICIES_KEY = 'capabilities.employee-policies';
 const PREFS_KEY = 'workspace.employee-runtime-prefs';
@@ -30,6 +31,10 @@ const PRESET_EMPLOYEE_NAMES: Record<string, string> = {
   research: 'Research Assistant',
   code: 'Code Assistant',
   administrator: 'Administrator',
+};
+const PRESET_DEFAULT_INSTRUCTIONS: Record<string, string> = {
+  code:
+    '凡任务要求「按既定设计规范」但没有提供规范/品牌/页面清单：必须采用一份文档化的默认企业规范（主/辅色、字阶、12 列栅格、断点、页面清单写入 README.md），并直接产出核心可运行页面；不得因缺品牌/规范/文案而停下澄清。只输出文字、不写文件=失败；要么写文件，要么给出精确阻塞点+唯一需要的输入。',
 };
 
 const BASELINE_WORKSPACE_SKILL_ID = 'opcai-workspace';
@@ -85,10 +90,19 @@ function rows(value: unknown): Array<Record<string, unknown>> {
 }
 
 /** Build the agent profile for an employee (KV catalog + preset fallback). */
-function profileFor(employeeId: string, employees: EmployeeRow[]): ChatRunContext['profile'] {
+function profileFor(
+  employeeId: string,
+  employees: EmployeeRow[],
+  overrides: Record<string, { description?: string; instructions?: string }>,
+): ChatRunContext['profile'] {
   const found = employees.find((item) => item.id === employeeId);
-  const name = found?.name?.trim() || PRESET_EMPLOYEE_NAMES[employeeId] || 'General Assistant';
-  const instructions = found?.instructions?.trim() || `${name}（OPCAI 数字员工）。按要求完成任务，不虚构执行结果。`;
+  const override = overrides[employeeId];
+  const name = found?.name?.trim() || override?.description?.trim() || PRESET_EMPLOYEE_NAMES[employeeId] || 'General Assistant';
+  const instructions =
+    override?.instructions?.trim() ||
+    found?.instructions?.trim() ||
+    PRESET_DEFAULT_INSTRUCTIONS[employeeId] ||
+    `${name}（OPCAI 数字员工）。按要求完成任务，不虚构执行结果。`;
   return { id: employeeId, name, instructions, toolIds: [] };
 }
 
@@ -262,6 +276,8 @@ async function knowledgeBasesFor(store: KeyValueStore, prefs: PrefsRow): Promise
  */
 export async function resolveTaskContext(store: KeyValueStore, task: ProjectTask): Promise<ChatRunContext | null> {
   const employees = rows(await kvJson(store, EMPLOYEES_KEY)) as EmployeeRow[];
+  const overridesRaw = await kvJson(store, OVERRIDES_KEY);
+  const overrides = overridesRaw && typeof overridesRaw === 'object' ? (overridesRaw as Record<string, { description?: string; instructions?: string }>) : {};
   const prefsRaw = await kvJson(store, PREFS_KEY);
   const prefsAll = prefsRaw && typeof prefsRaw === 'object' ? (prefsRaw as Record<string, unknown>) : {};
   const prefs = (prefsAll[task.employeeId] ?? {}) as PrefsRow;
@@ -278,7 +294,7 @@ export async function resolveTaskContext(store: KeyValueStore, task: ProjectTask
   const mcpToolTimeoutMs = prefs.mcpToolTimeoutMs ?? 60_000;
 
   return {
-    profile: profileFor(task.employeeId, employees),
+    profile: profileFor(task.employeeId, employees, overrides),
     model: enableSearch ? { ...model, enableSearch: true } : model,
     skills: await skillRuntimeFor(store, task, tier),
     searchProviders: enableSearch ? [] : searchProvidersFor(prefs, secrets.search),

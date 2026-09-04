@@ -71,7 +71,7 @@ export interface ServerTask {
   employeeId: string;
   skillIds: string[];
   dependsOn: string[];
-  permissionTier: 'read-only' | 'default' | 'extended' | 'full';
+  permissionTier: 'read-only' | 'default' | 'full';
   status: ServerTaskStatus;
   attempts: number;
   startedAt?: number;
@@ -133,6 +133,8 @@ export interface OrcEvent {
   activity?: ServerRunActivity;
   approval?: ServerRunApproval;
   artifact?: { path: string };
+  path?: string;
+  projectPath?: string;
   sources?: ServerRunRecord['sources'];
   message?: ServerMessage;
   error?: string;
@@ -257,6 +259,12 @@ export interface ServerChatSession {
   employeeId: string;
   modelLabel?: string;
   messages: ServerChatMessage[];
+  memory?: {
+    summary: string;
+    coveredUntilId: string;
+    updatedAt: number;
+    dirty: boolean;
+  };
   channelBinding?: { channelId: string; threadId: string } | null;
   grantsSession: Record<string, GrantCapability[]>;
   grantsAlways: Record<string, GrantCapability[]>;
@@ -298,6 +306,19 @@ export async function sendChatMessage(id: string, input: { content: string; empl
 export async function cancelChatRun(id: string): Promise<boolean> {
   const result = await request<{ aborted: boolean }>(`/sessions/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: JSON.stringify({}) });
   return result.aborted;
+}
+
+/** Flush durable session rolling memory (call when leaving a chat). */
+export async function flushChatSessionMemory(id: string): Promise<ServerChatSession | null> {
+  try {
+    const result = await request<{ session: ServerChatSession }>(`/sessions/${encodeURIComponent(id)}/memory/flush`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    return result.session;
+  } catch {
+    return null;
+  }
 }
 
 export async function chatPendingApprovals(id: string): Promise<ServerRunRecord[]> {

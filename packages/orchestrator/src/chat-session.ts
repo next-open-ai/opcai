@@ -1,9 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { ChatRequest } from '@opcai/contracts';
+import type { ChatRequest, ModelConfig } from '@opcai/contracts';
 import type { EventHub, HubListener } from './hub.js';
 import { deleteKey, listJsonIds, readJson, writeJson } from './repo.js';
 import type { OrcEvent } from './run-engine.js';
 import { RunEngine } from './run-engine.js';
+import {
+  buildSessionModelMessages,
+  estimateSessionMemoryChars,
+  rollSessionMemory,
+  shouldRollSessionMemory,
+  uncoveredMessages,
+} from './session-memory.js';
 import type { KeyValueStore } from './storage/kv.js';
 import { namespaceKey } from './storage/kv.js';
 import type { ChatMessage, ChatSession, GrantCapability, RunRecord } from './types.js';
@@ -175,7 +182,7 @@ export class ChatSessionService {
     await this.saveSession(session);
 
     const request = this.requestForTurn(session, runContext, turnId);
-    void this.settleRun(session.id, runId, turnId, attemptNo, request, assistantMessage.id, abort.signal);
+    void this.settleRun(session.id, runId, turnId, attemptNo, { ...request, runId }, assistantMessage.id, abort.signal);
     return { runId, turnId, attemptNo };
   }
 
@@ -186,12 +193,12 @@ export class ChatSessionService {
     return true;
   }
 
-  /** Build a ChatRequest for a turn: context + canonical history up to the turn. */
+  /**
+   * Build a ChatRequest for a turn: context + session rolling memory + recent
+   * uncovered history (or full history when no summary exists yet).
+   */
   private requestForTurn(session: ChatSession, context: ChatRunContext, turnId: string): ChatRequest {
-    const history = this.messagesOf(session)
-      .filter((message) => message.turnId !== turnId || message.role === 'user')
-      .filter((message) => message.content.trim().length > 0)
-      .map((message) => ({ role: message.role as 'user' | 'assistant', content: message.content }));
+    const history = buildSessionModelMessages(session, { turnId });
     return { ...context, messages: history };
   }
 
@@ -214,10 +221,59 @@ export class ChatSessionService {
         message.runId = run.id;
       }
       session.updatedAt = Date.now();
+      if (run.status !== 'waiting-approval') {
+        await this.refreshSessionMemory(session, request.model, { force: false });
+      } else if (session.memory) {
+        session.memory = { ...session.memory, dirty: true };
+      } else {
+        session.memory = { summary: '', coveredUntilId: '', updatedAt: Date.now(), dirty: true };
+      }
       await this.saveSession(session);
     } finally {
       if (this.activeAborts.get(sessionId)?.signal === signal) this.activeAborts.delete(sessionId);
     }
+  }
+
+  /**
+   * Roll session memory when over budget (or forced on flush). Marks dirty
+   * when uncovered turns remain. Never truncates the transcript.
+   */
+  private async refreshSessionMemory(session: ChatSession, model: ModelConfig, options: { force: boolean }) {
+    try {
+      const { memory } = await rollSessionMemory({ session, model, force: options.force });
+      session.memory = memory;
+      if (!options.force) session.memory.dirty = true;
+    } catch {
+      if (session.memory) session.memory = { ...session.memory, dirty: true };
+      else session.memory = { summary: '', coveredUntilId: '', updatedAt: Date.now(), dirty: true };
+    }
+  }
+
+  /**
+   * Flush rolling memory for a session (switch/idle/close). Rolls when over
+   * budget or when force-folding excess beyond the recent window; clears dirty
+   * when maintenance completes (or when there is nothing to fold).
+   */
+  async flushSessionMemory(sessionId: string, model?: ModelConfig): Promise<ChatSession | null> {
+    const session = await this.getChatSession(sessionId);
+    if (!session) return null;
+    const summary = session.memory?.summary || '';
+    const uncovered = uncoveredMessages(session.messages, session.memory?.coveredUntilId);
+    const needsWork = Boolean(session.memory?.dirty)
+      || shouldRollSessionMemory({ summary, uncovered, force: true })
+      || estimateSessionMemoryChars(summary, uncovered) >= 24_000;
+    if (!needsWork) return session;
+
+    const runContext = await this.resolveContextFor(session.employeeId);
+    const resolvedModel = model ?? runContext?.model;
+    if (!resolvedModel) {
+      await this.saveSession(session);
+      return session;
+    }
+    await this.refreshSessionMemory(session, resolvedModel, { force: true });
+    if (session.memory) session.memory.dirty = false;
+    await this.saveSession(session);
+    return session;
   }
 
   /* ------------------------------------------------------------------ *
@@ -285,7 +341,7 @@ export class ChatSessionService {
     const resumedRunId = randomUUID();
     const assistantId = this.assistantForTurn(session, turnId, resumedRunId);
     const request = this.requestForTurn(session, resumeContext, turnId);
-    void this.settleRun(session.id, resumedRunId, turnId, attemptNo, request, assistantId, abort.signal);
+    void this.settleRun(session.id, resumedRunId, turnId, attemptNo, { ...request, runId: resumedRunId }, assistantId, abort.signal);
     await this.saveSession(session);
     return { run: waiting, resumedRunId, turnId };
   }

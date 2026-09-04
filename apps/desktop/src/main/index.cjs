@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage, screen, protocol, net } = require('electron');
-const { fork, execFile } = require('node:child_process');
+const { fork, execFile, spawnSync } = require('node:child_process');
 const { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require('node:fs');
 const { createHash, randomUUID } = require('node:crypto');
 const { tmpdir } = require('node:os');
@@ -187,20 +187,55 @@ function listProjectFiles(root, directory = projectRoot(root), relative = '', de
 }
 function readProjectFile(root, relative) { const file = projectPath(root, relative); if (!existsSync(file) || !statSync(file).isFile()) throw new Error('Project file is unavailable.'); return { relative, content: readFileSync(file, 'utf8') }; }
 function writeProjectFile(root, relative, content) { const file = projectPath(root, relative); mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); writeFileSync(file, String(content), { mode: 0o600 }); return { relative, content: String(content) }; }
+// 只把真正交付给用户的文件同步进项目目录；中间过渡脚本/产物留在运行工作区。
+const DELIVERABLE_EXT = new Set(['html', 'htm', 'css', 'js', 'mjs', 'md', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'json', 'pdf', 'txt', 'csv', 'ico', 'woff', 'woff2', 'ttf']);
+// 运行中间件/脚本/模板目录：这些内容不进入项目目录。
+const INTERMEDIATE_DIRS = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
+function isDeliverablePath(from) {
+  const base = path.basename(from);
+  if (INTERMEDIATE_DIRS.has(base)) return false;
+  if (['.DS_Store', '.git'].includes(base)) return false;
+  const parts = from.split(path.sep);
+  if (parts.some((part) => INTERMEDIATE_DIRS.has(part))) return false;
+  if (String(base).startsWith('.') && base !== '.gitkeep') return false;
+  // cpSync：对目录返回 false 会跳过整棵子树（含根目录），必须允许目录遍历。
+  try {
+    if (existsSync(from) && statSync(from).isDirectory()) return true;
+  } catch { /* treat as file below */ }
+  const ext = path.extname(base).slice(1).toLowerCase();
+  // 脚本/源文件属于中间件，不进项目目录。
+  if (['py', 'sh', 'cjs', 'mjs', 'ts', 'tsx', 'jsx', 'map'].includes(ext)) return false;
+  return DELIVERABLE_EXT.has(ext);
+}
+
+/** 编排层 runId 与 agent-core 实际工作区目录可能不一致；从 RunRecord.eventLog 解析真实 workspace id。 */
+function resolveWorkspaceRunIds(runId) {
+  const ids = new Set([String(runId)]);
+  try {
+    const domainPath = path.join(storageRoot(), 'domain.json');
+    if (!existsSync(domainPath)) return [...ids];
+    const domain = JSON.parse(readFileSync(domainPath, 'utf8'));
+    const raw = domain?.kv?.[`run:${runId}`];
+    if (!raw) return [...ids];
+    const run = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    for (const event of Array.isArray(run?.eventLog) ? run.eventLog : []) {
+      if (event && typeof event.runId === 'string' && event.runId.trim()) ids.add(event.runId.trim());
+    }
+  } catch { /* best-effort recovery */ }
+  return [...ids];
+}
+
 function syncRunWorkspaceToProject(root, runId) {
-  const source = path.join(storageRoot(), 'workspaces', String(runId));
-  if (!existsSync(source)) return [];
   const target = projectRoot(root);
-  cpSync(source, target, {
-    recursive: true,
-    filter: (from) => {
-      const base = path.basename(from);
-      if (['.python-packages', '__pycache__', '.DS_Store'].includes(base)) return false;
-      // Agent scaffolding / process scripts are not project deliverables.
-      if (/\.(py|sh)$/i.test(base)) return false;
-      return true;
-    },
-  });
+  mkdirSync(target, { recursive: true, mode: 0o700 });
+  for (const id of resolveWorkspaceRunIds(runId)) {
+    const source = path.join(storageRoot(), 'workspaces', String(id));
+    if (!existsSync(source) || !statSync(source).isDirectory()) continue;
+    cpSync(source, target, {
+      recursive: true,
+      filter: (from) => isDeliverablePath(from),
+    });
+  }
   return listProjectFiles(target);
 }
 function materializeProjectAssets(root, assetIds) {
@@ -230,7 +265,14 @@ function registerPreviewRoot(root) {
 }
 
 function revealProjectFile(root, relative) {
-  const file = projectPath(root, relative);
+  const normalized = String(relative || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!normalized) {
+    const folder = projectRoot(root);
+    if (!existsSync(folder)) throw new Error('Project workspace is unavailable.');
+    void shell.openPath(folder);
+    return true;
+  }
+  const file = projectPath(root, normalized);
   if (!existsSync(file)) throw new Error('Project file is unavailable.');
   shell.showItemInFolder(file);
   return true;
@@ -922,10 +964,17 @@ async function waitForApi() {
 
 async function createWindow() {
   await waitForApi();
-  const { width: workAreaWidth, height: workAreaHeight } = screen.getPrimaryDisplay().workAreaSize;
+  // Near work-area size with a small inset — almost fills the screen, not maximized/fullscreen.
+  const workArea = screen.getPrimaryDisplay().workArea;
+  const marginX = Math.max(16, Math.round(workArea.width * 0.02));
+  const marginY = Math.max(16, Math.round(workArea.height * 0.025));
+  const width = Math.max(1180, workArea.width - marginX * 2);
+  const height = Math.max(760, workArea.height - marginY * 2);
   mainWindow = new BrowserWindow({
-    width: Math.round(workAreaWidth * 0.96),
-    height: Math.round(workAreaHeight * 0.94),
+    x: workArea.x + Math.round((workArea.width - width) / 2),
+    y: workArea.y + Math.round((workArea.height - height) / 2),
+    width,
+    height,
     minWidth: 1180,
     minHeight: 760,
     show: false,
@@ -950,6 +999,168 @@ async function createWindow() {
   // and leave a hidden process with no visible window. Loading has completed
   // at this point, so show the shell deterministically.
   mainWindow.show();
+}
+
+/* ------------------------------------------------------------------ *
+ * Environment checks (startup / “环境” page)
+ * ------------------------------------------------------------------ */
+
+function execCapture(command, args, timeoutMs = 8000) {
+  try {
+    const result = spawnSync(command, args, { encoding: 'utf8', timeout: timeoutMs, windowsHide: true });
+    if (result.error) return null;
+    return { code: result.status ?? -1, stdout: String(result.stdout || '').trim(), stderr: String(result.stderr || '').trim() };
+  } catch (_) {
+    return null;
+  }
+}
+
+function semverFirstTwo(text) {
+  const match = String(text).match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+  return match ? { major: Number(match[1]), minor: Number(match[2]), patch: match[3] ? Number(match[3]) : 0 } : null;
+}
+
+function platformLabel() {
+  const p = process.platform;
+  if (p === 'darwin') return 'macOS';
+  if (p === 'win32') return 'Windows';
+  if (p === 'linux') return 'Linux';
+  return p;
+}
+
+/** Detects a usable Python 3 interpreter (python3 / python / py). */
+function detectPython() {
+  const candidates = process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python'];
+  for (const command of candidates) {
+    const args = command === 'py' ? ['-3', '--version'] : ['--version'];
+    const result = execCapture(command, args, 6000);
+    if (result && result.code === 0) {
+      const text = `${result.stdout || ''} ${result.stderr || ''}`;
+      const version = semverFirstTwo(text);
+      if (version) return { command, version };
+    }
+  }
+  return null;
+}
+
+async function runEnvironmentChecks(onProgress) {
+  const push = (payload) => { try { onProgress?.(payload); } catch (_) { /* ignore */ } };
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  const isWin = process.platform === 'win32';
+  const items = [];
+
+  const begin = async (id, name, required) => { push({ kind: 'start', id, name, required }); await tick(); };
+  const finish = async (item) => { items.push(item); push({ kind: 'item', item }); await tick(); };
+
+  // Node.js / Electron（信息性）
+  await begin('node', 'Node.js（运行时）', '>= 22');
+  const nodeVersion = semverFirstTwo(process.versions.node);
+  const nodeOk = nodeVersion && nodeVersion.major >= 22;
+  await finish({
+    id: 'node', name: 'Node.js（运行时）', status: nodeOk ? 'ok' : 'error', required: '>= 22', found: `v${process.versions.node}`,
+    help: nodeOk
+      ? '桌面与本地服务依赖 Node 22+ 运行时。'
+      : `当前 Node 为 v${process.versions.node}。请安装 Node.js 22+（推荐 22 LTS）后重启应用。\nmacOS: brew install node@22；Windows: winget install OpenJS.NodeJS.LTS 或从 nodejs.org 安装；Linux: 使用 nvm 或发行版源安装 Node 22。`,
+  });
+
+  await begin('electron', 'Electron（桌面壳）', '随应用内置');
+  await finish({ id: 'electron', name: 'Electron（桌面壳）', status: 'ok', required: '随应用内置', found: `v${process.versions.electron}`, help: 'Electron 随安装包内置，无需单独安装。' });
+
+  // Python 3
+  await begin('python', 'Python 3（脚本/依赖安装）', '3.9+（python3/python/py）');
+  const python = detectPython();
+  const pythonOk = Boolean(python && python.version.major === 3 && python.version.minor >= 9);
+  await finish({
+    id: 'python', name: 'Python 3（脚本/依赖安装）', status: pythonOk ? 'ok' : 'error', required: '3.9+（命令解析为 python3/python/py）',
+    found: python ? `${python.command} v${python.version.major}.${python.version.minor}.${python.version.patch}` : '未检测到可用的 Python 3',
+    command: python ? `${python.command} --version` : undefined,
+    help: pythonOk
+      ? `将使用 ${python.command} 执行 Skill/工作区脚本并用 python -m pip install --target 安装隔离依赖。`
+      : isWin
+        ? '未找到 Python 3。安装方式：\n  1) Microsoft Store：安装 “Python 3.12”；\n  2) 或 winget install Python.Python.3.12；\n  3) 或 python.org 下载安装器并勾选 “Add python.exe to PATH”。\n安装后请重启本应用。若系统只有 “py” 启动器，我们已自动使用 py -3 探测。'
+        : process.platform === 'darwin'
+          ? '未找到 Python 3。推荐安装：\n  brew install python@3.12\n安装后请重启本应用（/usr/local/bin 或 /opt/homebrew/bin 需在 PATH）。'
+          : '未找到 Python 3。推荐安装：\n  sudo apt update && sudo apt install -y python3 python3-pip（Debian/Ubuntu）\n  或 dnf install python3 python3-pip（Fedora）\n安装后请重启本应用。',
+  });
+
+  // pip
+  await begin('pip', 'pip（Python 包安装，隔离安装到运行工作区）', '可用（python -m pip）');
+  let pipOk = false;
+  let pipFound = '未检测到 pip';
+  if (python) {
+    const args = python.command === 'py' ? ['-3', '-m', 'pip', '--version'] : ['-m', 'pip', '--version'];
+    const pip = execCapture(python.command, args, 8000);
+    pipOk = Boolean(pip && pip.code === 0);
+    pipFound = pipOk ? `${python.command} -m pip` : '未检测到 pip（python -m pip 失败）';
+  }
+  await finish({
+    id: 'pip', name: 'pip（Python 包安装，隔离安装到运行工作区）', status: pipOk ? 'ok' : 'error', required: '可用（python -m pip）', found: pipFound,
+    help: pipOk
+      ? '将以 python -m pip install --target 把依赖安装到每次运行的隔离工作区，不改系统 Python。'
+      : pythonOk
+        ? '检测到 Python 但 pip 不可用。多数发行版需单独安装：macOS: brew install python@3.12（含 pip）；Debian/Ubuntu: sudo apt install -y python3-pip；Windows: 使用 python.org 安装器（勾选 pip）或 python -m ensurepip。'
+        : '需先按上方 Python 指引安装 Python 3（一般自带 pip）。',
+  });
+
+  // git
+  await begin('git', 'Git（Skills 仓库导入/克隆）', '可用（git --version）');
+  const git = execCapture(isWin ? 'git' : 'git', ['--version'], 5000);
+  const gitOk = Boolean(git && git.code === 0);
+  await finish({
+    id: 'git', name: 'Git（Skills 仓库导入/克隆）', status: gitOk ? 'ok' : 'error', required: '可用（git --version）',
+    found: gitOk ? (git.stdout || git.stderr || 'git') : '未检测到 git',
+    help: gitOk
+      ? '用于从 GitHub/GitLab/Gitee 导入 Skills 仓库。'
+      : isWin
+        ? '未检测到 git。请从 git-scm.com 下载安装并勾选 “Add to PATH”，安装 Git for Windows 后重启本应用。'
+        : process.platform === 'darwin'
+          ? '未检测到 git。macOS 首次使用会弹出 “command line developer tools”，或执行：xcode-select --install；也可 brew install git。安装后重启本应用。'
+          : '未检测到 git。Debian/Ubuntu: sudo apt install -y git；Fedora: sudo dnf install git。安装后重启本应用。',
+  });
+
+  // npx
+  await begin('npx', 'npx（Skills 生态安装器）', '可用（随 Node 提供）');
+  const npx = execCapture(isWin ? 'npx.cmd' : 'npx', ['--version'], 8000);
+  const npxOk = Boolean(npx && npx.code === 0);
+  await finish({
+    id: 'npx', name: 'npx（Skills 生态安装器）', status: npxOk ? 'ok' : 'warn', required: '可用（随 Node 提供）',
+    found: npxOk ? `v${npx.stdout || npx.stderr || ''}`.trim() || 'npx' : '未检测到 npx',
+    help: npxOk
+      ? '用于 npx skills add … 安装公开 Skill 包。'
+      : '未检测到 npx。npx 随 Node.js 一起提供：请先按 Node 指引安装 Node 22+，或重装 Node（勾选 npm）。安装后重启本应用。',
+  });
+
+  // 数据目录可写（~/.opcai）
+  await begin('storage', '本地数据目录（~/.opcai）', '可读写');
+  let storageOk = true;
+  let storageError = '';
+  try {
+    const root = storageRoot();
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const probe = path.join(root, '.write-probe');
+    writeFileSync(probe, 'ok');
+    rmSync(probe, { force: true });
+  } catch (cause) {
+    storageOk = false;
+    storageError = cause instanceof Error ? cause.message : String(cause);
+  }
+  await finish({
+    id: 'storage', name: '本地数据目录（~/.opcai）', status: storageOk ? 'ok' : 'error', required: '可读写',
+    found: storageOk ? storageRoot() : storageError,
+    help: storageOk
+      ? '会话、项目、资产、Skill 与域数据保存在该目录。'
+      : `无法写入 ${storageRoot()}。请检查磁盘空间、目录权限；macOS/Linux 可执行 chmod 700，Windows 请确认用户对该路径有写权限后重启本应用。`,
+  });
+
+  const summary = {
+    total: items.length,
+    ok: items.filter((item) => item.status === 'ok').length,
+    warn: items.filter((item) => item.status === 'warn').length,
+    error: items.filter((item) => item.status === 'error').length,
+  };
+  const report = { platform: platformLabel(), checks: items, summary, checkedAt: Date.now() };
+  push({ kind: 'done', report });
+  return report;
 }
 
 app.whenReady().then(async () => {
@@ -1056,6 +1267,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('opcai:get-channel-settings', () => getChannelSettings());
   ipcMain.handle('opcai:save-channel-settings', async (_, payload) => saveChannelSettings(payload));
   ipcMain.handle('opcai:gateway-status', () => gatewayStatus());
+  ipcMain.handle('opcai:env-check', async (event) => runEnvironmentChecks((payload) => event.sender.send('opcai:env-check-progress', payload)));
   ipcMain.handle('opcai:gateway-restart', () => gatewayRestart());
   ipcMain.handle('opcai:list-assets', () => listAssets());
   ipcMain.handle('opcai:archive-artifact', (_, value) => archiveArtifact(value));

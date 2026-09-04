@@ -40,6 +40,8 @@ const props = defineProps<{
   createEmployee: (draft: EmployeeDraft) => Promise<Employee>;
   updateEmployee: (id: EmployeeId, draft: EmployeeDraft) => Promise<Employee>;
   removeEmployee: (id: EmployeeId) => Promise<void>;
+  resetEmployee: (id: EmployeeId) => Promise<void>;
+  hasEmployeeOverride: (id: EmployeeId) => boolean;
 }>();
 const emit = defineEmits<{ startChat: [id: EmployeeId] }>();
 const { t } = useI18n();
@@ -269,6 +271,11 @@ async function saveProfile() {
   }
 }
 
+async function onResetPreset(employee: Employee) {
+  await props.resetEmployee(employee.id);
+  notify.success(t('employee.resetDone'));
+}
+
 async function onDelete(employee: Employee) {
   if (!isEditableEmployee(employee)) return;
   if (!window.confirm(t('employee.deleteConfirm', { name: displayName(employee) }))) return;
@@ -383,8 +390,11 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
             <button v-if="canEditSelected" class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold hover:border-[var(--accent)]" type="button" @click="openEdit(selectedEmployee)">
               {{ t('employee.edit') }}
             </button>
-            <button v-if="canEditSelected" class="rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-500/10" type="button" @click="onDelete(selectedEmployee)">
+            <button v-if="canEditSelected && !isPresetEmployee(selectedEmployee)" class="rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-500/10" type="button" @click="onDelete(selectedEmployee)">
               {{ t('employee.delete') }}
+            </button>
+            <button v-if="isPresetEmployee(selectedEmployee) && props.hasEmployeeOverride(selectedEmployee.id)" class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold hover:border-[var(--accent)]" type="button" @click="onResetPreset(selectedEmployee)">
+              {{ t('employee.resetPreset') }}
             </button>
             <button class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white" type="button" @click="emit('startChat', selectedEmployee.id)">{{ t('employee.start') }}</button>
           </div>
@@ -600,62 +610,94 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
     </template>
 
     <div v-if="formOpen" class="fixed inset-0 z-40 grid place-items-center bg-slate-950/40 p-5" @click.self="closeForm">
-      <article class="w-full max-w-lg rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-2xl">
-        <div class="flex items-start justify-between gap-3">
+      <article class="flex max-h-[min(86vh,720px)] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-2xl">
+        <header class="flex items-start justify-between gap-3 border-b border-[var(--border)] px-6 py-4">
           <div>
-            <p class="text-[11px] font-extrabold tracking-[.12em] text-[var(--accent)]">EMPLOYEE · PROFILE</p>
-            <h2 class="mt-1 text-xl font-bold">{{ editingId ? t('employee.edit') : t('employee.create') }}</h2>
-            <p class="mt-1 text-xs text-[var(--muted)]">{{ t('employee.formHelp') }}</p>
+            <p class="text-[10px] font-extrabold tracking-[.14em] text-[var(--accent)]">EMPLOYEE · PROFILE</p>
+            <h2 class="mt-1 text-xl font-bold tracking-[-.02em]">{{ editingId ? t('employee.edit') : t('employee.create') }}</h2>
+            <p class="mt-1 text-xs leading-relaxed text-[var(--muted)]">{{ t('employee.formHelp') }}</p>
           </div>
-          <button class="text-xl text-[var(--muted)]" type="button" @click="closeForm">×</button>
-        </div>
+          <button class="grid h-8 w-8 place-items-center rounded-lg text-xl text-[var(--muted)] hover:bg-[var(--surface-muted)]" type="button" @click="closeForm">×</button>
+        </header>
 
-        <form class="mt-5 space-y-3" @submit.prevent="saveProfile">
-          <label class="grid gap-1.5 text-xs font-semibold text-[var(--muted)]">
-            <span>{{ t('employee.formName') }}</span>
-            <input v-model.trim="draft.name" class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-normal" required maxlength="48" />
-          </label>
-          <label class="grid gap-1.5 text-xs font-semibold text-[var(--muted)]">
-            <span>{{ t('employee.formDescription') }}</span>
-            <textarea v-model.trim="draft.description" rows="3" class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-normal" required maxlength="240" />
-          </label>
-          <label class="grid gap-1.5 text-xs font-semibold text-[var(--muted)]">
-            <span>{{ t('employee.formInstructions') }}</span>
-            <textarea v-model.trim="draft.instructions" rows="3" class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-normal" :placeholder="t('employee.formInstructionsHint')" maxlength="1200" />
-          </label>
-          <div class="grid gap-3 sm:grid-cols-[120px_1fr]">
-            <label class="grid gap-1.5 text-xs font-semibold text-[var(--muted)]">
-              <span>{{ t('employee.formInitials') }}</span>
-              <input v-model.trim="draft.initials" class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-normal uppercase" maxlength="4" />
+        <form class="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5" @submit.prevent="saveProfile">
+          <div class="space-y-4">
+            <label class="block text-xs font-semibold text-[var(--muted)]">
+              <span>{{ t('employee.formName') }}</span>
+              <input
+                v-model.trim="draft.name"
+                class="mt-1.5 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5 text-sm font-normal outline-none transition focus:border-[var(--accent)]"
+                required
+                maxlength="48"
+              />
             </label>
-            <div class="grid gap-1.5 text-xs font-semibold text-[var(--muted)]">
+            <label class="block text-xs font-semibold text-[var(--muted)]">
+              <span>{{ t('employee.formDescription') }}</span>
+              <textarea
+                v-model.trim="draft.description"
+                rows="3"
+                class="mt-1.5 w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5 text-sm font-normal outline-none transition focus:border-[var(--accent)]"
+                required
+                maxlength="240"
+              />
+            </label>
+            <label class="block text-xs font-semibold text-[var(--muted)]">
+              <span>{{ t('employee.formInstructions') }}</span>
+              <textarea
+                v-model.trim="draft.instructions"
+                rows="4"
+                class="mt-1.5 w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5 text-sm font-normal outline-none transition focus:border-[var(--accent)]"
+                :placeholder="t('employee.formInstructionsHint')"
+                maxlength="1200"
+              />
+              <span class="mt-1.5 block text-[11px] font-normal leading-4 text-[var(--muted)]">{{ t('employee.formInstructionsHelp') }}</span>
+            </label>
+          </div>
+
+          <div class="grid gap-4 sm:grid-cols-[150px_1fr]">
+            <label class="block text-xs font-semibold text-[var(--muted)]">
+              <span>{{ t('employee.formInitials') }}</span>
+              <input
+                v-model.trim="draft.initials"
+                class="mt-1.5 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5 text-center text-sm font-semibold uppercase outline-none transition focus:border-[var(--accent)]"
+                maxlength="4"
+              />
+            </label>
+            <div class="text-xs font-semibold text-[var(--muted)]">
               <span>{{ t('employee.formColor') }}</span>
-              <div class="flex flex-wrap gap-2">
+              <div class="mt-2 flex flex-wrap gap-2.5">
                 <button
                   v-for="color in EMPLOYEE_COLOR_PRESETS"
                   :key="color"
                   type="button"
-                  :class="['h-8 w-8 rounded-full border-2 transition', draft.color === color ? 'border-[var(--foreground)] scale-110' : 'border-transparent']"
+                  :aria-label="color"
+                  :class="[
+                    'grid h-9 w-9 place-items-center rounded-full text-xs font-bold text-white transition',
+                    draft.color === color ? 'scale-110 ring-2 ring-[var(--foreground)] ring-offset-2 ring-offset-[var(--surface)]' : 'ring-1 ring-transparent hover:ring-[var(--border)]',
+                  ]"
                   :style="{ background: color }"
                   @click="draft.color = color"
-                />
+                >{{ draft.color === color ? '✓' : '' }}</button>
               </div>
             </div>
           </div>
-          <div class="flex items-center gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-3">
-            <span class="grid h-11 w-11 place-items-center rounded-xl text-[11px] font-extrabold text-white" :style="{ background: draft.color }">{{ (draft.initials || draft.name || 'AI').slice(0, 4) }}</span>
+
+          <div class="flex items-center gap-3 rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/50 px-4 py-3.5">
+            <span class="grid h-12 w-12 shrink-0 place-items-center rounded-2xl text-sm font-extrabold text-white" :style="{ background: draft.color }">{{ (draft.initials || draft.name || 'AI').slice(0, 4) }}</span>
             <div class="min-w-0">
-              <strong class="block truncate text-sm">{{ draft.name || t('employee.formName') }}</strong>
-              <p class="truncate text-xs text-[var(--muted)]">{{ draft.description || t('employee.formDescription') }}</p>
+              <strong class="block truncate text-sm font-semibold">{{ draft.name || t('employee.formName') }}</strong>
+              <p class="mt-0.5 truncate text-xs text-[var(--muted)]">{{ draft.description || t('employee.formDescription') }}</p>
             </div>
-          </div>
-          <div class="flex justify-end gap-2 pt-2">
-            <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold" type="button" @click="closeForm">{{ t('common.cancel') }}</button>
-            <button class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-50" type="submit" :disabled="savingProfile">
-              {{ savingProfile ? t('employee.saving') : t('employee.saveProfile') }}
-            </button>
+            <span class="ml-auto shrink-0 rounded-full bg-[var(--surface-muted)] px-2 py-0.5 text-[10px] font-semibold text-[var(--muted)]">{{ editingId ? t('employee.edit') : t('employee.new') }}</span>
           </div>
         </form>
+
+        <footer class="flex items-center justify-end gap-2 border-t border-[var(--border)] px-6 py-4">
+          <button class="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-semibold text-[var(--muted)] hover:bg-[var(--surface-muted)]" type="button" @click="closeForm">{{ t('common.cancel') }}</button>
+          <button class="rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50" type="submit" :disabled="savingProfile">
+            {{ savingProfile ? t('employee.saving') : t('employee.saveProfile') }}
+          </button>
+        </footer>
       </article>
     </div>
 

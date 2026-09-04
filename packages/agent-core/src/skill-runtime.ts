@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { tool, type Tool } from 'ai';
@@ -15,6 +15,70 @@ const MAX_SCRIPT_OUTPUT = 32_000;
 const SCRIPT_TIMEOUT_MS = 30_000;
 const textFilePattern = /\.(md|txt|json|ya?ml|csv|html?|css|ts|js|mjs|cjs|py|sh)$/i;
 const executablePattern = /^scripts\/.+\.(sh|js|mjs|cjs|py)$/i;
+/** Extensions allowed into the shared project workspace (user-facing deliverables). */
+const PROJECT_DELIVERABLE_EXT = new Set([
+  'html', 'htm', 'css', 'js', 'md', 'markdown', 'txt', 'csv', 'json', 'pdf',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'woff', 'woff2', 'ttf',
+]);
+const PROJECT_INTERMEDIATE_DIRS = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
+
+/** True when a run-workspace relative path may be promoted into the project tree. */
+export function isProjectDeliverablePath(relative: string) {
+  const normalized = relative.replace(/\\/g, '/').replace(/^\/+/, '');
+  const parts = normalized.split('/');
+  if (!normalized || parts.some((part) => !part || part === '.' || part === '..')) return false;
+  if (parts.some((part) => PROJECT_INTERMEDIATE_DIRS.has(part))) return false;
+  const base = parts[parts.length - 1] || '';
+  if (base.startsWith('.') && base !== '.gitkeep') return false;
+  const ext = path.extname(base).slice(1).toLowerCase();
+  if (['py', 'sh', 'cjs', 'mjs', 'ts', 'tsx', 'jsx', 'map'].includes(ext)) return false;
+  return PROJECT_DELIVERABLE_EXT.has(ext);
+}
+
+/**
+ * Copy every deliverable file from an isolated run workspace into the shared
+ * project workspace. Used as a reliable end-of-run promotion so the project
+ * file tree does not depend solely on the model calling `publish_to_project`.
+ */
+export async function promoteWorkspaceDeliverablesToProject(
+  workspaceRoot: string,
+  projectRoot: string,
+): Promise<Array<{ path: string; projectPath: string }>> {
+  const published: Array<{ path: string; projectPath: string }> = [];
+  const root = path.resolve(workspaceRoot);
+  const destRoot = path.resolve(projectRoot);
+  async function walk(folder: string, depth = 0) {
+    if (depth > 8 || published.length >= 200) return;
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await readdir(folder, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || PROJECT_INTERMEDIATE_DIRS.has(entry.name)) continue;
+      const target = path.join(folder, entry.name);
+      if (entry.isDirectory()) {
+        await walk(target, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relative = path.relative(root, target).split(path.sep).join('/');
+      if (!isProjectDeliverablePath(relative)) continue;
+      const dest = path.join(destRoot, ...relative.split('/'));
+      await mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+      await copyFile(target, dest);
+      published.push({ path: relative, projectPath: relative });
+      if (published.length >= 200) return;
+    }
+  }
+  try {
+    await walk(root);
+  } catch {
+    /* best-effort: leave whatever was already published */
+  }
+  return published;
+}
 
 function truncate(value: string, limit: number) {
   return value.length > limit ? `${value.slice(0, limit)}\n…[truncated]` : value;
@@ -89,10 +153,17 @@ function runProcess(command: string, args: string[], cwd: string, options: { env
 /**
  * The local execution boundary for Agent Skills. Skill packages are immutable
  * at runtime; generated artifacts belong in a separate, run-scoped workspace.
+ * When `projectRoot` is set (project tasks), deliverables may be promoted into
+ * the shared project directory via `publish_to_project`.
  */
-export function createSkillExecutionTools(input: { skills: AgentSkillRuntime[]; runId: string }): Record<string, Tool<any, any, any>> {
+export function createSkillExecutionTools(input: {
+  skills: AgentSkillRuntime[];
+  runId: string;
+  projectRoot?: string;
+}): Record<string, Tool<any, any, any>> {
   const packages = new Map(input.skills.map((skill) => [skill.id, skill]));
   const workspaceRoot = path.join(process.env.OPCAI_WORKSPACES_DIR || path.join(process.cwd(), '.opcai-workspaces'), input.runId);
+  const projectRoot = input.projectRoot?.trim() ? path.resolve(input.projectRoot.trim()) : '';
   const loaded = new Set(input.skills.filter((skill) => skill.mode === 'default' && skill.instructions).map((skill) => skill.id));
   const getSkill = (skillId: string) => {
     const skill = packages.get(skillId);
@@ -103,6 +174,11 @@ export function createSkillExecutionTools(input: { skills: AgentSkillRuntime[]; 
   const workspacePath = async (relative: string) => {
     await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
     return pathInside(workspaceRoot, relative);
+  };
+  const projectPath = async (relative: string) => {
+    if (!projectRoot) throw new Error('Current run is not bound to a project workspace.');
+    await mkdir(projectRoot, { recursive: true, mode: 0o700 });
+    return pathInside(projectRoot, relative);
   };
   const runWorkspaceScript = async (skillId: string, relative: string, args: string[]) => {
     ensureLoaded(skillId);
@@ -171,7 +247,7 @@ export function createSkillExecutionTools(input: { skills: AgentSkillRuntime[]; 
     write_workspace_file: tool({
       description: 'Write a text artifact to this run\'s isolated workspace. Keep each call small: prefer content ≤8KB, or pass chunks (≤4KB each). For larger HTML/CSS/JS, call again with mode "append". Never put an entire multi-page site into one call.',
       inputSchema: z.object({
-        skillId: z.string().min(1),
+        skillId: z.string().min(1).default('opcai-workspace'),
         path: z.string().min(1).max(240),
         content: z.string().max(MAX_WRITE_CONTENT).optional(),
         chunks: z.array(z.string().max(MAX_WRITE_CHUNK)).max(MAX_WRITE_CHUNKS).optional(),
@@ -222,12 +298,53 @@ export function createSkillExecutionTools(input: { skills: AgentSkillRuntime[]; 
     }),
     run_workspace_script: tool({
       description: 'Run a script previously written to this isolated run workspace. Use this only to create an artifact when the loaded Skill permits both workspace writes and script execution. No shell expressions are accepted.',
-      inputSchema: z.object({ skillId: z.string().min(1), path: z.string().min(1).max(240), args: z.array(z.string().max(500)).max(16).default([]) }),
+      inputSchema: z.object({ skillId: z.string().min(1).default('opcai-workspace'), path: z.string().min(1).max(240), args: z.array(z.string().max(500)).max(16).default([]) }),
       execute: async ({ skillId, path: relative, args }) => runWorkspaceScript(skillId, relative, args),
+    }),
+    publish_to_project: tool({
+      description:
+        'Promote a finished deliverable from this run workspace into the shared project workspace (the directory shown in the project file tree). Intermediate scripts (.py/.sh) and tools/scripts/tmp stay in the run workspace — only user-facing assets (HTML/CSS/JS/Markdown/images/…) may be published. Requires a project-bound run.',
+      inputSchema: z.object({
+        skillId: z.string().min(1).default('opcai-workspace'),
+        /** Relative path inside the isolated run workspace. */
+        path: z.string().min(1).max(240),
+        /** Optional destination relative path under the project root (defaults to the same relative path). */
+        destPath: z.string().min(1).max(240).optional(),
+      }),
+      execute: async ({ skillId, path: relative, destPath }) => {
+        ensureLoaded(skillId);
+        const skill = getSkill(skillId);
+        if (!skill.execution.allowWorkspaceWrite) {
+          return approval(skillId, 'workspace-write', 'Publishing a deliverable into the project workspace requires your approval.');
+        }
+        if (!projectRoot) {
+          return { ok: false, error: 'Current run is not bound to a project workspace. publish_to_project is only available for project tasks.' };
+        }
+        const sourceRel = safeRelative(relative);
+        const destRel = safeRelative(destPath || relative);
+        if (!isProjectDeliverablePath(sourceRel) || !isProjectDeliverablePath(destRel)) {
+          return {
+            ok: false,
+            error: 'Only project deliverables may be published (HTML/CSS/JS/Markdown/images/data). Keep process scripts under the run workspace (e.g. scripts/, *.py, *.sh).',
+          };
+        }
+        let source: string;
+        try {
+          source = await workspacePath(sourceRel);
+          if (!(await stat(source)).isFile()) throw new Error('Not a file');
+        } catch {
+          return { ok: false, error: `Run workspace file is unavailable: ${sourceRel}. Write it with write_workspace_file first.` };
+        }
+        const dest = await projectPath(destRel);
+        await mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+        await copyFile(source, dest);
+        const bytes = (await stat(dest)).size;
+        return { ok: true, path: sourceRel, projectPath: destRel, bytes, projectRoot };
+      },
     }),
     install_python_dependency: tool({
       description: 'Install a Python package needed by a loaded Skill into this run workspace only. This is allowed by default work permission; it never modifies system Python.',
-      inputSchema: z.object({ skillId: z.string().min(1), package: z.string().min(1).max(120) }),
+      inputSchema: z.object({ skillId: z.string().min(1).default('opcai-workspace'), package: z.string().min(1).max(120) }),
       execute: async ({ skillId, package: dependency }) => {
         ensureLoaded(skillId);
         const skill = getSkill(skillId);

@@ -60,9 +60,9 @@ OPCAI 是**本地优先的数字员工工作台**：不是单一聊天工具，�
 | 包 | 职责 | 说明 |
 | --- | --- | --- |
 | `contracts` | Zod 契约与 `AgentEvent` 事件并集 | 单一事实源 |
-| `agent-core` | 唯一模型执行层：`streamAgentReply`（provider 适配/自定义 fetch：ollama think-off、Bailian enable_search、DeepSeek 关 thinking）、上下文压缩 `prepareStep`、Skill 目录组装 | 不感知会话 |
+| `agent-core` | 唯一模型执行层：`streamAgentReply`（provider 适配/自定义 fetch：ollama think-off、Bailian enable_search、DeepSeek 关 thinking）、**step 级**上下文压缩 `prepareStep`、会话摘要原语 `summarizeSessionMemory`、Skill 目录组装 | 不感知会话持久化 |
 | `tools` | `OpcaiTool{id,risk,inputSchema,execute}` + `ToolPolicy` | 契约层 |
-| `orchestrator` | **编排核心**（见 §5） | 纯 Node，测试友好（runner 可注入） |
+| `orchestrator` | **编排核心**（见 §5）：含 **Session Rolling Memory** | 纯 Node，测试友好（runner 可注入） |
 | `channel` | 通道协议与核心 | 传输无关 |
 | `storage` / `ui-kit` | 占位 | 待接入 |
 
@@ -71,7 +71,8 @@ OPCAI 是**本地优先的数字员工工作台**：不是单一聊天工具，�
 文件构成：
 
 - `storage/{kv,memory,json-file}.ts`：`KeyValueStore` 接口 + JSON 原子落盘（可换 sql.js）；`lock.ts` per-key mutex 串行化文档级读写。
-- `chat-session.ts`：会话 CRUD、消息回合（superseded 视图）、单会话单活动 run、审批决议与**续跑**；无 client context 时经 `contextResolver` 服务端组装。
+- `chat-session.ts`：会话 CRUD、消息回合（superseded 视图）、单会话单活动 run、审批决议与**续跑**；无 client context 时经 `contextResolver` 服务端组装；**Session Rolling Memory**（见 §5.1.1）。
+- `session-memory.ts`：滚动摘要预算/水位线/组装与 roll 纯逻辑。
 - `run-engine.ts`：一次 agent attempt 的执行与记录——结构事件持久化（tool/approval/artifact/sources/终态），`message.delta` 仅透传；审批出现则终态为 `waiting-approval`（停车）。
 - `project.ts`：项目状态机与调度器（parallel/DAG 并发+dependsOn、waterfall/discussion 串行）、任务级审批停车、取消/重试、协调汇总；并发写由 mutex 保护。
 - `types.ts` / `events.ts` / `hub.ts`：规范记录、统一 OrcEvent、进程内发布订阅（供 SSE）。
@@ -83,13 +84,49 @@ OPCAI 是**本地优先的数字员工工作台**：不是单一聊天工具，�
 客户端/通道 POST /api/orch/sessions/:id/messages {content}   （context 可省）
   → ChatSessionService.sendUserMessage
       → 服务端组装上下文（KV 员工/技能/偏好 + keyring 模型/搜索）
+      → requestForTurn：注入 session.memory.summary + 未覆盖原文（或全量历史）
       → RunEngine.execute：工具审批 → 事件流出（SSE）→ 终态 waiting-approval
+  → settleRun：写回 transcript；阈值滚动摘要；标记 dirty
   → /approvals/:id/resolve {allow, scope?}
       → engine 记录决议、写入 grants → 自动续跑同 turn 新 attempt
   → 会话/运行记录持久化（重启可恢复、桌面与网关同源）
+  → 切换会话时 POST /sessions/:id/memory/flush（桌面离开钩子）
 ```
 
+#### 5.1.1 Session Rolling Memory（会话级滚动记忆）
+
+长对话的**本会话**连续性，不是跨会话用户画像。
+
+| 原则 | 说明 |
+| --- | --- |
+| 真相源 | `ChatSession.messages` 始终完整保留；summary **从不**替代 transcript |
+| 派生状态 | `memory.{summary, coveredUntilId, updatedAt, dirty}` 挂在同一 session 记录上（domain KV） |
+| 打开/续聊 | 有摘要时模型只看到 summary 注入块 + 水位线之后的原文；UI 仍可展示全文 |
+| 阈值滚动 | `summary + 未覆盖原文` ≳ 24k 字符 → LLM 摘要旧段、推进 `coveredUntilId`、保留最近 ~8 条原文 |
+| Flush | 桌面 `startChat` / `selectConversation` 离开时调用 flush；强制折叠超出最近窗口的增量并清 `dirty` |
+| 与 step compaction 关系 | `agent-core` 的 `prepareStep` 只压缩**当次 run**；会话记忆跨重开、跨多次 run |
+
+实现入口：`packages/orchestrator/src/session-memory.ts`、`packages/orchestrator/README.md`。
 桌面普通对话在 Electron 内自动走该路径（双模式；协作者等旧特性降级保留）；`message.delta` 对 IM/网关当前采用**终态轮询回传**（确定性），SSE 直播列入后续迭代。
+
+### 5.1.2 项目双工作区与交付物晋升
+
+项目执行刻意拆成两层目录：
+
+| 层 | 路径 | 可见性 | 用途 |
+| --- | --- | --- | --- |
+| Run workspace | `~/.opcai/workspaces/<runId>/` | 不对用户文件树展示 | 过程脚本、`.py`/`.sh`、临时生成器 |
+| Project workspace | `~/.opcai/projects/<name>-<id>/` | 左侧「项目文件」树 | 最终交付（HTML/CSS/JS/文案/图片…） |
+
+规则：
+
+1. 工具默认只写 run workspace（`write_workspace_file` / `run_workspace_script`）。
+2. 项目任务请求注入 `projectWorkspacePath` + 与编排层一致的 `runId`。
+3. 推荐在交付就绪时调用 `publish_to_project` 即时晋升；**run 正常结束时平台还会自动扫一遍 run workspace 并晋升交付物**（`promoteWorkspaceDeliverablesToProject`），不依赖模型是否记得调用工具。过程脚本（`.py`/`.sh`、`tools/`/`scripts/`/`tmp/`）一律拒绝晋升。
+4. 客户端仍按 task `runId` 做 deliverable sync 兜底；若编排 `runId` 与 agent 实际工作区目录曾不一致，会从 `RunRecord.eventLog` 解析真实 workspace id。sync 的 `cpSync` filter **必须允许目录遍历**，否则根目录/子目录一旦返回 false 会整树跳过。
+5. 事件：`project.file.published` → UI 刷新文件树。
+
+实现：`packages/agent-core/src/skill-runtime.ts`（`publish_to_project` / auto-promote）、`packages/orchestrator/src/project.ts`（注入路径）、`apps/desktop/.../index.cjs`（sync）、`apps/renderer/.../ProjectConversationWorkspace.vue`。
 
 ### 5.2 项目调度
 

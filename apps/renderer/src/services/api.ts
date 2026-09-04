@@ -48,6 +48,8 @@ export type StreamChatInput = {
   searchProviders?: Array<{ id: 'bocha' | 'tavily' | 'brave' | 'exa' | 'zhipu' | 'aliyun'; label: string; apiKey: string; baseUrl?: string; enabled: boolean; preferred: boolean }>;
   mcpConnections?: McpConnectionPayload[];
   knowledgeBases?: KnowledgeBasePayload[];
+  runId?: string;
+  projectWorkspacePath?: string;
   maxSteps?: number;
   runTimeoutMs?: number;
   mcpToolTimeoutMs?: number;

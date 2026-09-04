@@ -80,6 +80,7 @@ function toolLabel(toolName: string) {
     read_skill_file: '读取 Skill 文件',
     read_workspace_file: '读取工作区文件',
     write_workspace_file: '写入工作区文件',
+    publish_to_project: '发布到项目空间',
     run_skill_script: '执行 Skill 脚本',
     run_workspace_script: '执行工作区脚本',
     fetch_skill_url: '访问网络资源',

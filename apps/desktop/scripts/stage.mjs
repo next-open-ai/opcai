@@ -55,6 +55,10 @@ function copyDereferenced(source, destination) {
 
 function stageDependency(name, resolver) {
   if (seen.has(name) || name.startsWith('@opcai/')) return;
+  // Some runtime dependencies (e.g. apache-arrow) wrongly list @types/* in
+  // their runtime `dependencies`. Those are compile-time only and may not even
+  // be resolvable in the CI pnpm layout — never stage or recurse into them.
+  if (name.startsWith('@types/')) return;
   const source = resolvePackageDir(name, resolver);
   if (!source) throw new Error(`Unable to resolve API production dependency: ${name}`);
   seen.add(name);

@@ -4,7 +4,7 @@ import { readStored, writeStored } from './storage.js';
 export type SkillSource = 'builtin' | 'local' | 'registry';
 export type SkillStatus = 'ready' | 'draft' | 'disabled';
 export type PolicyMode = 'disabled' | 'available' | 'default';
-export type ExecutionLevel = 'read-only' | 'default' | 'extended' | 'full';
+export type ExecutionLevel = 'read-only' | 'default' | 'full';
 export const defaultSkillExecution = (level: ExecutionLevel = 'default') => ({ allowWorkspaceWrite: level !== 'read-only', allowScriptExecution: level !== 'read-only', allowedNetworkHosts: [] as string[], allowAllNonDestructive: level === 'full' });
 
 export interface SkillRecord {

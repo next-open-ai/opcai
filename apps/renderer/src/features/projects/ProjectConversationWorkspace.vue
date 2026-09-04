@@ -16,6 +16,8 @@ const props = defineProps<{
   employees: Employee[];
   templateName: string;
   running: boolean;
+  /** Incremented when a deliverable is published into the project workspace. */
+  fileTreeEpoch?: number;
 }>();
 const emit = defineEmits<{
   back: [];
@@ -59,6 +61,13 @@ const detailEmployee = computed(
   () =>
     members.value.find((employee) => employee.id === detailEmployeeId.value) ??
     null,
+);
+const hasPendingApproval = computed(
+  () =>
+    props.project.messages.some((message) => message.approvals?.length) ||
+    props.project.tasks.some(
+      (task) => task.status === "running" && /审批|approval/i.test(task.error ?? ""),
+    ),
 );
 const detailTasks = computed(() =>
   props.project.tasks
@@ -179,10 +188,76 @@ function fileDepth(entry: FileEntry) { return Math.max(0, entry.relative.split('
 function fileName(entry: FileEntry) { return entry.relative.split('/').pop() ?? entry.relative; }
 function toggleDirectory(entry: FileEntry) { const next = new Set(collapsedDirectories.value); if (next.has(entry.relative)) next.delete(entry.relative); else next.add(entry.relative); collapsedDirectories.value = next; }
 
+/** Last segment of the project workspace path — shown instead of the raw absolute path. */
+const workspaceFolderName = computed(() => {
+  const raw = props.project.workspacePath?.trim() || '';
+  if (!raw) return '';
+  const parts = raw.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || raw;
+});
+
+/** Short parent hint, e.g. ~/.opcai/projects */
+const workspaceLocationHint = computed(() => {
+  const raw = props.project.workspacePath?.trim() || '';
+  if (!raw) return '';
+  const normalized = raw.replace(/\\/g, '/');
+  const projectsMarker = '/.opcai/projects/';
+  if (normalized.includes(projectsMarker)) return '~/.opcai/projects';
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length <= 1) return '';
+  const parent = parts.slice(0, -1).join('/');
+  return parent.length > 36 ? `…/${parts.slice(-3, -1).join('/')}` : `/${parent}`;
+});
+
+const pathCopied = ref(false);
+let pathCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function copyWorkspacePath() {
+  const path = props.project.workspacePath?.trim();
+  if (!path) return;
+  try {
+    await navigator.clipboard.writeText(path);
+    pathCopied.value = true;
+    clearTimeout(pathCopiedTimer);
+    pathCopiedTimer = setTimeout(() => { pathCopied.value = false; }, 1600);
+  } catch { /* clipboard may be unavailable */ }
+}
+
+async function openWorkspaceFolder() {
+  if (!props.project.workspacePath || !window.opcaiDesktop) return;
+  try {
+    await window.opcaiDesktop.revealProjectFile(props.project.workspacePath, '');
+  } catch {
+    await copyWorkspacePath();
+  }
+}
+
+function fileGlyph(entry: FileEntry): { label: string; className: string } {
+  if (entry.type === 'directory') {
+    return {
+      label: collapsedDirectories.value.has(entry.relative) ? '▸' : '▾',
+      className: 'text-[var(--muted)]',
+    };
+  }
+  const name = fileName(entry);
+  if (/\.html?$/i.test(name)) return { label: 'H', className: 'bg-orange-500/15 text-orange-700' };
+  if (/\.css$/i.test(name)) return { label: 'C', className: 'bg-sky-500/15 text-sky-700' };
+  if (/\.(js|mjs|cjs)$/i.test(name)) return { label: 'J', className: 'bg-amber-500/15 text-amber-700' };
+  if (/\.(ts|tsx)$/i.test(name)) return { label: 'T', className: 'bg-blue-500/15 text-blue-700' };
+  if (/\.(md|markdown)$/i.test(name)) return { label: 'M', className: 'bg-slate-500/15 text-slate-600' };
+  if (/\.json$/i.test(name)) return { label: '{ }', className: 'bg-emerald-500/15 text-emerald-700' };
+  if (/\.(png|jpe?g|gif|webp|svg|ico)$/i.test(name)) return { label: '◇', className: 'bg-violet-500/15 text-violet-700' };
+  if (/\.pdf$/i.test(name)) return { label: 'P', className: 'bg-rose-500/15 text-rose-700' };
+  return { label: '·', className: 'bg-[var(--surface-muted)] text-[var(--muted)]' };
+}
+
 async function recoverProjectFiles() {
   if (!props.project.workspacePath || !window.opcaiDesktop) return;
   const assetIds = [...new Set(totalAssets.value.map((asset) => asset.id))];
   const runIds = new Set<string>();
+  for (const task of props.project.tasks) {
+    if (task.runId) runIds.add(task.runId);
+  }
   for (const asset of totalAssets.value) {
     if ('runId' in asset && typeof (asset as { runId?: string }).runId === 'string') {
       runIds.add((asset as { runId: string }).runId);
@@ -216,8 +291,11 @@ async function loadFiles(options: { recover?: boolean } = {}) {
   }
   refreshing.value = true;
   try {
+    // 先把本项目各任务的运行工作区(生成的文件)同步到项目目录，再读取文件树。
+    await syncRunWorkspacesIntoProject();
     files.value = await window.opcaiDesktop.listProjectFiles(props.project.workspacePath);
-    const needsRecover = options.recover !== false && !files.value.some((entry) => entry.type === 'file') && totalAssets.value.length > 0;
+    const hasTaskRuns = props.project.tasks.some((task) => Boolean(task.runId));
+    const needsRecover = options.recover !== false && !files.value.some((entry) => entry.type === 'file') && (totalAssets.value.length > 0 || hasTaskRuns);
     if (needsRecover) {
       await recoverProjectFiles();
       files.value = await window.opcaiDesktop.listProjectFiles(props.project.workspacePath);
@@ -226,6 +304,15 @@ async function loadFiles(options: { recover?: boolean } = {}) {
     filesError.value = error instanceof Error ? error.message : '无法读取项目空间。';
   } finally {
     refreshing.value = false;
+  }
+}
+
+/** 复制所有已运行任务的生成文件到项目目录，使左侧文件树能看到运行工作区的产物。 */
+async function syncRunWorkspacesIntoProject() {
+  if (!props.project.workspacePath || !window.opcaiDesktop) return;
+  const runIds = [...new Set(props.project.tasks.map((task) => task.runId).filter((runId): runId is string => Boolean(runId)))];
+  for (const runId of runIds) {
+    try { await window.opcaiDesktop.syncProjectWorkspace(props.project.workspacePath, runId); } catch { /* 单个运行失败不影响其它 */ }
   }
 }
 
@@ -279,11 +366,30 @@ function openMember(employeeId: EmployeeId) {
 }
 
 onMounted(() => { void loadFiles({ recover: true }); });
+// 运行期间自动刷新文件树：编程员工写入的工作区文件会随同步落到项目目录，
+// 无需手工点「刷新」即可看到产物。
+let fileRefreshTimer: ReturnType<typeof setInterval> | undefined;
+function ensureFileRefresh() {
+  if (props.project.status === "running" && !fileRefreshTimer) {
+    fileRefreshTimer = setInterval(() => { void loadFiles({ recover: true }); }, 5000);
+  } else if (props.project.status !== "running" && fileRefreshTimer) {
+    clearInterval(fileRefreshTimer);
+    fileRefreshTimer = undefined;
+  }
+}
+ensureFileRefresh();
 watch(
-  () => [props.project.status, props.project.messages.length, totalAssets.value.length, props.project.workspacePath] as const,
-  () => { void loadFiles({ recover: true }); },
+  () => [props.project.status, props.project.messages.length, totalAssets.value.length, props.project.workspacePath, props.fileTreeEpoch ?? 0] as const,
+  () => {
+    ensureFileRefresh();
+    void loadFiles({ recover: true });
+  },
 );
-onBeforeUnmount(() => editor?.dispose());
+onBeforeUnmount(() => {
+  if (fileRefreshTimer) clearInterval(fileRefreshTimer);
+  clearTimeout(pathCopiedTimer);
+  editor?.dispose();
+});
 </script>
 
 <template>
@@ -326,7 +432,7 @@ onBeforeUnmount(() => editor?.dispose());
     </header>
 
     <div
-      class="grid min-h-0 flex-1 grid-cols-1"
+      class="grid min-h-0 flex-1 grid-cols-1 [grid-template-rows:minmax(0,1fr)]"
       :class="[
         resizingTree ? 'select-none' : '',
         editing
@@ -358,46 +464,97 @@ onBeforeUnmount(() => editor?.dispose());
           </div>
         </template>
         <template v-else>
-          <div class="mb-3 flex items-center justify-between gap-2 px-2">
-            <strong class="text-xs">项目文件</strong>
-            <div class="flex items-center gap-1">
+          <div class="mb-3 flex items-center justify-between gap-2 px-1">
+            <div class="min-w-0">
+              <p class="text-[10px] font-bold tracking-[0.14em] text-[var(--muted)]">FILES</p>
+              <strong class="block text-sm tracking-tight">项目文件</strong>
+            </div>
+            <div class="flex shrink-0 items-center gap-0.5">
               <button
-                class="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-wait disabled:opacity-50"
+                class="rounded-lg px-2 py-1 text-[11px] font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-wait disabled:opacity-50"
                 type="button"
                 :disabled="refreshing || !project.workspacePath"
                 @click="loadFiles({ recover: true })"
-              >{{ refreshing ? '同步中…' : '刷新' }}</button>
+              >{{ refreshing ? '同步中' : '刷新' }}</button>
               <button
-                class="rounded-md px-2 py-1 text-[11px] font-semibold text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--accent)]"
+                class="rounded-lg px-2 py-1 text-[11px] font-semibold text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--accent)]"
                 type="button"
                 title="向左收起，扩大右侧空间"
                 @click="setTreeCollapsed(true)"
               >‹</button>
             </div>
           </div>
-          <p class="mb-1 px-2 text-[11px] leading-4 text-[var(--muted)] break-all">{{ project.workspacePath || '旧项目尚未配置项目空间。' }}</p>
-          <p v-if="fileCount" class="mb-3 px-2 text-[10px] text-[var(--muted)]">{{ fileCount }} 个交付文件</p>
-          <button
-            v-for="entry in visibleFiles"
-            :key="entry.relative"
-            type="button"
-            :style="{ paddingLeft: `${8 + fileDepth(entry) * 14}px` }"
-            :class="[
-              'flex w-full items-center gap-2 rounded-lg py-2 text-left text-sm',
-              entry.type === 'directory'
-                ? 'text-[var(--muted)] hover:bg-[var(--surface-muted)]'
-                : selectedFile === entry.relative
-                  ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
-                  : 'hover:bg-[var(--surface-muted)]',
-            ]"
-            @click="selectFile(entry)"
+
+          <div
+            v-if="project.workspacePath"
+            class="mb-3 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/70 px-2.5 py-2"
           >
-            <span>{{ entry.type === 'directory' ? (collapsedDirectories.has(entry.relative) ? '›' : '⌄') : '▧' }}</span>
-            <span class="truncate">{{ fileName(entry) }}</span>
-          </button>
-          <p v-if="filesError" class="mt-4 px-2 text-xs leading-5 text-rose-600">{{ filesError }}</p>
-          <p v-else-if="!deliverableFiles.length" class="mt-6 px-2 text-xs leading-5 text-[var(--muted)]">
-            仅展示交付资产（页面、样式、文案等）。智能体过程脚本（如 .py / .sh）不会出现在此树中。
+            <div class="flex items-start gap-2">
+              <span
+                class="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-[var(--accent-soft)] text-xs font-bold text-[var(--accent)]"
+                aria-hidden="true"
+              >⌂</span>
+              <div class="min-w-0 flex-1">
+                <p class="truncate text-xs font-semibold leading-5 text-[var(--text)]" :title="project.workspacePath">
+                  {{ workspaceFolderName }}
+                </p>
+                <p v-if="workspaceLocationHint" class="truncate text-[10px] leading-4 text-[var(--muted)]" :title="project.workspacePath">
+                  {{ workspaceLocationHint }}
+                </p>
+              </div>
+            </div>
+            <div class="mt-2 flex items-center gap-1.5">
+              <button
+                class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)]"
+                type="button"
+                title="在访达中打开项目目录"
+                @click="openWorkspaceFolder"
+              >打开位置</button>
+              <button
+                class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)]"
+                type="button"
+                :title="project.workspacePath"
+                @click="copyWorkspacePath"
+              >{{ pathCopied ? '已复制' : '复制路径' }}</button>
+              <span v-if="fileCount" class="ml-auto text-[10px] tabular-nums text-[var(--muted)]">{{ fileCount }} 项</span>
+            </div>
+          </div>
+          <p v-else class="mb-3 px-1 text-[11px] leading-4 text-[var(--muted)]">旧项目尚未配置项目空间。</p>
+
+          <div class="space-y-0.5">
+            <button
+              v-for="entry in visibleFiles"
+              :key="entry.relative"
+              type="button"
+              :style="{ paddingLeft: `${6 + fileDepth(entry) * 12}px` }"
+              :class="[
+                'group flex w-full items-center gap-2 rounded-lg py-1.5 pr-2 text-left text-[13px] transition',
+                entry.type === 'directory'
+                  ? 'font-medium text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]'
+                  : selectedFile === entry.relative
+                    ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
+                    : 'text-[var(--text)]/90 hover:bg-[var(--surface-muted)]',
+              ]"
+              :title="entry.relative"
+              @click="selectFile(entry)"
+            >
+              <span
+                v-if="entry.type === 'directory'"
+                :class="['w-4 shrink-0 text-center text-[10px]', fileGlyph(entry).className]"
+              >{{ fileGlyph(entry).label }}</span>
+              <span
+                v-else
+                :class="[
+                  'grid h-5 w-5 shrink-0 place-items-center rounded-md text-[9px] font-bold leading-none',
+                  fileGlyph(entry).className,
+                ]"
+              >{{ fileGlyph(entry).label }}</span>
+              <span class="min-w-0 flex-1 truncate">{{ fileName(entry) }}</span>
+            </button>
+          </div>
+          <p v-if="filesError" class="mt-4 px-1 text-xs leading-5 text-rose-600">{{ filesError }}</p>
+          <p v-else-if="!deliverableFiles.length" class="mt-5 px-1 text-xs leading-5 text-[var(--muted)]">
+            暂无交付文件。过程脚本留在员工运行空间；最终产物会自动或经 publish_to_project 进入此处。
           </p>
           <div
             class="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize touch-none hover:bg-[var(--accent)]/25 active:bg-[var(--accent)]/40"
@@ -545,6 +702,13 @@ onBeforeUnmount(() => editor?.dispose());
               <p class="text-xs font-bold text-emerald-700">协调员汇总</p>
               <p class="mt-2 whitespace-pre-wrap text-sm leading-6">{{ project.summary }}</p>
             </article>
+          </div>
+        </div>
+
+        <div v-if="hasPendingApproval" class="shrink-0 border-t border-amber-500/20 bg-amber-500/10 px-6 py-2">
+          <div class="mx-auto flex max-w-3xl items-center gap-2 text-xs text-amber-700">
+            <span class="shrink-0">⏳</span>
+            <span>有任务正在等待你的批准；点击上方消息里的「允许本次 / 始终允许 / 拒绝」后继续执行。</span>
           </div>
         </div>
 
@@ -728,6 +892,14 @@ onBeforeUnmount(() => editor?.dispose());
                 class="rounded-lg bg-[var(--surface-muted)] px-2 py-1.5 text-xs"
               ><strong>{{ activity.toolName }}</strong> · {{ activity.summary }}</p>
             </div>
+            <p
+              v-else-if="task.status === 'running' && !task.transcript?.activities?.length"
+              class="mt-3 text-xs leading-5 text-[var(--muted)]"
+            >正在执行中。若长时间无过程输出，可能是进程刚重启，系统会自动回收卡住的任务。</p>
+            <p
+              v-else-if="task.error"
+              class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-800"
+            >{{ task.error }}</p>
           </article>
           <p v-if="!detailTasks.length" class="text-sm text-[var(--muted)]">该成员尚无任务记录。</p>
         </div>

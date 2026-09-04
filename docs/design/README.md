@@ -7,7 +7,7 @@
 
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
-| [architecture.md](architecture.md) | 当前项目架构 / 进程与模块边界 / 主要逻辑（会话·可续跑审批·项目调度·存储 keyring·通道） | ✅ 当前权威 |
+| [architecture.md](architecture.md) | 当前项目架构 / 进程与模块边界 / 主要逻辑（会话·滚动记忆·可续跑审批·项目调度·存储 keyring·通道） | ✅ 当前权威 |
 | [gateway-m0.md](gateway-m0.md) | M0：编排层下沉、域存储单写者、可续跑 run、`/api/orch` REST/SSE 接口表 | ✅ |
 | [gateway-m0-acceptance.md](gateway-m0-acceptance.md) | M0 验收清单（A–E）与各入口 | ✅ |
 | [gateway-m1.md](gateway-m1.md) | M1：`@opcai/channel` 协议、网关子进程、Telegram 适配器与白名单；真机步骤 | ✅ |

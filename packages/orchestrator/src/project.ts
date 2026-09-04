@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
+import { promoteWorkspaceDeliverablesToProject } from '@opcai/agent-core';
 import type { EventHub, HubListener } from './hub.js';
 import { deleteKey, listJsonIds, readJson, writeJson } from './repo.js';
 import type { OrcEvent } from './events.js';
@@ -24,6 +27,13 @@ const PROJECT_RUN_NS = 'project-run';
 const DEFAULT_TASK_CONCURRENCY = 4;
 const TASK_SETTLE_POLL_MS = 200;
 const PARKED_POLL_MS = 400;
+
+function runWorkspaceRoot(runId: string) {
+  return path.join(
+    process.env.OPCAI_WORKSPACES_DIR || path.join(os.homedir(), '.opcai', 'workspaces'),
+    runId,
+  );
+}
 
 export interface ProjectTaskDraft {
   /** Stable client id (optional); preserved so dependsOn references survive. */
@@ -120,6 +130,102 @@ export class ProjectService {
 
   private projectRunKey(id: string): string {
     return namespaceKey(PROJECT_RUN_NS, id);
+  }
+
+  /**
+   * After an API/desktop process restart, in-flight `execute()` calls are gone
+   * but RunRecords may still say `running`. Settle those orphans, promote any
+   * leftover workspace deliverables, and close project runs that can finish.
+   */
+  async recoverOrphanedExecution(): Promise<{ projects: number; tasks: number }> {
+    const ids = await listJsonIds(this.store, PROJECT_KEY_PREFIX);
+    let projectsTouched = 0;
+    let tasksTouched = 0;
+    for (const id of ids) {
+      const project = await this.getProject(id);
+      if (!project || project.status !== 'running') continue;
+      let changed = false;
+      for (const task of project.tasks) {
+        if (task.status !== 'running' || !task.runId) continue;
+        // Live attempts register an AbortController; absence means orphaned.
+        if (this.taskAborts.has(task.id)) continue;
+        const run = await this.engine.load(task.runId);
+        if (run && run.status !== 'running') {
+          task.status = run.status === 'completed' ? 'completed' : run.status === 'cancelled' ? 'cancelled' : 'failed';
+          task.finishedAt = run.finishedAt ?? Date.now();
+          task.error = run.error;
+          changed = true;
+          tasksTouched += 1;
+          continue;
+        }
+        const settled = await this.settleOrphanedTask(project, task, run);
+        if (settled) {
+          changed = true;
+          tasksTouched += 1;
+        }
+      }
+      if (!changed) continue;
+      projectsTouched += 1;
+      await this.saveProject(project);
+      this.hub.publish(`project:${project.id}`, { type: 'project.updated', projectId: project.id });
+      await this.maybeFinish(project.id, project.activeRunId);
+    }
+    return { projects: projectsTouched, tasks: tasksTouched };
+  }
+
+  private async settleOrphanedTask(project: Project, task: ProjectTask, run: RunRecord | null): Promise<boolean> {
+    if (!task.runId) return false;
+    const workspaceRoot = runWorkspaceRoot(task.runId);
+    let published = 0;
+    if (project.workspacePath) {
+      try {
+        published = (await promoteWorkspaceDeliverablesToProject(workspaceRoot, project.workspacePath)).length;
+      } catch {
+        published = 0;
+      }
+    }
+    const hasProgress =
+      Boolean(run?.transcript?.trim()) ||
+      (run?.activities?.length ?? 0) > 0 ||
+      (run?.artifacts?.length ?? 0) > 0 ||
+      published > 0;
+    const now = Date.now();
+    const message = hasProgress
+      ? `执行进程已中断；已根据运行工作区回收 ${published || run?.artifacts?.length || 0} 个交付物。`
+      : '执行进程已中断，任务未正常结束。可重试该任务。';
+
+    if (run && run.status === 'running') {
+      run.status = hasProgress ? 'completed' : 'failed';
+      run.error = hasProgress ? undefined : message;
+      run.finishedAt = now;
+      if (hasProgress && !run.transcript.trim()) {
+        run.transcript = `（任务产出已写入工作区；${message}）`;
+      } else if (!hasProgress && !run.transcript.trim()) {
+        run.transcript = message;
+      }
+      await this.engine.save(run);
+      const settled = {
+        type: 'run.settled' as const,
+        runId: run.id,
+        sessionId: run.sessionId,
+        status: run.status,
+        error: run.error,
+      };
+      this.hub.publish(`run:${run.id}`, settled);
+      this.hub.publish(`project:${project.id}`, settled);
+    }
+
+    task.status = hasProgress ? 'completed' : 'failed';
+    task.finishedAt = now;
+    task.error = hasProgress ? undefined : message;
+    this.hub.publish(`project:${project.id}`, {
+      type: 'project.task',
+      projectId: project.id,
+      taskId: task.id,
+      status: task.status,
+      runId: task.runId,
+    });
+    return true;
   }
 
   /* ------------------------------------------------------------------ *
@@ -586,7 +692,13 @@ export class ProjectService {
     const signal = abortHolder.controller?.signal ?? new AbortController().signal;
 
     const currentTask = (await this.getProject(projectId))?.tasks.find((item) => item.id === task.id);
-    const request = { ...context, messages: [{ role: 'user' as const, content: (currentTask ?? task).objective }] };
+    const project = await this.getProject(projectId);
+    const request = {
+      ...context,
+      runId,
+      ...(project?.workspacePath ? { projectWorkspacePath: project.workspacePath } : {}),
+      messages: [{ role: 'user' as const, content: (currentTask ?? task).objective }],
+    };
     let run: RunRecord;
     try {
       run = await this.engine.execute({

@@ -74,4 +74,14 @@ export class Orchestrator {
   async close(): Promise<void> {
     await this.store.close();
   }
+
+  /**
+   * Reconcile durable state left behind by a previous process (desktop/API restart).
+   * Safe to call once at boot; no-ops when nothing is orphaned.
+   */
+  async recoverOnBoot(): Promise<{ projects: number; tasks: number; chatRuns: number }> {
+    const projectResult = await this.projects.recoverOrphanedExecution();
+    const chatRuns = await this.engine.recoverOrphanedRuns();
+    return { ...projectResult, chatRuns };
+  }
 }

@@ -56,6 +56,14 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('tool.completed'), runId: z.string(), toolName: z.string(), summary: z.string(), ok: z.boolean() }),
   z.object({ type: z.literal('tool.failed'), runId: z.string(), toolName: z.string(), summary: z.string() }),
   z.object({ type: z.literal('artifact.created'), runId: z.string(), path: z.string().min(1).max(240) }),
+  z.object({
+    type: z.literal('project.file.published'),
+    runId: z.string(),
+    /** Relative path inside the run workspace (source). */
+    path: z.string().min(1).max(240),
+    /** Relative path written under the shared project workspace. */
+    projectPath: z.string().min(1).max(240),
+  }),
   z.object({ type: z.literal('search.sources'), runId: z.string(), provider: z.string(), sources: z.array(z.object({ title: z.string(), url: z.string().url(), source: z.string().optional() })).max(10) }),
   z.object({ type: z.literal('tool.approval_required'), runId: z.string(), skillId: z.string(), capability: z.enum(['workspace-write', 'script-execution', 'network-access']), summary: z.string() }),
   z.object({ type: z.literal('run.completed'), runId: z.string() }),
@@ -241,6 +249,16 @@ export const ChatRequestSchema = z.object({
   searchProviders: z.array(SearchProviderRuntimeSchema).max(6).default([]),
   mcpConnections: z.array(McpConnectionRuntimeSchema).max(12).default([]),
   knowledgeBases: z.array(KnowledgeBaseRuntimeSchema).max(12).default([]),
+  /**
+   * Stable run id shared by orchestrator records and the on-disk run workspace
+   * (`~/.opcai/workspaces/<runId>`). When omitted, agent-core generates one.
+   */
+  runId: z.string().min(1).max(120).optional(),
+  /**
+   * Absolute shared project workspace root. When set, `publish_to_project` may
+   * promote deliverables from the isolated run workspace into this directory.
+   */
+  projectWorkspacePath: z.string().min(1).max(500).optional(),
   /** Soft ceiling for tool/LLM steps in one run. */
   maxSteps: z.number().int().min(4).max(64).optional(),
   /** Wall-clock budget for the whole agent run (ms). */

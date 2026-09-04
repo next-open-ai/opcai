@@ -121,6 +121,7 @@ export class RunEngine {
       if (event.type === 'message.delta' && event.text) {
         run.transcript += event.text;
         publish({ type: 'run.delta', runId, sessionId: options.sessionId, text: event.text });
+        scheduleCheckpoint();
         return;
       }
       run.eventLog.push(event);
@@ -130,18 +131,21 @@ export class RunEngine {
           const activity: RunActivity = { toolName: event.toolName, summary: event.summary, status: 'running', at: Date.now() };
           run.activities.push(activity);
           publish({ type: 'run.activity', runId, activity });
+          scheduleCheckpoint();
           break;
         }
         case 'tool.completed': {
           const activity: RunActivity = { toolName: event.toolName, summary: event.summary, status: event.ok ? 'completed' : 'failed', at: Date.now() };
           run.activities.push(activity);
           publish({ type: 'run.activity', runId, activity });
+          scheduleCheckpoint();
           break;
         }
         case 'tool.failed': {
           const activity: RunActivity = { toolName: event.toolName, summary: event.summary, status: 'failed', at: Date.now() };
           run.activities.push(activity);
           publish({ type: 'run.activity', runId, activity });
+          scheduleCheckpoint();
           break;
         }
         case 'tool.approval_required': {
@@ -155,22 +159,57 @@ export class RunEngine {
           };
           run.approvals.push(approval);
           publish({ type: 'run.approval', runId, approval });
+          // Approvals must survive a process restart so the UI can resume.
+          void this.save(run);
           break;
         }
         case 'artifact.created': {
           const artifact = { path: event.path };
           run.artifacts.push(artifact);
           publish({ type: 'run.artifact', runId, artifact });
+          scheduleCheckpoint();
+          break;
+        }
+        case 'project.file.published': {
+          const artifact = { path: event.projectPath };
+          if (!run.artifacts.some((item) => item.path === artifact.path)) run.artifacts.push(artifact);
+          publish({
+            type: 'project.file.published',
+            runId,
+            path: event.path,
+            projectPath: event.projectPath,
+            projectId: options.kind === 'project-task' ? options.sessionId : undefined,
+          });
+          publish({ type: 'run.artifact', runId, artifact });
+          scheduleCheckpoint();
           break;
         }
         case 'search.sources': {
           run.sources = event.sources.map((source) => ({ ...source }));
           publish({ type: 'run.sources', runId, sources: run.sources });
+          scheduleCheckpoint();
           break;
         }
         default:
+          scheduleCheckpoint();
           break;
       }
+    };
+
+    // Persist mid-run progress so a desktop/API restart does not leave an empty
+    // "running" record with no activities (workspace files may already exist).
+    let checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+    let checkpointDirty = false;
+    const flushCheckpoint = () => {
+      checkpointTimer = undefined;
+      if (!checkpointDirty || run.status !== 'running') return;
+      checkpointDirty = false;
+      void this.save(run);
+    };
+    const scheduleCheckpoint = () => {
+      checkpointDirty = true;
+      if (checkpointTimer) return;
+      checkpointTimer = setTimeout(flushCheckpoint, 1_500);
     };
 
     const abortController = new AbortController();
@@ -192,6 +231,8 @@ export class RunEngine {
       }
     } finally {
       clearTimeout(timeoutId);
+      if (checkpointTimer) clearTimeout(checkpointTimer);
+      checkpointDirty = false;
       if (signal) signal.removeEventListener('abort', onAbort);
     }
 
@@ -226,6 +267,41 @@ export class RunEngine {
     await this.save(run);
     publish({ type: 'run.settled', runId, sessionId: options.sessionId, status: run.status, error: run.error });
     return run;
+  }
+
+  /**
+   * Mark chat runs left in `running` after a process restart as cancelled.
+   * Project-task orphans are handled by ProjectService.recoverOrphanedExecution.
+   */
+  async recoverOrphanedRuns(): Promise<number> {
+    const keys = await this.store.keys(`${RUN_NS}:`);
+    let count = 0;
+    for (const key of keys) {
+      const run = await readJson<RunRecord>(this.store, key);
+      if (!run || run.status !== 'running') continue;
+      if (run.kind === 'project-task') continue;
+      run.status = 'cancelled';
+      run.error = '执行进程已中断，对话回合未正常结束。';
+      run.cancelReason = 'user';
+      run.finishedAt = Date.now();
+      await this.save(run);
+      this.hub.publish(`run:${run.id}`, {
+        type: 'run.settled',
+        runId: run.id,
+        sessionId: run.sessionId,
+        status: run.status,
+        error: run.error,
+      });
+      this.hub.publish(`session:${run.sessionId}`, {
+        type: 'run.settled',
+        runId: run.id,
+        sessionId: run.sessionId,
+        status: run.status,
+        error: run.error,
+      });
+      count += 1;
+    }
+    return count;
   }
 }
 

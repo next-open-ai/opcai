@@ -48,4 +48,10 @@ contextBridge.exposeInMainWorld('opcaiDesktop', {
   saveChannelSettings: (payload) => ipcRenderer.invoke('opcai:save-channel-settings', payload),
   gatewayStatus: () => ipcRenderer.invoke('opcai:gateway-status'),
   gatewayRestart: () => ipcRenderer.invoke('opcai:gateway-restart'),
+  checkEnvironment: () => ipcRenderer.invoke('opcai:env-check'),
+  onEnvCheckProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('opcai:env-check-progress', listener);
+    return () => ipcRenderer.removeListener('opcai:env-check-progress', listener);
+  },
 });

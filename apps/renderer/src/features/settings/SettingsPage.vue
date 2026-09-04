@@ -6,13 +6,14 @@ import { useModelConfig, type ModelSettings } from '../../app/model-config';
 import type { Employee, EmployeeId } from '../../app/workspace';
 import { employeeDisplayName } from '../../app/employees';
 import ProviderInstancesEditor from './ProviderInstancesEditor.vue';
+import EnvironmentSettingsCard from './EnvironmentSettingsCard.vue';
 import ConfiguredModelsEditor from './ConfiguredModelsEditor.vue';
 import { searchProviderIds, useSearchConfig, type SearchProviderId } from '../../app/search-config';
 import { knowledgeProviderMeta, useKnowledgeConfig } from '../../app/kb-config';
 import { useNotify } from '../../app/notify';
 
 const props = defineProps<{ employees: Employee[]; defaultEmployeeId: EmployeeId }>();
-const emit = defineEmits<{ setDefaultEmployee: [id: EmployeeId] }>();
+const emit = defineEmits<{ setDefaultEmployee: [id: EmployeeId]; openEnvironment: []; openCheck: [] }>();
 const { t, locale, setLocale } = useI18n();
 const { preference, setTheme } = useTheme();
 const { settings, load, save } = useModelConfig();
@@ -25,7 +26,7 @@ const {
 const notify = useNotify();
 const dirty = ref(false);
 const languageLabel: Record<Locale, string> = { 'zh-CN': '简体中文', 'en-US': 'English' };
-type SettingsTab = 'appearance' | 'providers' | 'models' | 'search' | 'knowledge' | 'general';
+type SettingsTab = 'appearance' | 'providers' | 'models' | 'search' | 'knowledge' | 'environment' | 'general';
 const tab = ref<SettingsTab>('providers');
 const tabs: Array<{ id: SettingsTab; labelKey: string }> = [
   { id: 'appearance', labelKey: 'settings.tabAppearance' },
@@ -33,6 +34,7 @@ const tabs: Array<{ id: SettingsTab; labelKey: string }> = [
   { id: 'models', labelKey: 'settings.tabModels' },
   { id: 'search', labelKey: 'settings.tabSearch' },
   { id: 'knowledge', labelKey: 'settings.tabKnowledge' },
+  { id: 'environment', labelKey: 'settings.tabEnvironment' },
   { id: 'general', labelKey: 'settings.tabGeneral' },
 ];
 
@@ -259,6 +261,11 @@ function resetSearchEndpoint(id: SearchProviderId) {
         <span class="text-xs text-[var(--muted)]">{{ t('settings.knowledgeSaveHint') }}</span>
         <button class="rounded-lg bg-[var(--accent)] px-3 py-2.5 text-[13px] font-semibold text-white" type="button" @click="saveKnowledgeProviderConfig">{{ t('settings.save') }}</button>
       </div>
+    </section>
+
+    <section v-else-if="tab === 'environment'" class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <h2 class="mb-4 text-[17px] font-bold">{{ t('settings.tabEnvironment') }}</h2>
+      <EnvironmentSettingsCard @open-environment="emit('openEnvironment')" @open-check="emit('openCheck')" />
     </section>
 
     <section v-else class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">

@@ -91,6 +91,7 @@ waterfall 两任务 → `[remote-confirm] ALL PASS`。
 | POST/GET/DELETE `/sessions[/:id]` | 会话 CRUD |
 | POST `/sessions/:id/messages` | 发消息并启动 run（body: content, context） |
 | POST `/sessions/:id/cancel` | 中止活动 run |
+| POST `/sessions/:id/memory/flush` | 会话滚动记忆 flush（切换/离开时；摘要+水位线） |
 | GET `/sessions/:id/runs`、`/runs/:runId` | run 记录/回放 |
 | GET `/sessions/:id/approvals` | 待审批列表 |
 | POST `/sessions/:id/approvals/:aid/resolve` | 审批决议（allow/deny + resumeContext） |

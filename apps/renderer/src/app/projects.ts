@@ -31,7 +31,7 @@ export interface ProjectTask {
   model: string;
   skillIds: string[];
   dependsOn: string[];
-  permissionTier: "read-only" | "default" | "extended" | "full";
+  permissionTier: "read-only" | "default" | "full";
   status: ProjectTaskStatus;
   attempts: number;
   startedAt?: number;

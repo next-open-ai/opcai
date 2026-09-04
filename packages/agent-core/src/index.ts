@@ -1,11 +1,12 @@
+import path from 'node:path';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { stepCountIs, streamText } from 'ai';
 import type { AgentEvent, AgentProfile, AgentSkillRuntime, ModelConfig } from '@opcai/contracts';
 import type { OpcaiTool, ToolPolicy } from '@opcai/tools';
-import { compactMessagesForStep } from './context-compaction.js';
-import { createSkillExecutionTools } from './skill-runtime.js';
+import { compactMessagesForStep, summarizePlainTurns } from './context-compaction.js';
+import { createSkillExecutionTools, promoteWorkspaceDeliverablesToProject } from './skill-runtime.js';
 import { createWebSearchTools } from './search-runtime.js';
 import { createKnowledgeTools } from './knowledge-runtime.js';
 import { createExperienceTools, recallExperienceBlock } from './experience/index.js';
@@ -128,6 +129,21 @@ function streamProviderOptions(config: ModelConfig) {
   };
 }
 
+/** Durable session-memory summarizer (ModelConfig → plain turns). */
+export async function summarizeSessionMemory(input: {
+  model: ModelConfig;
+  previousSummary?: string;
+  turns: Array<{ role: 'user' | 'assistant'; content: string }>;
+}): Promise<string | null> {
+  const providerOptions = streamProviderOptions(input.model);
+  return summarizePlainTurns({
+    previousSummary: input.previousSummary,
+    turns: input.turns,
+    model: languageModel(input.model),
+    providerOptions: providerOptions as Record<string, unknown> | undefined,
+  });
+}
+
 function friendlyModelError(raw: string) {
   if (/reasoning_content/i.test(raw)) {
     return 'DeepSeek 思考模式在工具多轮调用中要求回传 reasoning_content，当前链路已自动关闭 thinking。请重试本轮以生成最终结论。';
@@ -186,6 +202,10 @@ function toolInputSummary(toolName: string, input: unknown) {
     const mode = value.mode === 'append' ? '追加' : '写入';
     return `正在${mode}运行工作区文件：${String(value.path || '')}`;
   }
+  if (toolName === 'publish_to_project') {
+    const dest = value.destPath ? ` → ${String(value.destPath)}` : '';
+    return `正在发布到项目空间：${String(value.path || '')}${dest}`;
+  }
   if (toolName === 'run_skill_script') return `正在执行脚本：${String(value.path || '')}`;
   if (toolName === 'run_workspace_script') return `正在执行生成脚本：${String(value.path || '')}`;
   if (toolName === 'fetch_skill_url') return `正在访问网络资源：${String(value.url || '')}`;
@@ -208,6 +228,9 @@ function toolResultSummary(toolName: string, output: unknown) {
   if (toolName === 'write_workspace_file') {
     const mode = value.mode === 'append' ? '已追加' : '已写入';
     return `${mode} ${String(value.path || '运行工作区文件')}${typeof value.totalBytes === 'number' ? `（共 ${value.totalBytes} 字节）` : '。'}`;
+  }
+  if (toolName === 'publish_to_project') {
+    return `已发布到项目空间：${String(value.projectPath || value.path || '')}${typeof value.bytes === 'number' ? `（${value.bytes} 字节）` : ''}`;
   }
   if (toolName === 'fetch_skill_url') return `已获取网络资源（${String(value.contentType || 'text')}）。`;
   if (toolName === 'web_search') {
@@ -255,12 +278,15 @@ export async function* streamAgentReply(input: {
   searchProviders?: import('@opcai/contracts').SearchProviderRuntime[];
   mcpConnections?: import('@opcai/contracts').McpConnectionRuntime[];
   knowledgeBases?: import('@opcai/contracts').KnowledgeBaseRuntime[];
+  runId?: string;
+  projectWorkspacePath?: string;
   maxSteps?: number;
   runTimeoutMs?: number;
   mcpToolTimeoutMs?: number;
   abortSignal?: AbortSignal;
 }): AsyncGenerator<AgentEvent> {
-  const runId = crypto.randomUUID();
+  const runId = input.runId?.trim() || crypto.randomUUID();
+  const projectRoot = input.projectWorkspacePath?.trim() || '';
   yield { type: 'run.started', runId };
   const mcp = await loadMcpToolset(input.mcpConnections, { toolTimeoutMs: input.mcpToolTimeoutMs });
   const knowledgeTools = createKnowledgeTools({ knowledgeBases: input.knowledgeBases, model: input.model });
@@ -315,7 +341,10 @@ export async function* streamAgentReply(input: {
       Object.keys(experienceTools).length
         ? 'Agent experience memory is available for this employee only. After a meaningful multi-step success (or a hard-won pitfall), call save_experience with a short structured card (situation/action/pitfall/whenNot). Use load_experience when pivoting to a task that may match prior work. Low-similarity loads return empty—do not invent memories.'
         : '',
-      'Use load_skill only for a relevant authorized Skill. The platform harness `opcai-workspace` is pre-authorized for this run: use skillId `opcai-workspace` for write_workspace_file, run_workspace_script, and install_python_dependency when the run permission tier allows. Skill files are read-only. Generated files belong in the isolated run workspace. Default work permission allows workspace writes, script execution, and isolated Python dependency installation through that harness. Direct network access is capability-gated; never claim an operation ran unless its tool returned a successful result. After load_skill, only read or execute paths explicitly returned in its files list; never guess a filename from an instruction example. For artifact requests (for example PDFs, reports, code, or data files), do not stop at a plan or ask avoidable follow-up questions. When writing websites or large codebases: (1) keep each write_workspace_file body under ~8KB, (2) split CSS/JS/HTML into multiple files or use mode "append" / chunks, (3) ship the critical HTML pages before polish, (4) if a write fails with JSON/parse/input errors, immediately retry with a much smaller chunk—never paste the same huge payload again. If the Skill documents a creation workflow but has no generator script, write a minimal generator script to the run workspace and invoke run_workspace_script with skillId `opcai-workspace`. If a Python dependency such as reportlab is required, use install_python_dependency before executing. Use reasonable defaults for non-critical details. If a required permission, script, dependency, or output path is unavailable, state the exact blocker and the one next user action in the final answer.',
+      projectRoot
+        ? 'This run is bound to a shared project workspace. Keep intermediate generators and process scripts in the isolated run workspace (write_workspace_file / run_workspace_script). Prefer publish_to_project as soon as a user-facing deliverable is ready (HTML/CSS/JS/Markdown/images/data) so it appears in the project file tree mid-run. At run end the platform also auto-promotes remaining deliverables from the run workspace into the project tree.'
+        : '',
+      'Use load_skill only for a relevant authorized Skill. The platform harness `opcai-workspace` is pre-authorized for this run: use skillId `opcai-workspace` for write_workspace_file, run_workspace_script, install_python_dependency, and publish_to_project (when a project workspace is bound) when the run permission tier allows. Skill files are read-only. Generated process files belong in the isolated run workspace; project deliverables should be published (or will be auto-promoted at run end). Default work permission allows workspace writes, script execution, and isolated Python dependency installation through that harness. Direct network access is capability-gated; never claim an operation ran unless its tool returned a successful result. After load_skill, only read or execute paths explicitly returned in its files list; never guess a filename from an instruction example. For artifact requests (for example PDFs, reports, code, or data files), do not stop at a plan or ask avoidable follow-up questions. When writing websites or large codebases: (1) keep each write_workspace_file body under ~8KB, (2) split CSS/JS/HTML into multiple files or use mode "append" / chunks, (3) ship the critical HTML pages before polish, (4) if a write fails with JSON/parse/input errors, immediately retry with a much smaller chunk—never paste the same huge payload again, (5) after the deliverable is ready in the run workspace and a project is bound, call publish_to_project for each final asset (auto-promote also runs at the end). If the Skill documents a creation workflow but has no generator script, write a minimal generator script to the run workspace and invoke run_workspace_script with skillId `opcai-workspace`. If a Python dependency such as reportlab is required, use install_python_dependency before executing. Use reasonable defaults for non-critical details. If a required permission, script, dependency, or output path is unavailable, state the exact blocker and the one next user action in the final answer.',
     ].filter(Boolean).join('\n\n');
     const model = languageModel(input.model);
     const providerOptions = streamProviderOptions(input.model);
@@ -325,7 +354,7 @@ export async function* streamAgentReply(input: {
       system: runtimeInstructions,
       messages: input.messages,
       tools: {
-        ...createSkillExecutionTools({ skills, runId }),
+        ...createSkillExecutionTools({ skills, runId, projectRoot: projectRoot || undefined }),
         ...searchTools,
         ...knowledgeTools,
         ...experienceTools,
@@ -371,6 +400,13 @@ export async function* streamAgentReply(input: {
           const artifact = (output as Record<string, unknown>).path;
           if (typeof artifact === 'string' && !/\.(sh|js|mjs|cjs|py)$/i.test(artifact)) yield { type: 'artifact.created', runId, path: artifact };
         }
+        if (ok && part.toolName === 'publish_to_project' && output && typeof output === 'object') {
+          const value = output as Record<string, unknown>;
+          if (typeof value.path === 'string' && typeof value.projectPath === 'string') {
+            yield { type: 'project.file.published', runId, path: value.path, projectPath: value.projectPath };
+            yield { type: 'artifact.created', runId, path: value.projectPath };
+          }
+        }
         if (ok && part.toolName === 'web_search' && output && typeof output === 'object') {
           const value = output as Record<string, unknown>; const sources = Array.isArray(value.sources) ? value.sources.filter((item): item is { title: string; url: string; source?: string } => Boolean(item && typeof item === 'object' && typeof (item as any).title === 'string' && typeof (item as any).url === 'string')).slice(0, 10) : [];
           if (sources.length) yield { type: 'search.sources', runId, provider: String(value.provider || ''), sources };
@@ -399,6 +435,19 @@ export async function* streamAgentReply(input: {
       return;
     }
     if (!emittedText && lastToolSucceeded !== undefined) yield { type: 'message.delta', runId, text: lastToolSucceeded ? '工具调用已完成。请查看上方执行记录和运行工作区产物。' : '工具未能完成请求；请查看上方执行记录中的权限或输入原因。' };
+    // Auto-promote deliverables so the project file tree is filled even when the
+    // model never called publish_to_project (or only published a subset).
+    if (projectRoot) {
+      const workspaceRoot = path.join(
+        process.env.OPCAI_WORKSPACES_DIR || path.join(process.cwd(), '.opcai-workspaces'),
+        runId,
+      );
+      const published = await promoteWorkspaceDeliverablesToProject(workspaceRoot, projectRoot);
+      for (const item of published) {
+        yield { type: 'project.file.published', runId, path: item.path, projectPath: item.projectPath };
+        yield { type: 'artifact.created', runId, path: item.projectPath };
+      }
+    }
     yield { type: 'run.completed', runId };
   } catch (error) {
     if (isAbortLike(error, abortSignal)) {

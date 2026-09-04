@@ -47,5 +47,29 @@ interface Window {
     saveChannelSettings(payload: unknown): Promise<{ ok: boolean; meta: Record<string, unknown> }>;
     gatewayStatus(): Promise<{ running: boolean; pid: number | null }>;
     gatewayRestart(): Promise<{ running: boolean; pid: number | null }>;
+    checkEnvironment(): Promise<EnvCheckReport>;
+    onEnvCheckProgress(callback: (payload: EnvCheckProgressPayload) => void): () => void;
   };
+}
+
+type EnvCheckProgressPayload =
+  | { kind: 'start'; id: string; name: string; required: string }
+  | { kind: 'item'; item: EnvCheckItem }
+  | { kind: 'done'; report: EnvCheckReport };
+
+interface EnvCheckItem {
+  id: string;
+  name: string;
+  status: 'ok' | 'warn' | 'error';
+  required: string;
+  found: string;
+  command?: string;
+  help: string;
+}
+
+interface EnvCheckReport {
+  platform: string;
+  checks: EnvCheckItem[];
+  summary: { total: number; ok: number; warn: number; error: number };
+  checkedAt: number;
 }

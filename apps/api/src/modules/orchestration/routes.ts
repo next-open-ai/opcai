@@ -70,6 +70,10 @@ export function getOrchestrator(): Orchestrator {
       contextResolver,
       chatContextResolver,
     });
+    // Fire-and-forget: settle runs left `running` by a previous process exit.
+    void instance.recoverOnBoot().catch((error) => {
+      console.error('[orch] recoverOnBoot failed', error);
+    });
   }
   return instance;
 }
@@ -187,6 +191,14 @@ export const orchestrationRoutes: FastifyPluginAsync = async (app) => {
   app.post('/sessions/:sessionId/cancel', async (request, reply) => {
     const aborted = await orch.chat.abortActiveRun(String((request.params as Record<string, string>).sessionId));
     return { aborted };
+  });
+
+  /** Flush session rolling memory (switch/idle/close). */
+  app.post('/sessions/:sessionId/memory/flush', async (request, reply) => {
+    const sessionId = String((request.params as Record<string, string>).sessionId);
+    const session = await orch.chat.flushSessionMemory(sessionId);
+    if (!session) return fail(reply, new Error('Chat session not found.'));
+    return { session };
   });
 
   app.get('/sessions/:sessionId/runs', async (request, reply) => {

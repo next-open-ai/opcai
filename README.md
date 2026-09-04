@@ -26,6 +26,8 @@ channel gateway ─── HTTP / SSE ─────────┘   (Telegram 
 | Skills (progressive disclosure) | Authorize → `SKILL.md` on demand → resources/scripts within an isolated run workspace |
 | Project orchestration | Draft → human confirm → server scheduler (parallel / waterfall / DAG) across multiple employees; resumable approval per task |
 | Resumable approvals | Tool approval parks a run (`waiting-approval`); deciding it re-runs the same turn automatically |
+| Session rolling memory | Per-session `memory.summary` + watermark; auto-summarize over budget, flush on leave; transcript stays source of truth |
+| Dual project workspaces | Process files stay in per-run agent workspaces; final deliverables use `publish_to_project` into the shared project tree |
 | Knowledge / MCP / Web search | Local LanceDB + cloud KBs, MCP connectors (http/sse/stdio), multi-provider search with masking |
 | Channels & remote office | Gateway child process: Telegram & Feishu adapters, personal allowlist, **remote relay** device link (WS outbound) for terminals |
 | Local-first storage | One durable domain store owned by the API process; secrets stay encrypted in the main process (`safeStorage`) and are only released over fork IPC |

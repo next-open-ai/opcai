@@ -12,7 +12,16 @@ const SUMMARY_SOURCE_CHARS = 48_000;
 /** Cap the summary stored back into the conversation. */
 const SUMMARY_MAX_CHARS = 3_500;
 
-const SUMMARY_PREFIX = '[OPCAI context summary]';
+/** Shared prefix for ephemeral step compaction and durable session memory. */
+export const SESSION_SUMMARY_PREFIX = '[OPCAI context summary]';
+const SUMMARY_PREFIX = SESSION_SUMMARY_PREFIX;
+
+/** Soft budget for durable session memory (summary + uncovered turns). */
+export const SESSION_MEMORY_BUDGET_CHARS = 24_000;
+/** Keep this many newest canonical messages verbatim after a session roll. */
+export const SESSION_MEMORY_KEEP_RECENT = KEEP_RECENT_MESSAGES;
+/** Cap stored session summary text. */
+export const SESSION_MEMORY_SUMMARY_MAX_CHARS = SUMMARY_MAX_CHARS;
 
 function estimateChars(messages: ModelMessage[]): number {
   try {
@@ -64,25 +73,25 @@ function pruneAggressively(messages: ModelMessage[], keepToolWindow: 'before-las
   });
 }
 
-async function summarizeOlderTurns(input: {
-  older: ModelMessage[];
+const SUMMARY_SYSTEM = [
+  'You compress prior agent conversation into a continuity brief for the same agent.',
+  'Preserve: user goals, constraints, decisions, file paths created/edited, failed attempts, and next unfinished work.',
+  'Omit: raw CSS/HTML dumps, repeated tool JSON, reasoning traces, and chit-chat.',
+  'Write in the same language as the user content. Max ~400 words. No markdown fences.',
+].join(' ');
+
+async function summarizeDigest(input: {
+  digest: string;
   model: LanguageModel;
   providerOptions?: Record<string, unknown>;
+  minChars?: number;
 }): Promise<string | null> {
-  const digest = input.older
-    .map(messageToPlain)
-    .join('\n\n---\n\n')
-    .slice(0, SUMMARY_SOURCE_CHARS);
-  if (digest.trim().length < 400) return null;
+  const digest = input.digest.trim().slice(0, SUMMARY_SOURCE_CHARS);
+  if (digest.length < (input.minChars ?? 400)) return null;
   try {
     const { text } = await generateText({
       model: input.model,
-      system: [
-        'You compress prior agent conversation into a continuity brief for the same agent.',
-        'Preserve: user goals, constraints, decisions, file paths created/edited, failed attempts, and next unfinished work.',
-        'Omit: raw CSS/HTML dumps, repeated tool JSON, reasoning traces, and chit-chat.',
-        'Write in the same language as the user content. Max ~400 words. No markdown fences.',
-      ].join(' '),
+      system: SUMMARY_SYSTEM,
       prompt: digest,
       maxOutputTokens: 900,
       ...(input.providerOptions ? { providerOptions: input.providerOptions as never } : {}),
@@ -92,6 +101,48 @@ async function summarizeOlderTurns(input: {
   } catch {
     return null;
   }
+}
+
+async function summarizeOlderTurns(input: {
+  older: ModelMessage[];
+  model: LanguageModel;
+  providerOptions?: Record<string, unknown>;
+}): Promise<string | null> {
+  const digest = input.older.map(messageToPlain).join('\n\n---\n\n');
+  return summarizeDigest({
+    digest,
+    model: input.model,
+    providerOptions: input.providerOptions,
+  });
+}
+
+/**
+ * Summarize plain user/assistant turns for durable session rolling memory.
+ * Optionally folds a previous summary into the new brief.
+ */
+export async function summarizePlainTurns(input: {
+  previousSummary?: string;
+  turns: Array<{ role: 'user' | 'assistant'; content: string }>;
+  model: LanguageModel;
+  providerOptions?: Record<string, unknown>;
+}): Promise<string | null> {
+  const body = input.turns
+    .map((turn) => `${turn.role}: ${turn.content}`)
+    .join('\n\n---\n\n');
+  const digest = [
+    input.previousSummary?.trim()
+      ? `Previous session summary:\n${input.previousSummary.trim()}`
+      : '',
+    body,
+  ]
+    .filter(Boolean)
+    .join('\n\n====\n\n');
+  return summarizeDigest({
+    digest,
+    model: input.model,
+    providerOptions: input.providerOptions,
+    minChars: 120,
+  });
 }
 
 /**
@@ -152,4 +203,20 @@ export async function compactMessagesForStep(input: {
   while (messages.length && messages[0]?.role === 'tool') messages = messages.slice(1);
 
   return { messages, didPrune, didSummarize };
+}
+
+/** Build the user/assistant pair used to inject a durable or ephemeral summary. */
+export function sessionSummaryMessagePair(summary: string): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const text = summary.trim();
+  if (!text) return [];
+  return [
+    {
+      role: 'user',
+      content: `${SESSION_SUMMARY_PREFIX}\n${text}\n\nContinue from this summary and the recent messages below. Do not re-read the entire history.`,
+    },
+    {
+      role: 'assistant',
+      content: 'Understood. I will use the summary as prior context and continue with the recent turns.',
+    },
+  ];
 }

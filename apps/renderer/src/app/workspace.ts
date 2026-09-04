@@ -23,7 +23,7 @@ import {
 } from './employees.js';
 
 export type { Employee, EmployeeDraft, EmployeeId } from './employees.js';
-export type View = 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'assets' | 'automations' | 'projects' | 'remote' | 'settings';
+export type View = 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'assets' | 'automations' | 'projects' | 'remote' | 'env' | 'settings';
 export type CollaborationDelivery = 'synthesize' | 'direct';
 export interface CollaborationRun { employeeId: EmployeeId; task: string; status: 'running' | 'completed' | 'failed'; summary: string; activities: ToolActivity[]; error?: string; }
 export interface Message { id: string; role: 'user' | 'assistant'; content: string; activities?: ToolActivity[]; approvals?: ToolApproval[]; assets?: Asset[]; sources?: Array<SearchSource & { provider: string }>; collaborations?: CollaborationRun[]; collaborationDelivery?: CollaborationDelivery; }
@@ -104,7 +104,7 @@ async function load() {
   permissionTierByEmployee.value = parsePermissionTiers(await readStored('workspace.permission-tiers'));
   await hydrateServerHook?.();
 }
-function parsePermissionTiers(value: string | null): Record<string, ExecutionLevel> { try { const parsed = JSON.parse(value || '{}') as Record<string, unknown>; return Object.fromEntries(Object.entries(parsed).filter(([, tier]) => tier === 'read-only' || tier === 'default' || tier === 'extended' || tier === 'full')) as Record<string, ExecutionLevel>; } catch { return {}; } }
+function parsePermissionTiers(value: string | null): Record<string, ExecutionLevel> { try { const parsed = JSON.parse(value || '{}') as Record<string, unknown>; return Object.fromEntries(Object.entries(parsed).filter(([, tier]) => tier === 'read-only' || tier === 'default' || tier === 'full')) as Record<string, ExecutionLevel>; } catch { return {}; } }
 
 
 export function useWorkspace() {
@@ -423,7 +423,15 @@ export function useWorkspace() {
   const activeConversation = computed(() => conversations.value.find((item) => item.id === activeConversationId.value) ?? null);
   const currentEmployee = computed(() => employees.value.find((item) => item.id === currentEmployeeId.value) ?? employees.value[0]);
   const setView = (value: View) => { view.value = value; };
+  const flushLeavingConversation = (leavingId: string | null) => {
+    if (!leavingId) return;
+    const leaving = conversations.value.find((item) => item.id === leavingId);
+    const sessionId = leaving?.serverSessionId;
+    if (!sessionId) return;
+    void orch.flushChatSessionMemory(sessionId).catch(() => undefined);
+  };
   const startChat = (employeeId: EmployeeId = currentEmployeeId.value) => {
+    flushLeavingConversation(activeConversationId.value);
     currentEmployeeId.value = employeeId;
     activeConversationId.value = null;
     view.value = 'chat';
@@ -431,6 +439,9 @@ export function useWorkspace() {
   const selectConversation = (id: string) => {
     const conversation = conversations.value.find((item) => item.id === id);
     if (!conversation) return;
+    if (activeConversationId.value && activeConversationId.value !== id) {
+      flushLeavingConversation(activeConversationId.value);
+    }
     activeConversationId.value = id;
     currentEmployeeId.value = conversation.employeeId;
     view.value = 'chat';
@@ -461,6 +472,8 @@ export function useWorkspace() {
   const setPermissionTier = (tier: ExecutionLevel) => { permissionTierByEmployee.value = { ...permissionTierByEmployee.value, [currentEmployeeId.value]: tier }; void writeStored('workspace.permission-tiers', JSON.stringify(permissionTierByEmployee.value)); };
   const createEmployee = async (draft: EmployeeDraft) => catalog.create(draft);
   const updateEmployee = async (id: EmployeeId, draft: EmployeeDraft) => catalog.update(id, draft);
+  const resetEmployee = async (id: EmployeeId) => catalog.resetPreset(id);
+  const hasEmployeeOverride = (id: EmployeeId) => catalog.hasPresetOverride(id);
   const removeEmployee = async (id: EmployeeId) => {
     await catalog.remove(id);
     if (currentEmployeeId.value === id) {
@@ -696,7 +709,7 @@ export function useWorkspace() {
    * Runs a project task without selecting or mutating the user's active chat.
    * This is the concurrency boundary used by the project orchestrator.
    */
-  const runProjectTask = async (input: { projectId: string; taskId: string; prompt: string; employeeId: EmployeeId; skillIds: string[]; permissionTier?: ExecutionLevel; model: ProviderConfig }, onActivity?: (activity: ToolActivity) => void, onDelta?: (delta: string) => void): Promise<ProjectTaskTranscript> => {
+  const runProjectTask = async (input: { projectId: string; taskId: string; prompt: string; employeeId: EmployeeId; skillIds: string[]; permissionTier?: ExecutionLevel; model: ProviderConfig; workspacePath?: string }, onActivity?: (activity: ToolActivity) => void, onDelta?: (delta: string) => void): Promise<ProjectTaskTranscript> => {
     const employee = employees.value.find((item) => item.id === input.employeeId) ?? employees.value[0];
     const skills = await skillRuntimeFor(employee.id, input.skillIds, input.permissionTier);
     const opts = runOptionsFor(employee.id, true);
@@ -709,7 +722,16 @@ export function useWorkspace() {
         toolIds: skills.map((skill) => skill.id),
         instructions: profileInstructions(employee, 'You are working on one assigned project task. Complete only this task, report concrete findings and deliverables in the user\'s language. Do not delegate further.'),
       },
-      messages: [{ role: 'user', content: input.prompt }], model: toModelPayload(model, { enableSearch: opts.enableBuiltinSearch }), skills, searchProviders: opts.searchProviders, mcpConnections: opts.mcpConnections, knowledgeBases: opts.knowledgeBases, maxSteps: opts.maxSteps, runTimeoutMs: opts.runTimeoutMs, mcpToolTimeoutMs: opts.mcpToolTimeoutMs,
+      messages: [{ role: 'user', content: input.prompt }],
+      model: toModelPayload(model, { enableSearch: opts.enableBuiltinSearch }),
+      skills,
+      searchProviders: opts.searchProviders,
+      mcpConnections: opts.mcpConnections,
+      knowledgeBases: opts.knowledgeBases,
+      projectWorkspacePath: input.workspacePath,
+      maxSteps: opts.maxSteps,
+      runTimeoutMs: opts.runTimeoutMs,
+      mcpToolTimeoutMs: opts.mcpToolTimeoutMs,
     }, (delta) => { transcript.assistantContent += delta; onDelta?.(delta); }, (activity) => {
       const existing = transcript.activities.find((item) => item.toolName === activity.toolName && item.status === 'running');
       if (existing && activity.status !== 'running') Object.assign(existing, activity); else transcript.activities.push(activity);
@@ -794,5 +816,5 @@ export function useWorkspace() {
       await new Promise((resolve) => setTimeout(resolve, 350));
     }
   };
-  return { employees, view, currentEmployeeId, currentEmployee, conversations, activeConversation, permissionTier, load, setView, startChat, selectConversation, selectEmployee, setDefaultEmployee, setPermissionTier, clearConversation, deleteConversation, addMessage, abortActiveRun, runAutomation, runProjectTask, generateProjectDraft, approveAndRetry, createEmployee, updateEmployee, removeEmployee };
+  return { employees, view, currentEmployeeId, currentEmployee, conversations, activeConversation, permissionTier, load, setView, startChat, selectConversation, selectEmployee, setDefaultEmployee, setPermissionTier, clearConversation, deleteConversation, addMessage, abortActiveRun, runAutomation, runProjectTask, generateProjectDraft, approveAndRetry, createEmployee, updateEmployee, removeEmployee, resetEmployee, hasEmployeeOverride };
 }

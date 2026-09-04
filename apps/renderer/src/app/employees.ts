@@ -35,7 +35,16 @@ const PRESET_IDS = new Set(['general', 'research', 'code', 'administrator']);
 export const PRESET_EMPLOYEES: Employee[] = [
   { id: 'general', color: '#526fe0', initials: 'AI', nameKey: 'employee.general.name', descriptionKey: 'employee.general.description', preset: true },
   { id: 'research', color: '#0f9b8e', initials: 'R', nameKey: 'employee.research.name', descriptionKey: 'employee.research.description', preset: true },
-  { id: 'code', color: '#8b5bd3', initials: '</>', nameKey: 'employee.code.name', descriptionKey: 'employee.code.description', preset: true },
+  {
+    id: 'code',
+    color: '#8b5bd3',
+    initials: '</>',
+    nameKey: 'employee.code.name',
+    descriptionKey: 'employee.code.description',
+    preset: true,
+    instructions:
+      '凡任务要求「按既定设计规范」但没有提供规范/品牌/页面清单：必须采用一份文档化的默认企业规范（主/辅色、字阶、12 列栅格、断点、页面清单写入 README.md），并直接产出核心可运行页面；不得因缺品牌/规范/文案而停下澄清。只输出文字、不写文件=失败；要么写文件，要么给出精确阻塞点+唯一需要的输入。',
+  },
   { id: 'administrator', color: '#263449', initials: 'SYS', nameKey: 'employee.administrator.name', descriptionKey: 'employee.administrator.description', preset: true, system: true },
 ];
 
@@ -53,7 +62,9 @@ export const EMPLOYEE_COLOR_PRESETS = [
 ];
 
 const key = 'workspace.custom-employees';
+const overridesKey = 'workspace.employee-overrides';
 const customEmployees = ref<Employee[]>([]);
+const presetOverrides = ref<Record<string, { description?: string; instructions?: string }>>({});
 const loaded = ref(false);
 
 function slugify(name: string) {
@@ -81,8 +92,9 @@ export function isPresetEmployee(employee: Pick<Employee, 'id' | 'preset'>) {
   return employee.preset === true || PRESET_IDS.has(employee.id);
 }
 
-export function isEditableEmployee(employee: Pick<Employee, 'id' | 'preset' | 'system'>) {
-  return !isPresetEmployee(employee) && !employee.system;
+export function isEditableEmployee(employee: Pick<Employee, 'system'>) {
+  // 预设员工（非系统角色）也可编辑「说明」与「指令」；仅系统角色（administrator）不可编辑。
+  return !employee.system;
 }
 
 export function employeeDisplayName(employee: Employee | undefined | null, t: (key: string) => string) {
@@ -124,6 +136,19 @@ function normalizeCustom(value: unknown): Employee | null {
   };
 }
 
+function normalizePresetOverrides(value: unknown): Record<string, { description?: string; instructions?: string }> {
+  if (!value || typeof value !== 'object') return {};
+  const out: Record<string, { description?: string; instructions?: string }> = {};
+  for (const [id, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!PRESET_IDS.has(id) || !raw || typeof raw !== 'object') continue;
+    const row = raw as { description?: unknown; instructions?: unknown };
+    const description = String(row.description || '').trim();
+    const instructions = String(row.instructions || '').trim();
+    if (description || instructions) out[id] = { description: description || undefined, instructions: instructions || undefined };
+  }
+  return out;
+}
+
 function normalizeAll(value: unknown): Employee[] {
   if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
@@ -142,14 +167,24 @@ async function persist() {
 }
 
 export function useEmployeeCatalog() {
-  const employees = computed(() => [...PRESET_EMPLOYEES, ...customEmployees.value]);
+  const employees = computed(() => [
+    ...PRESET_EMPLOYEES.map((preset) => {
+      const override = presetOverrides.value[preset.id];
+      return override
+        ? { ...preset, description: override.description, instructions: override.instructions }
+        : preset;
+    }),
+    ...customEmployees.value,
+  ]);
 
   const load = async () => {
     if (loaded.value) return;
     try {
       customEmployees.value = normalizeAll(JSON.parse((await readStored(key)) || '[]'));
+      presetOverrides.value = normalizePresetOverrides(JSON.parse((await readStored(overridesKey)) || '{}'));
     } catch {
       customEmployees.value = [];
+      presetOverrides.value = {};
     }
     loaded.value = true;
   };
@@ -184,6 +219,16 @@ export function useEmployeeCatalog() {
   };
 
   const update = async (id: string, draft: EmployeeDraft) => {
+    if (PRESET_IDS.has(id)) {
+      const description = draft.description.trim();
+      if (!description) throw new Error('Employee description is required.');
+      presetOverrides.value = {
+        ...presetOverrides.value,
+        [id]: { description, instructions: draft.instructions.trim() },
+      };
+      await writeStored(overridesKey, JSON.stringify(presetOverrides.value));
+      return byId(id) as Employee;
+    }
     const index = customEmployees.value.findIndex((item) => item.id === id);
     if (index < 0) throw new Error('Only custom employees can be edited.');
     const name = draft.name.trim();
@@ -206,6 +251,16 @@ export function useEmployeeCatalog() {
     return next;
   };
 
+  const hasPresetOverride = (id: string) => Boolean(presetOverrides.value[id]);
+
+  const resetPreset = async (id: string) => {
+    if (!PRESET_IDS.has(id) || !presetOverrides.value[id]) return;
+    const copy = { ...presetOverrides.value };
+    delete copy[id];
+    presetOverrides.value = copy;
+    await writeStored(overridesKey, JSON.stringify(copy));
+  };
+
   const remove = async (id: string) => {
     if (PRESET_IDS.has(id)) throw new Error('Preset employees cannot be deleted.');
     customEmployees.value = customEmployees.value.filter((item) => item.id !== id);
@@ -220,6 +275,8 @@ export function useEmployeeCatalog() {
     create,
     update,
     remove,
+    hasPresetOverride,
+    resetPreset,
   };
 }
 

@@ -69,8 +69,7 @@ const approvalLabel: Record<ToolApproval["capability"], string> = {
 const tiers: Array<{ value: ExecutionLevel; label: string }> = [
   { value: "read-only", label: "只读" },
   { value: "default", label: "默认工作权限" },
-  { value: "extended", label: "扩展权限" },
-  { value: "full", label: "完全工作权限" },
+  { value: "full", label: "完全权限（危险操作除外）" },
 ];
 
 function displayTool(activity: ToolActivity) {

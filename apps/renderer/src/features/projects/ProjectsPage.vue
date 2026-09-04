@@ -43,8 +43,9 @@ const props = defineProps<{
       prompt: string;
       employeeId: EmployeeId;
       skillIds: string[];
-      permissionTier: "read-only" | "default" | "extended" | "full";
+      permissionTier: "read-only" | "default" | "full";
       model: ProviderConfig;
+      workspacePath?: string;
     },
     onActivity?: (activity: ToolActivity) => void,
     onDelta?: (delta: string) => void,
@@ -71,6 +72,13 @@ const {
  * Legacy local projects keep the original scheduler below.
  * ------------------------------------------------------------------ */
 const managedPollers = new Map<string, ReturnType<typeof setInterval>>();
+const managedPollCounts = new Map<string, number>();
+function stopManagedPoll(projectId: string) {
+  const timer = managedPollers.get(projectId);
+  if (timer) clearInterval(timer);
+  managedPollers.delete(projectId);
+  managedPollCounts.delete(projectId);
+}
 const hydratedKeys = new Set<string>();
 
 function managedProvider(): ProviderId {
@@ -172,15 +180,26 @@ function adoptServerProject(sp: orch.ServerProject, previous?: Project): Project
 }
 
 async function refreshManaged(projectId: string): Promise<boolean> {
+  const count = (managedPollCounts.get(projectId) ?? 0) + 1;
+  managedPollCounts.set(projectId, count);
+  // 防失控：超过约 15 分钟仍未结束则停轮询，避免无限刷请求。
+  if (count > 1200) { stopManagedPoll(projectId); return false; }
   const sp = await orch.getProject(projectId);
   const index = projects.value.findIndex((item) => item.id === projectId);
-  if (!sp || index < 0) return false;
+  if (!sp || index < 0) { stopManagedPoll(projectId); return false; }
+  // 服务端已不存在活动运行（或无 activeRunId）即视为终态，停止轮询。
+  if (!sp.activeRunId) { stopManagedPoll(projectId); return false; }
   const next = adoptServerProject(sp, projects.value[index]);
   projects.value = [...projects.value.slice(0, index), next, ...projects.value.slice(index + 1)];
-  // Hydrate transcripts for completed tasks the server settled (once each).
+  // Hydrate transcripts for settled tasks, and also for long-running tasks so
+  // mid-run checkpoints (activities/transcript) appear in member detail.
   for (const task of next.tasks) {
     if (task.status === "completed" && !task.transcript) {
       void hydrateManagedTask(next, task.id);
+    } else if (task.status === "failed" && !task.transcript && task.runId) {
+      void hydrateManagedTask(next, task.id);
+    } else if (task.status === "running" && task.runId) {
+      void hydrateManagedTask(next, task.id, { allowRefresh: true });
     } else if (task.status === "running" && /等待审批|approval/i.test(task.error ?? "")) {
       void hydratePendingApprovals(next, task);
     }
@@ -191,15 +210,27 @@ async function refreshManaged(projectId: string): Promise<boolean> {
   return sp.status === "running";
 }
 
-async function hydrateManagedTask(project: Project, taskId: string): Promise<void> {
+async function hydrateManagedTask(
+  project: Project,
+  taskId: string,
+  options: { allowRefresh?: boolean } = {},
+): Promise<void> {
   const key = `${project.id}:${taskId}`;
-  if (hydratedKeys.has(key)) return;
-  hydratedKeys.add(key);
+  if (hydratedKeys.has(key) && !options.allowRefresh) return;
+  if (!options.allowRefresh) hydratedKeys.add(key);
   const task = project.tasks.find((item) => item.id === taskId);
   const run = task ? await orch.projectTranscript(project.id, taskId) : null;
   if (!task || !run) {
-    hydratedKeys.delete(key);
+    if (!options.allowRefresh) hydratedKeys.delete(key);
     return;
+  }
+  // Running tasks with empty checkpoints stay quiet until progress lands.
+  if (run.status === "running" && !run.transcript && !(run.activities?.length) && !(run.artifacts?.length)) {
+    return;
+  }
+  if (!options.allowRefresh) hydratedKeys.add(key);
+  else if (run.status === "completed" || run.status === "failed" || run.status === "cancelled") {
+    hydratedKeys.add(key);
   }
   task.transcript = serverToTranscript(run);
   task.runId = run.id;
@@ -384,6 +415,9 @@ function applyManagedEvent(projectId: string, event: orch.OrcEvent): void {
     bumpProject();
   } else if (event.type === "run.artifact" && event.artifact && event.runId) {
     bumpProject();
+  } else if (event.type === "project.file.published") {
+    fileTreeEpoch.value += 1;
+    bumpProject();
   } else if (event.type === "project.task" && event.taskId && event.status) {
     const target = project.tasks.find((task) => task.id === event.taskId);
     if (target && target.status !== event.status) target.status = event.status as ProjectTask["status"];
@@ -442,13 +476,15 @@ async function runManagedProject(project: Project): Promise<void> {
     await refreshManaged(project.id);
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "服务端编排启动失败。";
+    // 启动失败仍为草稿：允许下次进入对话时再次自动尝试。
+    autoStartedDrafts.delete(project.id);
     return;
   }
   const existing = managedPollers.get(project.id);
   if (existing) clearInterval(existing);
   managedPollers.set(
     project.id,
-    setInterval(() => void refreshManaged(project.id), 800),
+    setInterval(() => void refreshManaged(project.id), 3000),
   );
   startManagedStream(project.id);
 }
@@ -501,6 +537,8 @@ async function deleteProject(project: Project | null): Promise<void> {
 
 const tab = ref<"projects" | "runs">("projects");
 const selectedId = ref<string | null>(null);
+/** Bumped when agents publish files into the shared project workspace. */
+const fileTreeEpoch = ref(0);
 const creating = ref(false);
 const createStep = ref<1 | 2 | 3>(1);
 const planning = ref(false);
@@ -745,12 +783,14 @@ function closeCreate() {
   error.value = "";
 }
 async function continueCreate() {
-  if (!name.value.trim() || !goal.value.trim() || !coordinator.value) {
-    error.value = "请填写项目名称、需求并选择协调员模型。";
+  // 名称可选；描述与协调员模型必填。规划成功进入「确认运行」步骤。
+  if (!goal.value.trim() || !coordinator.value) {
+    error.value = "请填写项目描述并选择协调员模型。";
     return;
   }
+  if (planning.value) return;
   await generateTasks();
-  if (!error.value) createStep.value = 2;
+  if (!error.value && draftTasks.value.length) createStep.value = 3;
 }
 function addProjectMessage(project: Project, message: ProjectMessage) {
   project.messages.push(message);
@@ -820,17 +860,28 @@ async function confirmCreate() {
   selectedId.value = adopted.id;
   detailTaskId.value = adopted.tasks[0]?.id ?? null;
   closeCreate();
+  autoStartIfDraft(adopted);
 }
 async function chooseWorkspaceParent() {
   const selected = await window.opcaiDesktop?.pickProjectDirectory();
   if (selected) workspaceParent.value = selected;
 }
+const autoStartedDrafts = new Set<string>();
+/** 进入项目对话即自动启动（仅草稿项目触发一次；状态离开 draft 后允许再次进入时重试）。 */
+function autoStartIfDraft(project: Project | null | undefined) {
+  if (!project || project.status !== "draft") return;
+  if (autoStartedDrafts.has(project.id)) return;
+  autoStartedDrafts.add(project.id);
+  void run(project);
+}
+
 function openProject(project: Project) {
   selectedId.value = project.id;
   detailTaskId.value =
     project.tasks.find((task) => task.status === "running")?.id ??
     project.tasks[0]?.id ??
     null;
+  autoStartIfDraft(project);
 }
 function updateTask(task: ProjectTask, patch: Partial<ProjectTask>) {
   Object.assign(task, patch);
@@ -911,6 +962,7 @@ async function executeTask(project: Project, task: ProjectTask) {
         skillIds: task.skillIds,
         permissionTier: task.permissionTier,
         model,
+        workspacePath: project.workspacePath,
       },
       (activity) => {
         const current = task.transcript!;
@@ -1028,6 +1080,7 @@ async function run(project: Project) {
       skillIds: [],
       permissionTier: "read-only",
       model: aggregator,
+      workspacePath: project.workspacePath,
     });
     project.summary = synthesis.assistantContent;
     addProjectMessage(project, {
@@ -1118,6 +1171,7 @@ onMounted(async () => {
   if (focusId && projects.value.some((project) => project.id === focusId)) {
     selectedId.value = focusId;
     await writeStored("projects.focus-id", "");
+    autoStartIfDraft(projects.value.find((project) => project.id === focusId));
   }
 });
 
@@ -1135,702 +1189,269 @@ onBeforeUnmount(() => {
     >
       <header v-if="!selected" class="flex shrink-0 flex-wrap items-end justify-between gap-4">
         <div>
-          <p
-            class="text-[11px] font-extrabold tracking-[.13em] text-[var(--accent)]"
-          >
-            OPCAI / PROJECT ORCHESTRATION
-          </p>
+          <p class="text-[11px] font-extrabold tracking-[.13em] text-[var(--accent)]">OPCAI / PROJECT ORCHESTRATION</p>
           <h1 class="mt-2 text-4xl font-bold tracking-[-.045em]">项目</h1>
-          <p class="mt-3 text-[var(--muted)]">
-            把复杂目标交给多个数字员工：先确认编排，再让任务在隔离上下文中可靠运行。
-          </p>
+          <p class="mt-3 text-[var(--muted)]">把复杂目标交给多个数字员工：先确认编排，再让任务在隔离上下文中可靠运行。</p>
         </div>
-        <button
-          class="rounded-xl bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white"
-          @click="openCreate"
-        >
-          ＋ 新建项目
-        </button>
+        <button class="rounded-xl bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white" @click="openCreate">＋ 新建项目</button>
       </header>
-      <div v-if="!selected"
-        class="mt-6 inline-flex w-fit rounded-xl bg-[var(--surface-muted)] p-1"
-      >
-        <button
-          :class="[
-            'rounded-lg px-4 py-2 text-sm font-semibold',
-            tab === 'projects'
-              ? 'bg-[var(--surface)] shadow-sm'
-              : 'text-[var(--muted)]',
-          ]"
-          @click="
-            tab = 'projects';
-            selectedId = null;
-          "
-        >
-          项目</button
-        ><button
-          :class="[
-            'rounded-lg px-4 py-2 text-sm font-semibold',
-            tab === 'runs'
-              ? 'bg-[var(--surface)] shadow-sm'
-              : 'text-[var(--muted)]',
-          ]"
-          @click="tab = 'runs'"
-        >
-          运行记录
-          <span class="ml-1 rounded bg-[var(--surface)] px-1.5 text-xs">{{
-            runs.length
-          }}</span>
-        </button>
+
+      <div v-if="!selected" class="mt-6 inline-flex w-fit rounded-xl bg-[var(--surface-muted)] p-1">
+        <button :class="['rounded-lg px-4 py-2 text-sm font-semibold', tab === 'projects' ? 'bg-[var(--surface)] shadow-sm' : 'text-[var(--muted)]']" @click="tab = 'projects'; selectedId = null;">项目</button>
+        <button :class="['rounded-lg px-4 py-2 text-sm font-semibold', tab === 'runs' ? 'bg-[var(--surface)] shadow-sm' : 'text-[var(--muted)]']" @click="tab = 'runs'">运行记录 <span class="ml-1 rounded bg-[var(--surface)] px-1.5 text-xs">{{ runs.length }}</span></button>
       </div>
-      <div :class="[selected ? 'min-h-0 flex-1 overflow-hidden' : 'mt-6 min-h-0 flex-1 overflow-y-auto pr-1']">
-        <section
-          v-if="creating"
-          class="rounded-2xl border border-[var(--accent)]/30 bg-[var(--surface)] shadow-sm"
-        >
-          <div
-            class="flex items-start justify-between border-b border-[var(--border)] px-6 py-5"
-          >
-            <div>
-              <p
-                class="text-[10px] font-bold tracking-[.14em] text-[var(--accent)]"
-              >
-                CREATE · REVIEW · RUN
-              </p>
-              <h2 class="mt-1 text-xl font-bold">
-                {{
-                  createStep === 1
-                    ? "定义项目"
-                    : createStep === 2
-                      ? "规划员工与分工"
-                      : "确认并创建项目"
-                }}
+
+      <div :class="[selected ? 'min-h-0 flex-1 overflow-hidden flex flex-col' : 'mt-6 min-h-0 flex-1 overflow-y-auto pr-1']">
+        <!-- 新建项目向导：①选模板 → ②信息与规划 → ③确认运行 -->
+        <section v-if="creating" class="rounded-2xl border border-[var(--accent)]/30 bg-[var(--surface)] shadow-sm">
+          <div class="flex items-start justify-between gap-4 border-b border-[var(--border)] px-6 py-5">
+            <div class="min-w-0">
+              <p class="text-[10px] font-bold tracking-[0.14em] text-[var(--accent)]">CREATE · PLAN · RUN</p>
+              <h2 class="mt-1 text-xl font-bold tracking-tight">
+                {{ createStep === 1 ? '选择项目类型' : createStep === 2 ? '填写信息并规划' : '确认执行方案' }}
               </h2>
               <p class="mt-1 text-sm text-[var(--muted)]">
-                创建只生成草案；确认后才运行任何智能体。
+                {{ createStep === 1 ? '先选协作模式，再填写目标与协调员模型。' : createStep === 2 ? '描述目标后，用协调员模型生成可编辑任务草案。' : '核对任务分工，确认后进入项目对话工作台由服务端调度。' }}
               </p>
             </div>
-            <button class="text-sm text-[var(--muted)]" @click="closeCreate">
-              关闭
-            </button>
+            <button class="shrink-0 rounded-lg px-2 py-1 text-sm text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" type="button" @click="closeCreate">关闭</button>
           </div>
           <div class="p-6">
             <ol class="mb-7 flex items-center gap-2 text-xs font-semibold">
-              <template v-for="step in [1, 2, 3]" :key="step"
-                ><span
-                  :class="[
-                    'grid h-6 w-6 place-items-center rounded-full',
-                    createStep >= step
-                      ? 'bg-[var(--accent)] text-white'
-                      : 'bg-[var(--surface-muted)] text-[var(--muted)]',
-                  ]"
-                  >{{ step }}</span
-                ><span
-                  :class="
-                    createStep >= step
-                      ? 'text-[var(--text)]'
-                      : 'text-[var(--muted)]'
-                  "
-                  >{{
-                    step === 1
-                      ? "项目与模板"
-                      : step === 2
-                        ? "员工与分工"
-                        : "确认"
-                  }}</span
-                ><i v-if="step < 3" class="h-px w-8 bg-[var(--border)]"
-              /></template>
+              <template v-for="step in [1, 2, 3]" :key="step">
+                <span :class="['grid h-6 w-6 place-items-center rounded-full', createStep >= step ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)] text-[var(--muted)]']">{{ step }}</span>
+                <span :class="createStep >= step ? 'text-[var(--text)]' : 'text-[var(--muted)]'">{{ step === 1 ? '选模板' : step === 2 ? '信息与规划' : '确认方案' }}</span>
+                <i v-if="step < 3" class="h-px w-8 bg-[var(--border)]" />
+              </template>
             </ol>
+
+            <!-- ① 模板 -->
             <div v-if="createStep === 1">
               <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                 <button
                   v-for="item in templates"
                   :key="item.id"
-                  :class="[
-                    'rounded-2xl border p-4 text-left transition',
-                    mode === item.id
-                      ? 'border-[var(--accent)] bg-[var(--accent-soft)] shadow-sm'
-                      : 'border-[var(--border)] hover:border-[var(--accent)]/50',
-                  ]"
+                  :class="['rounded-2xl border p-4 text-left transition', mode === item.id ? 'border-[var(--accent)] bg-[var(--accent-soft)] shadow-sm' : 'border-[var(--border)] hover:border-[var(--accent)]/50']"
                   @click="chooseTemplate(item.id)"
                 >
-                  <span
-                    class="grid h-9 w-9 place-items-center rounded-xl bg-[var(--surface-muted)] text-lg font-bold"
-                    >{{ item.icon }}</span
-                  ><strong class="mt-4 block">{{ item.name }}</strong>
-                  <p
-                    class="mt-1 min-h-10 text-xs leading-relaxed text-[var(--muted)]"
-                  >
-                    {{ item.description }}
-                  </p>
-                  <span
-                    class="mt-3 inline-block text-[11px] font-semibold text-[var(--accent)]"
-                    >{{ item.hint }}</span
-                  >
+                  <span class="grid h-9 w-9 place-items-center rounded-xl bg-[var(--surface-muted)] text-lg font-bold">{{ item.icon }}</span>
+                  <strong class="mt-4 block">{{ item.name }}</strong>
+                  <p class="mt-1 min-h-10 text-xs leading-relaxed text-[var(--muted)]">{{ item.description }}</p>
+                  <span class="mt-3 inline-block text-[11px] font-semibold text-[var(--accent)]">{{ item.hint }}</span>
                 </button>
               </div>
-              <div class="mt-6 grid gap-5 lg:grid-cols-[1fr_250px]">
-                <div class="space-y-4">
-                  <label class="block text-sm font-semibold"
-                    >项目名称（可选）<input
-                      v-model="name"
-                      class="mt-2 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5 font-normal outline-none focus:border-[var(--accent)]"
-                      placeholder="例如：新产品调研与交付" /></label
-                  ><label class="block text-sm font-semibold"
-                    >项目目标<textarea
-                      v-model="goal"
-                      class="mt-2 min-h-28 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5 font-normal outline-none focus:border-[var(--accent)]"
-                      placeholder="描述最终目标、边界、对象和期望产出…"
-                    />
-                  </label>
-                </div>
-                <aside class="rounded-xl bg-[var(--surface-muted)] p-4">
-                  <p class="text-sm font-bold">协调员模型</p>
-                  <select
-                    v-model="coordinatorId"
-                    class="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm"
-                  >
-                    <option disabled value="">选择模型</option>
-                    <option
-                      v-for="model in models"
-                      :key="model.id"
-                      :value="model.id"
-                    >
-                      {{ modelLabel(model) }}
-                    </option></select
-                  ><button
-                    class="mt-4 w-full rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-50"
-                    :disabled="planning"
-                    @click="continueCreate"
-                  >
-                    {{ planning ? "正在规划…" : "下一步：规划员工" }}
-                  </button>
-                  <p class="mt-3 text-xs leading-relaxed text-[var(--muted)]">
-                    当前模板：{{
-                      template.name
-                    }}。也可由协调员依据目标改写任务。
-                  </p>
-                  <div class="mt-4 border-t border-[var(--border)] pt-4">
-                    <p class="text-xs font-bold">项目空间目录</p>
-                    <p
-                      class="mt-1 break-all text-[11px] leading-4 text-[var(--muted)]"
-                    >
-                      {{
-                        workspaceParent ||
-                        "默认：~/.opcai/projects/项目名称-随机标识"
-                      }}
-                    </p>
-                    <button
-                      class="mt-2 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold"
-                      type="button"
-                      @click="chooseWorkspaceParent"
-                    >
-                      {{
-                        workspaceParent ? "更换父目录" : "选择父目录（可选）"
-                      }}
-                    </button>
-                  </div>
-                </aside>
+              <p class="mt-4 text-xs text-[var(--muted)]">选择项目类型模板后，下一步填写项目名称 / 描述、工作目录，并生成执行草案。</p>
+              <div class="mt-6 flex items-center justify-between">
+                <button class="text-sm text-[var(--muted)]" @click="closeCreate">取消</button>
+                <button class="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white" @click="createStep = 2">下一步：项目信息</button>
               </div>
             </div>
-            <p v-if="error" class="mt-4 text-sm text-rose-600">{{ error }}</p>
-            <div
-              v-if="createStep === 2"
-              class="mt-6 border-t border-[var(--border)] pt-5"
-            >
-              <div class="mb-3 flex justify-between">
-                <h3 class="font-bold">执行草案 · 请确认</h3>
+
+            <p v-if="error" class="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{{ error }}</p>
+
+            <!-- ② 信息与规划：名称 → 描述 → 目录 → 底部操作 -->
+            <div v-if="createStep === 2" class="space-y-5">
+              <label class="block text-sm font-semibold">
+                项目名称
+                <span class="ml-1 font-normal text-[var(--muted)]">（可选）</span>
+                <input
+                  v-model="name"
+                  class="mt-2 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5 font-normal outline-none transition focus:border-[var(--accent)]"
+                  placeholder="例如：计生用品官方网站"
+                />
+              </label>
+
+              <label class="block text-sm font-semibold">
+                项目描述
+                <textarea
+                  v-model="goal"
+                  class="mt-2 min-h-36 w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5 font-normal outline-none transition focus:border-[var(--accent)]"
+                  placeholder="描述最终目标、边界、对象和期望产出。协调员会据此生成可编辑的任务草案…"
+                />
+              </label>
+
+              <div class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/60 px-3.5 py-3">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="text-[11px] font-bold tracking-wide text-[var(--muted)]">项目空间</p>
+                    <p class="mt-1 break-all text-xs leading-5 text-[var(--text)]">
+                      {{ workspaceParent || '默认保存到 ~/.opcai/projects/项目名称-随机标识' }}
+                    </p>
+                  </div>
+                  <button
+                    class="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs font-semibold hover:border-[var(--accent)]/50"
+                    type="button"
+                    @click="chooseWorkspaceParent"
+                  >
+                    {{ workspaceParent ? '更换' : '选择目录' }}
+                  </button>
+                </div>
+                <p class="mt-2 text-[11px] text-[var(--muted)]">当前模板：{{ template.name }} · 交付物将写入该目录</p>
+              </div>
+
+              <div class="flex flex-col gap-3 border-t border-[var(--border)] pt-4 sm:flex-row sm:items-end sm:justify-between">
                 <button
-                  class="text-sm text-[var(--accent)]"
-                  @click="
-                    draftTasks.push({
-                      title: '新任务',
-                      objective: '',
-                      employeeId: 'general',
-                      skillIds: [],
-                    })
-                  "
+                  class="rounded-lg border border-[var(--border)] px-4 py-2 text-sm text-[var(--muted)] hover:text-[var(--text)]"
+                  type="button"
+                  @click="createStep = 1"
+                >
+                  ← 返回上一步
+                </button>
+
+                <div class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-end sm:gap-2.5">
+                  <label class="block w-full sm:w-[min(100%,300px)]">
+                    <span class="mb-1.5 block text-[10px] font-bold uppercase tracking-[0.12em] text-[var(--muted)]">
+                      协调员模型
+                    </span>
+                    <select
+                      v-model="coordinatorId"
+                      class="h-11 w-full truncate rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 text-sm outline-none focus:border-[var(--accent)]"
+                      :disabled="!models.length || planning"
+                    >
+                      <option v-if="!models.length" disabled value="">请先在设置中配置模型</option>
+                      <option v-for="model in models" :key="model.id" :value="model.id">
+                        {{ modelLabel(model) }}
+                      </option>
+                    </select>
+                  </label>
+                  <button
+                    class="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-6 text-sm font-semibold tracking-wide text-white shadow-sm transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-45"
+                    type="button"
+                    :disabled="planning || !coordinator || !goal.trim()"
+                    @click="continueCreate"
+                  >
+                    <span v-if="planning" class="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" aria-hidden="true" />
+                    {{ planning ? '正在规划…' : '进行规划' }}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- ③ 确认运行（可编辑） -->
+            <div v-if="createStep === 3" class="space-y-5">
+              <div class="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <h3 class="font-bold">执行方案</h3>
+                  <p class="mt-1 text-xs text-[var(--muted)]">可编辑标题、目标与负责员工；确认后进入项目对话工作台。</p>
+                </div>
+                <button
+                  class="rounded-lg border border-dashed border-[var(--accent)]/50 px-3 py-1.5 text-sm font-semibold text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                  type="button"
+                  @click="draftTasks.push({ title: '新任务', objective: '', employeeId: 'general', skillIds: [] })"
                 >
                   ＋ 添加任务
                 </button>
               </div>
-              <article
-                v-for="(task, index) in draftTasks"
-                :key="index"
-                class="mb-2 grid gap-2 rounded-xl border border-[var(--border)] p-3 md:grid-cols-[.9fr_1.7fr_150px_auto]"
-              >
-                <input
-                  v-model="task.title"
-                  class="rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-2 text-sm"
-                /><input
-                  v-model="task.objective"
-                  class="rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-2 text-sm"
-                /><select
-                  v-model="task.employeeId"
-                  class="rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-2 text-sm"
-                >
-                  <option
-                    v-for="employee in employees"
-                    :key="employee.id"
-                    :value="employee.id"
-                  >
-                    {{ employeeName(employee.id) }}
-                  </option></select
-                ><button
-                  class="text-sm text-rose-600"
-                  @click="draftTasks.splice(index, 1)"
-                >
-                  删除
-                </button>
-              </article>
-              <div class="mt-5 flex justify-end gap-3">
-                <button
-                  class="rounded-lg border border-[var(--border)] px-4 py-2 text-sm"
-                  @click="createStep = 1"
-                >
-                  返回上一步</button
-                ><button
-                  class="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white"
-                  @click="createStep = 3"
-                >
-                  下一步：确认项目
-                </button>
-              </div>
-            </div>
-            <div
-              v-if="createStep === 3"
-              class="mt-6 rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/50 p-5"
-            >
-              <p
-                class="text-xs font-bold tracking-[.12em] text-[var(--accent)]"
-              >
-                FINAL REVIEW
-              </p>
-              <h3 class="mt-2 text-lg font-bold">{{ name }}</h3>
-              <p class="mt-2 text-sm text-[var(--muted)]">{{ goal }}</p>
-              <div class="mt-4 space-y-2">
-                <div
+
+              <div class="space-y-2">
+                <article
                   v-for="(task, index) in draftTasks"
-                  :key="task.title + index"
-                  class="flex items-center justify-between rounded-xl bg-[var(--surface)] px-3 py-2 text-sm"
+                  :key="index"
+                  class="grid gap-2 rounded-xl border border-[var(--border)] bg-[var(--background)]/40 p-3 md:grid-cols-[.9fr_1.7fr_150px_auto]"
                 >
-                  <span
-                    ><strong>{{ index + 1 }}. {{ task.title }}</strong
-                    ><small class="ml-2 text-[var(--muted)]">{{
-                      employeeName(task.employeeId)
-                    }}</small></span
-                  ><span class="text-xs text-[var(--muted)]">{{
-                    task.dependsOn?.length
-                      ? `依赖 ${task.dependsOn.map((item) => item + 1).join("、")}`
-                      : "可立即执行"
-                  }}</span>
-                </div>
+                  <input v-model="task.title" class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-sm outline-none focus:border-[var(--accent)]" placeholder="任务标题" />
+                  <input v-model="task.objective" class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-sm outline-none focus:border-[var(--accent)]" placeholder="任务目标" />
+                  <select v-model="task.employeeId" class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-sm outline-none focus:border-[var(--accent)]">
+                    <option v-for="employee in employees" :key="employee.id" :value="employee.id">{{ employeeName(employee.id) }}</option>
+                  </select>
+                  <button class="rounded-lg px-2 py-2 text-sm text-rose-600 hover:bg-rose-50" type="button" @click="draftTasks.splice(index, 1)">删除</button>
+                </article>
               </div>
-              <p class="mt-4 text-xs text-[var(--muted)]">
-                创建后将进入项目对话工作台；只有点击“启动首轮”后才会调用员工。
-              </p>
-              <div class="mt-5 flex justify-end gap-3">
+
+              <div class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/50 p-4 text-sm">
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <p><strong>项目：</strong>{{ name || '（未命名）' }}</p>
+                  <p class="text-xs text-[var(--muted)]">{{ draftTasks.length }} 项任务</p>
+                  <p v-if="coordinator" class="text-xs text-[var(--muted)]">
+                    协调员 · {{ modelLabel(coordinator) }}
+                  </p>
+                </div>
+                <p class="mt-2 text-[var(--muted)]">{{ goal }}</p>
+              </div>
+
+              <div class="flex flex-col gap-3 border-t border-[var(--border)] pt-4 sm:flex-row sm:items-center sm:justify-between">
+                <button class="rounded-lg border border-[var(--border)] px-4 py-2 text-sm text-[var(--muted)]" type="button" @click="createStep = 2">
+                  ← 返回修改描述
+                </button>
                 <button
-                  class="rounded-lg border border-[var(--border)] px-4 py-2 text-sm"
-                  @click="createStep = 2"
-                >
-                  返回修改</button
-                ><button
-                  class="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white"
+                  class="rounded-lg bg-[var(--accent)] px-5 py-2.5 text-sm font-semibold text-white shadow-sm disabled:opacity-45"
+                  type="button"
+                  :disabled="!draftTasks.length"
                   @click="confirmCreate"
                 >
-                  确认并进入项目工作台
+                  确认并进入对话工作台
                 </button>
               </div>
             </div>
           </div>
         </section>
 
-        <section
-          v-else-if="tab === 'runs'"
-          class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]"
-        >
-          <div
-            v-if="!runs.length"
-            class="p-14 text-center text-sm text-[var(--muted)]"
-          >
-            尚无项目运行记录。
-          </div>
-          <button
-            v-for="item in runs"
-            :key="item.id"
-            class="flex w-full items-center justify-between border-b border-[var(--border)] px-5 py-4 text-left last:border-0"
-          >
-            <span
-              ><strong>{{
-                projects.find((project) => project.id === item.projectId)
-                  ?.name ?? "已删除项目"
-              }}</strong
-              ><span class="ml-3 text-xs text-[var(--muted)]">{{
-                date(item.startedAt)
-              }}</span></span
-            ><span
-              :class="[
-                'rounded-full px-2 py-1 text-xs font-semibold',
-                statusStyle(item.status),
-              ]"
-              >{{ statusText(item.status) }}</span
-            >
-          </button>
-        </section>
-
-        <section v-else-if="!selected" class="space-y-7">
-          <div
-            v-if="projects.length"
-            class="grid gap-3 md:grid-cols-2 xl:grid-cols-3"
-          >
-            <button
-              v-for="project in projects"
-              :key="project.id"
-              class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 text-left transition hover:border-[var(--accent)] hover:shadow-md"
-              @click="openProject(project)"
-            >
-              <div class="flex justify-between gap-3">
-                <span
-                  class="rounded-lg bg-[var(--accent-soft)] px-2 py-1 text-[11px] font-bold text-[var(--accent)]"
-                  >{{
-                    templates.find((item) => item.id === project.mode)?.name
-                  }}</span
-                ><span
-                  :class="[
-                    'rounded-full px-2 py-1 text-[10px] font-bold',
-                    statusStyle(project.status),
-                  ]"
-                  >{{ statusText(project.status) }}</span
-                >
-              </div>
-              <h2 class="mt-4 text-lg font-bold">{{ project.name }}</h2>
-              <p class="mt-2 line-clamp-2 text-sm text-[var(--muted)]">
-                {{ project.goal }}
-              </p>
-              <p class="mt-5 text-xs text-[var(--muted)]">
-                {{ project.tasks.length }} 个任务 · 更新于
-                {{ date(project.updatedAt) }}
-              </p>
-            </button>
-          </div>
-          <div
-            v-else
-            class="rounded-2xl border border-dashed border-[var(--border)] bg-[var(--surface)] p-14 text-center"
-          >
+        <!-- 项目列表（未选择时） -->
+        <section v-else-if="tab === 'projects' && !selected" class="grid gap-5">
+          <template v-if="projects.length">
+            <div class="grid gap-4 md:grid-cols-2">
+              <button
+                v-for="project in projects"
+                :key="project.id"
+                class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 text-left hover:border-[var(--accent)]/60"
+                @click="openProject(project)"
+              >
+                <div class="flex justify-between gap-3">
+                  <span class="rounded-lg bg-[var(--accent-soft)] px-2 py-1 text-[11px] font-bold text-[var(--accent)]">{{ templates.find((item) => item.id === project.mode)?.name }}</span>
+                  <span :class="['rounded-full px-2 py-1 text-[10px] font-bold', statusStyle(project.status)]">{{ statusText(project.status) }}</span>
+                </div>
+                <h2 class="mt-4 text-lg font-bold">{{ project.name }}</h2>
+                <p class="mt-2 line-clamp-2 text-sm text-[var(--muted)]">{{ project.goal }}</p>
+                <p class="mt-5 text-xs text-[var(--muted)]">{{ project.tasks.length }} 个任务 · 更新于 {{ date(project.updatedAt) }}</p>
+              </button>
+            </div>
+          </template>
+          <div v-else class="rounded-2xl border border-dashed border-[var(--border)] bg-[var(--surface)] p-14 text-center">
             <h2 class="text-xl font-bold">选择一种项目编排方式</h2>
-            <p
-              class="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-[var(--muted)]"
-            >
-              瀑布、并发、讨论与 DAG
-              都从模板开始；在运行前可确认并调整任务草案。
-            </p>
-            <button
-              class="mt-6 rounded-xl bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white"
-              @click="openCreate"
-            >
-              创建第一个项目
-            </button>
+            <p class="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-[var(--muted)]">瀑布、并发、讨论与 DAG 都从模板开始；在运行前可确认并调整任务草案。</p>
+            <button class="mt-6 rounded-xl bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white" @click="openCreate">创建第一个项目</button>
           </div>
           <div>
             <h2 class="text-lg font-bold">项目模板</h2>
             <div class="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <button
-                v-for="item in templates"
-                :key="item.id"
-                class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 text-left hover:border-[var(--accent)]"
-                @click="
-                  openCreate();
-                  chooseTemplate(item.id);
-                "
-              >
-                <span class="text-lg font-bold text-[var(--accent)]">{{
-                  item.icon
-                }}</span
-                ><strong class="mt-3 block">{{ item.name }}</strong>
-                <p class="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-                  {{ item.description }}
-                </p>
+              <button v-for="item in templates" :key="item.id" class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 text-left hover:border-[var(--accent)]" @click="openCreate(); chooseTemplate(item.id)">
+                <span class="text-lg font-bold text-[var(--accent)]">{{ item.icon }}</span>
+                <strong class="mt-3 block">{{ item.name }}</strong>
+                <p class="mt-1 text-xs leading-relaxed text-[var(--muted)]">{{ item.description }}</p>
+                <span class="mt-3 inline-block text-[11px] font-semibold text-[var(--accent)]">{{ item.hint }}</span>
               </button>
             </div>
           </div>
         </section>
 
-        <ProjectConversationWorkspace
-          v-else-if="selected"
-          :project="selected!"
-          :employees="employees"
-          :template-name="
-            templates.find((item) => item.id === selected!.mode)?.name ?? '项目'
-          "
-          :running="selected!.status === 'running'"
-          @back="selectedId = null"
-          @start="run(selected!)"
-          @cancel="cancel(selected!)"
-          @remove="
-            deleteProject(selected);
-            selectedId = null;
-          "
-          @dispatch="dispatchProjectInstruction(selected!, $event)"
-          @approve="resolveManagedApproval"
-        />
+        <!-- 项目对话工作台（已选择） -->
+        <section v-else-if="tab === 'projects' && selected" class="min-h-0 flex-1 flex flex-col">
+          <ProjectConversationWorkspace
+            :project="selected!"
+            :employees="employees"
+            :template-name="templates.find((item) => item.id === selected?.mode)?.name ?? '项目'"
+            :running="selected?.status === 'running'"
+            :file-tree-epoch="fileTreeEpoch"
+            @back="selectedId = null"
+            @start="run(selected!)"
+            @cancel="cancel(selected!)"
+            @remove="deleteProject(selected!); selectedId = null;"
+            @dispatch="dispatchProjectInstruction(selected!, $event)"
+          />
+        </section>
 
-        <!-- Legacy task-detail view retained temporarily as reference for the project workspace migration.
-        <section v-else-if="false" class="min-h-0">
-          <button
-            class="mb-4 text-sm font-semibold text-[var(--accent)]"
-            @click="selectedId = null"
-          >
-            ← 返回项目列表
+        <!-- 运行记录 -->
+        <section v-else-if="tab === 'runs'" class="overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
+          <div v-if="!runs.length" class="p-14 text-center text-sm text-[var(--muted)]">尚无项目运行记录。</div>
+          <button v-for="item in runs" :key="item.id" class="flex w-full items-center justify-between border-b border-[var(--border)] px-5 py-4 text-left last:border-0">
+            <span>
+              <strong>{{ projects.find((project) => project.id === item.projectId)?.name ?? '已删除项目' }}</strong>
+              <span class="ml-3 text-xs text-[var(--muted)]">{{ statusText(item.status) }}</span>
+              <span class="ml-3 text-xs text-[var(--muted)]">{{ item.taskIds.length }} 项任务</span>
+            </span>
+            <span class="text-xs text-[var(--muted)]">{{ date(item.finishedAt ?? item.startedAt) }}</span>
           </button>
-          <header
-            class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6"
-          >
-            <div class="flex flex-wrap items-start justify-between gap-4">
-              <div>
-                <span
-                  class="rounded-lg bg-[var(--accent-soft)] px-2 py-1 text-[11px] font-bold text-[var(--accent)]"
-                  >{{
-                    templates.find((item) => item.id === selected?.mode)?.name
-                  }}</span
-                >
-                <h2 class="mt-3 text-2xl font-bold">{{ selected?.name }}</h2>
-                <p
-                  class="mt-2 max-w-4xl text-sm leading-relaxed text-[var(--muted)]"
-                >
-                  {{ selected?.goal }}
-                </p>
-              </div>
-              <div class="flex gap-2">
-                <button
-                  v-if="selected?.status === 'running'"
-                  class="rounded-lg border border-amber-500/40 px-3 py-2 text-sm font-semibold text-amber-700"
-                  @click="selected && cancel(selected)"
-                >
-                  取消待执行任务</button
-                ><button
-                  v-else
-                  class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white"
-                  @click="selected && run(selected)"
-                >
-                  {{
-                    selected?.status === "draft" ? "确认并启动" : "再次运行"
-                  }}</button
-                ><button
-                  class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm text-rose-600"
-                  @click="
-                    deleteProject(selected);
-                    selectedId = null;
-                  "
-                >
-                  删除
-                </button>
-              </div>
-            </div>
-            <div class="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div
-                v-for="state in ['queued', 'running', 'completed', 'failed']"
-                :key="state"
-                class="rounded-xl bg-[var(--surface-muted)] p-3"
-              >
-                <p class="text-xs text-[var(--muted)]">
-                  {{ statusText(state) }}
-                </p>
-                <strong class="mt-1 block text-xl">{{
-                  selected?.tasks.filter((task) => task.status === state)
-                    .length ?? 0
-                }}</strong>
-              </div>
-            </div>
-          </header>
-          <div
-            class="mt-5 grid min-h-[500px] gap-5 xl:grid-cols-[minmax(360px,.8fr)_minmax(0,1.4fr)]"
-          >
-            <aside
-              class="min-h-0 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-3"
-            >
-              <div class="mb-2 flex items-center justify-between px-2">
-                <h3 class="text-sm font-bold">智能体与任务</h3>
-                <span class="text-xs text-[var(--muted)]"
-                  >{{ selected.tasks.length }} 项</span
-                >
-              </div>
-              <button
-                v-for="task in selected.tasks"
-                :key="task.id"
-                :class="[
-                  'mb-2 w-full rounded-xl border p-3 text-left transition',
-                  detailTask?.id === task.id
-                    ? 'border-[var(--accent)] bg-[var(--accent-soft)]/40'
-                    : 'border-transparent hover:bg-[var(--surface-muted)]',
-                ]"
-                @click="detailTaskId = task.id"
-              >
-                <div class="flex items-center justify-between gap-2">
-                  <strong class="truncate text-sm">{{ task.title }}</strong
-                  ><span
-                    :class="[
-                      'rounded-full px-2 py-0.5 text-[10px] font-bold',
-                      statusStyle(task.status),
-                    ]"
-                    >{{ statusText(task.status) }}</span
-                  >
-                </div>
-                <p class="mt-1 text-xs text-[var(--muted)]">
-                  {{ employeeName(task.employeeId) }} · {{ task.provider }}
-                </p>
-                <div
-                  class="mt-3 h-1.5 overflow-hidden rounded-full bg-[var(--surface-muted)]"
-                >
-                  <div
-                    :class="[
-                      'h-full rounded-full',
-                      task.status === 'completed'
-                        ? 'w-full bg-emerald-500'
-                        : task.status === 'running'
-                          ? 'w-2/3 animate-pulse bg-[var(--accent)]'
-                          : task.status === 'failed'
-                            ? 'w-full bg-rose-500'
-                            : 'w-1/6 bg-slate-400',
-                    ]"
-                  ></div>
-                </div>
-              </button>
-            </aside>
-            <article
-              v-if="detailTask"
-              class="min-h-0 overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]"
-            >
-              <header class="border-b border-[var(--border)] px-5 py-4">
-                <div class="flex items-center justify-between gap-3">
-                  <div>
-                    <p class="text-xs font-bold text-[var(--accent)]">
-                      {{ employeeName(detailTask.employeeId) }} · LIVE TASK RUN
-                    </p>
-                    <h3 class="mt-1 text-lg font-bold">
-                      {{ detailTask.title }}
-                    </h3>
-                  </div>
-                  <span
-                    :class="[
-                      'rounded-full px-2 py-1 text-xs font-bold',
-                      statusStyle(detailTask.status),
-                    ]"
-                    >{{ statusText(detailTask.status) }}</span
-                  >
-                </div>
-                <p class="mt-2 text-sm text-[var(--muted)]">
-                  {{ detailTask.objective }}
-                </p>
-              </header>
-              <div class="grid min-h-[420px] grid-rows-[minmax(0,1fr)_auto]">
-                <div class="min-h-0 overflow-y-auto p-5">
-                  <div
-                    v-if="detailTask.transcript?.assistantContent"
-                    class="rounded-xl bg-[var(--surface-muted)] p-4"
-                  >
-                    <p class="mb-2 text-xs font-bold text-[var(--muted)]">
-                      {{ employeeName(detailTask.employeeId) }} 的输出
-                    </p>
-                    <pre
-                      class="whitespace-pre-wrap font-sans text-sm leading-relaxed"
-                      >{{ detailTask.transcript.assistantContent }}</pre
-                    >
-                    <span
-                      v-if="detailTask.status === 'running'"
-                      class="mt-3 inline-flex items-center gap-2 text-xs text-[var(--accent)]"
-                      ><i
-                        class="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--accent)]"
-                      ></i
-                      >正在流式生成</span
-                    >
-                  </div>
-                  <p
-                    v-else
-                    class="py-10 text-center text-sm text-[var(--muted)]"
-                  >
-                    {{
-                      detailTask.status === "queued"
-                        ? "正在等待前置任务或可用执行槽位…"
-                        : "等待任务启动…"
-                    }}
-                  </p>
-                  <p
-                    v-if="detailTask.error"
-                    class="mt-4 rounded-xl bg-rose-500/10 p-3 text-sm text-rose-700"
-                  >
-                    {{ detailTask.error }}
-                  </p>
-                </div>
-                <div
-                  class="border-t border-[var(--border)] bg-[var(--surface-muted)]/40 p-4"
-                >
-                  <div class="mb-2 flex items-center justify-between">
-                    <p class="text-xs font-bold">执行过程</p>
-                    <span class="text-xs text-[var(--muted)]"
-                      >{{
-                        detailTask.transcript?.activities?.length ?? 0
-                      }}
-                      步</span
-                    >
-                  </div>
-                  <div class="max-h-36 space-y-1 overflow-y-auto">
-                    <div
-                      v-for="(activity, index) in detailTask.transcript
-                        ?.activities ?? []"
-                      :key="`${activity.toolName}-${index}`"
-                      class="flex items-center gap-2 rounded-lg bg-[var(--surface)] px-3 py-2 text-xs"
-                    >
-                      <span
-                        :class="[
-                          'h-1.5 w-1.5 rounded-full',
-                          activity.status === 'completed'
-                            ? 'bg-emerald-500'
-                            : activity.status === 'failed'
-                              ? 'bg-rose-500'
-                              : 'animate-pulse bg-blue-500',
-                        ]"
-                      ></span
-                      ><strong class="shrink-0">{{ activity.toolName }}</strong
-                      ><span class="truncate text-[var(--muted)]">{{
-                        activity.summary
-                      }}</span>
-                    </div>
-                    <p
-                      v-if="!detailTask.transcript?.activities?.length"
-                      class="text-xs text-[var(--muted)]"
-                    >
-                      工具、命令和文件过程会实时显示在这里。
-                    </p>
-                  </div>
-                  <div
-                    v-if="detailTask.transcript?.assets?.length"
-                    class="mt-3 flex flex-wrap gap-2"
-                  >
-                    <span
-                      v-for="asset in detailTask.transcript.assets"
-                      :key="asset.id"
-                      class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs"
-                      >📦 {{ asset.name }}</span
-                    >
-                  </div>
-                </div>
-              </div>
-            </article>
-          </div>
-          <article
-            v-if="selected.summary"
-            class="mt-5 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-6"
-          >
-            <p class="text-xs font-bold text-emerald-700">
-              COORDINATOR SUMMARY
-            </p>
-            <pre
-              class="mt-3 whitespace-pre-wrap font-sans text-sm leading-relaxed"
-              >{{ selected.summary }}</pre
-            >
-          </article>
-        </section> -->
+        </section>
       </div>
     </div>
   </section>

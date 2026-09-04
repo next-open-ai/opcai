@@ -29,6 +29,20 @@ export interface ChatMessage {
 
 export type GrantCapability = 'workspace-write' | 'script-execution' | 'network-access';
 
+/**
+ * Derived session rolling memory. Transcript (`messages`) remains the source of
+ * truth; this summary is rebuildable and may lag until the next roll/flush.
+ */
+export interface SessionMemory {
+  /** Rolling continuity brief for reopen / context assembly. */
+  summary: string;
+  /** Last message id fully absorbed into `summary` (canonical view). */
+  coveredUntilId: string;
+  updatedAt: number;
+  /** True when new turns exist beyond the watermark and may need a flush. */
+  dirty: boolean;
+}
+
 export interface ChatSession {
   id: string;
   kind: 'chat';
@@ -38,6 +52,8 @@ export interface ChatSession {
   /** Currently selected model (client-resolved, non-secret label payload). */
   modelLabel?: string;
   messages: ChatMessage[];
+  /** Rolling summary for long chats; optional until first roll/flush. */
+  memory?: SessionMemory;
   /** Future channel binding, e.g. channel:telegram:<chatId>. */
   channelBinding?: { channelId: string; threadId: string } | null;
   /** Per-session approvals granted this run (skillId -> capabilities). */
@@ -120,7 +136,7 @@ export interface RunRecord {
 export type ProjectStatus = 'draft' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type ProjectTaskStatus = 'draft' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 export type ProjectMode = 'waterfall' | 'parallel' | 'discussion' | 'dag';
-export type PermissionTier = 'read-only' | 'default' | 'extended' | 'full';
+export type PermissionTier = 'read-only' | 'default' | 'full';
 
 export interface ProjectTask {
   id: string;
