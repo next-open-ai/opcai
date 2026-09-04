@@ -89,18 +89,33 @@ function archiveArtifact(value) {
   const runId = String(value?.runId || '');
   const relativePath = String(value?.relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
   if (!/^[a-f0-9-]{20,}$/i.test(runId) || !relativePath || relativePath.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('Invalid artifact location.');
+  // Intent contract: only files under output/ are business deliverables (any product type, including final .py/.js).
+  const processDirs = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
+  const neverExt = new Set(['pyc', 'pyo', 'pyd', 'class', 'o', 'obj', 'exe', 'dll', 'so', 'dylib', 'map']);
+  const parts = relativePath.split('/');
+  const base = parts[parts.length - 1] || '';
+  const ext = path.extname(base).slice(1).toLowerCase();
+  if (parts[0] !== 'output' || parts.length < 2 || parts.some((part) => processDirs.has(part)) || !ext || neverExt.has(ext) || (base.startsWith('.') && base !== '.gitkeep')) {
+    throw new Error('Only business deliverables under output/ can be archived to the asset library.');
+  }
   const workspaceRoot = path.resolve(storageRoot(), 'workspaces', runId);
   const source = path.resolve(workspaceRoot, relativePath);
   if (!source.startsWith(`${workspaceRoot}${path.sep}`) || !existsSync(source) || !statSync(source).isFile()) throw new Error('Generated artifact is no longer available.');
   const name = path.basename(source);
   const sizeBytes = statSync(source).size;
   if (sizeBytes > 100 * 1024 * 1024) throw new Error('Generated artifact exceeds the 100 MB asset limit.');
+  const sha256 = createHash('sha256').update(readFileSync(source)).digest('hex');
+  // Idempotent: same run + path + content must not create duplicate asset cards.
+  const existing = assetRows(database.exec(
+    `${ASSET_SELECT} WHERE run_id = ? AND workspace_relative = ? AND sha256 = ? LIMIT 1`,
+    [runId, relativePath, sha256],
+  ))[0];
+  if (existing) return existing;
   const id = randomUUID();
   const targetFolder = path.join(storageRoot(), 'assets', id);
   mkdirSync(targetFolder, { recursive: true, mode: 0o700 });
   const target = path.join(targetFolder, name);
   copyFileSync(source, target, 0);
-  const sha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
   const relativeAssetPath = path.relative(storageRoot(), target).split(path.sep).join('/');
   const createdAt = Date.now();
   const projectId = String(value?.projectId || '').trim() || null;
@@ -962,23 +977,63 @@ async function waitForApi() {
   throw new Error('OPCAI local API did not become ready.');
 }
 
+function fitWindowToNearestDisplay(win) {
+  if (!win || win.isDestroyed() || win.isFullScreen()) return;
+  const bounds = win.getBounds();
+  const display = screen.getDisplayMatching(bounds);
+  const area = display.workArea;
+  const minW = Math.min(win.getMinimumSize()[0] || 640, area.width);
+  const minH = Math.min(win.getMinimumSize()[1] || 480, area.height);
+  let { x, y, width, height } = bounds;
+  width = Math.min(Math.max(width, minW), area.width);
+  height = Math.min(Math.max(height, minH), area.height);
+  x = Math.min(Math.max(x, area.x), area.x + area.width - width);
+  y = Math.min(Math.max(y, area.y), area.y + area.height - height);
+  if (x !== bounds.x || y !== bounds.y || width !== bounds.width || height !== bounds.height) {
+    win.setBounds({ x, y, width, height }, false);
+  }
+}
+
 async function createWindow() {
   await waitForApi();
-  // Near work-area size with a small inset — almost fills the screen, not maximized/fullscreen.
+  // Start as a normal movable window (not near-fullscreen / not Space-fullscreen).
+  // macOS: fullscreenable:false makes the green button maximize in-place so the
+  // window can still be dragged to another display; Space fullscreen cannot.
   const workArea = screen.getPrimaryDisplay().workArea;
-  const marginX = Math.max(16, Math.round(workArea.width * 0.02));
-  const marginY = Math.max(16, Math.round(workArea.height * 0.025));
-  const width = Math.max(1180, workArea.width - marginX * 2);
-  const height = Math.max(760, workArea.height - marginY * 2);
+  const width = Math.min(1280, Math.max(960, Math.round(workArea.width * 0.72)));
+  const height = Math.min(860, Math.max(640, Math.round(workArea.height * 0.78)));
   mainWindow = new BrowserWindow({
     x: workArea.x + Math.round((workArea.width - width) / 2),
     y: workArea.y + Math.round((workArea.height - height) / 2),
     width,
     height,
-    minWidth: 1180,
-    minHeight: 760,
+    // Half of a 1440-wide laptop is ~720px; keep mins below that for Split View / snap.
+    minWidth: 640,
+    minHeight: 480,
+    resizable: true,
+    movable: true,
+    maximizable: true,
+    minimizable: true,
+    fullscreenable: process.platform !== 'darwin',
+    fullscreen: false,
     show: false,
     webPreferences: { preload: path.join(__dirname, '../preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  if (process.platform === 'darwin') {
+    // Prefer maximize over native fullscreen Space (blocks dragging across displays).
+    mainWindow.setFullScreenable(false);
+  }
+  let fitTimer = null;
+  const scheduleFit = () => {
+    if (fitTimer) clearTimeout(fitTimer);
+    fitTimer = setTimeout(() => fitWindowToNearestDisplay(mainWindow), 80);
+  };
+  mainWindow.on('moved', scheduleFit);
+  mainWindow.on('resized', scheduleFit);
+  screen.on('display-metrics-changed', scheduleFit);
+  mainWindow.on('closed', () => {
+    if (fitTimer) clearTimeout(fitTimer);
+    screen.removeListener('display-metrics-changed', scheduleFit);
   });
   mainWindow.webContents.on('did-fail-load', (_event, code, description, validatedUrl) => {
     console.error(`[renderer] failed to load (${code}): ${description} (${validatedUrl})`);
@@ -998,6 +1053,8 @@ async function createWindow() {
   // In development, a renderer failure can prevent ready-to-show from firing
   // and leave a hidden process with no visible window. Loading has completed
   // at this point, so show the shell deterministically.
+  if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
+  fitWindowToNearestDisplay(mainWindow);
   mainWindow.show();
 }
 

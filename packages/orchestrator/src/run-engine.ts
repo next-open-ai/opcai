@@ -165,6 +165,10 @@ export class RunEngine {
         }
         case 'artifact.created': {
           const artifact = { path: event.path };
+          if (run.artifacts.some((item) => item.path === artifact.path)) {
+            scheduleCheckpoint();
+            break;
+          }
           run.artifacts.push(artifact);
           publish({ type: 'run.artifact', runId, artifact });
           scheduleCheckpoint();
@@ -172,7 +176,8 @@ export class RunEngine {
         }
         case 'project.file.published': {
           const artifact = { path: event.projectPath };
-          if (!run.artifacts.some((item) => item.path === artifact.path)) run.artifacts.push(artifact);
+          const isNewArtifact = !run.artifacts.some((item) => item.path === artifact.path);
+          if (isNewArtifact) run.artifacts.push(artifact);
           publish({
             type: 'project.file.published',
             runId,
@@ -180,7 +185,8 @@ export class RunEngine {
             projectPath: event.projectPath,
             projectId: options.kind === 'project-task' ? options.sessionId : undefined,
           });
-          publish({ type: 'run.artifact', runId, artifact });
+          // Do not re-broadcast run.artifact when the same path was already archived mid-run.
+          if (isNewArtifact) publish({ type: 'run.artifact', runId, artifact });
           scheduleCheckpoint();
           break;
         }

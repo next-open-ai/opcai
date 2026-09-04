@@ -31,6 +31,30 @@ export interface Conversation { id: string; title: string; employeeId: EmployeeI
 export interface ProjectTaskDraft { title: string; objective: string; employeeId: EmployeeId; skillIds: string[]; }
 export interface ProjectTaskTranscript { assistantContent: string; activities: ToolActivity[]; approvals: ToolApproval[]; assets: Array<{ id: string; name: string; sizeBytes: number; runId?: string }>; runId?: string; }
 
+/** Keep in sync with agent-core deliverable contract: only output/ is archived. */
+const NEVER_DELIVERABLE_EXT = new Set(['pyc', 'pyo', 'pyd', 'class', 'o', 'obj', 'exe', 'dll', 'so', 'dylib', 'map']);
+const PROCESS_ONLY_DIRS = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
+
+function isUserFacingDeliverablePath(relativePath: string) {
+  const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts[0] !== 'output' || parts.length < 2) return false;
+  if (parts.some((part) => !part || part === '.' || part === '..' || PROCESS_ONLY_DIRS.has(part))) return false;
+  const base = parts[parts.length - 1] || '';
+  if (base.startsWith('.') && base !== '.gitkeep') return false;
+  const ext = base.includes('.') ? base.slice(base.lastIndexOf('.') + 1).toLowerCase() : '';
+  return Boolean(ext) && !NEVER_DELIVERABLE_EXT.has(ext);
+}
+
+function alreadyHasAsset(assets: Asset[] | undefined, runId: string, relativePath: string) {
+  const base = relativePath.split('/').pop() || relativePath;
+  return Boolean(assets?.some((item) =>
+    item.id && (
+      (item.runId === runId && (item.workspaceRelative === relativePath || item.name === base))
+      || item.workspaceRelative === relativePath
+    )));
+}
+
 const view = ref<View>('chat');
 const currentEmployeeId = ref<EmployeeId>('general');
 const conversations = ref<Conversation[]>([]);
@@ -209,17 +233,21 @@ export function useWorkspace() {
   }
 
   async function archiveServerArtifact(conversation: Conversation, assistantMessage: Message, runId: string, relativePath: string) {
+    const normalized = relativePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!isUserFacingDeliverablePath(normalized) || alreadyHasAsset(assistantMessage.assets, runId, normalized)) return;
     try {
       const asset = await archiveArtifact({
         runId,
-        relativePath,
+        relativePath: normalized,
         conversationId: conversation.id,
         employeeId: conversation.employeeId,
       });
       if (!assistantMessage.assets?.some((item) => item.id === asset.id)) assistantMessage.assets?.push(asset as Asset);
       serverBump();
     } catch (error) {
-      assistantMessage.activities?.push({ toolName: 'archive_asset', status: 'failed', summary: error instanceof Error ? error.message : '资产归档失败。' });
+      const message = error instanceof Error ? error.message : '资产归档失败。';
+      if (/Only business deliverables|Only user-facing deliverables|no longer available/i.test(message)) return;
+      assistantMessage.activities?.push({ toolName: 'archive_asset', status: 'failed', summary: message });
     }
   }
 
@@ -646,12 +674,16 @@ export function useWorkspace() {
         else assistantMessage.activities?.push(activity);
         conversations.value = [...conversations.value];
       }, (approval) => { if (!assistantMessage.approvals?.some((item) => item.skillId === approval.skillId && item.capability === approval.capability)) assistantMessage.approvals?.push(approval); conversations.value = [...conversations.value]; }, async (artifact) => {
+        const normalized = artifact.path.replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!isUserFacingDeliverablePath(normalized) || alreadyHasAsset(assistantMessage.assets, artifact.runId, normalized)) return;
         try {
-          const asset = await archiveArtifact({ runId: artifact.runId, relativePath: artifact.path, conversationId: conversation.id, employeeId: employee.id });
+          const asset = await archiveArtifact({ runId: artifact.runId, relativePath: normalized, conversationId: conversation.id, employeeId: employee.id });
           if (!assistantMessage.assets?.some((item) => item.id === asset.id)) assistantMessage.assets?.push(asset);
           conversations.value = [...conversations.value];
         } catch (error) {
-          assistantMessage.activities?.push({ toolName: 'archive_asset', status: 'failed', summary: error instanceof Error ? error.message : '资产归档失败。' });
+          const message = error instanceof Error ? error.message : '资产归档失败。';
+          if (/Only business deliverables|Only user-facing deliverables|no longer available/i.test(message)) return;
+          assistantMessage.activities?.push({ toolName: 'archive_asset', status: 'failed', summary: message });
           conversations.value = [...conversations.value];
         }
       }, (search) => { const next = search.sources.map((source) => ({ ...source, provider: search.provider })); assistantMessage.sources = [...new Map([...(assistantMessage.sources ?? []), ...next].map((source) => [source.url, source])).values()]; conversations.value = [...conversations.value]; });
@@ -738,8 +770,17 @@ export function useWorkspace() {
       onActivity?.(activity);
     }, (approval) => { if (!transcript.approvals.some((item) => item.skillId === approval.skillId && item.capability === approval.capability)) transcript.approvals.push(approval); }, async (artifact) => {
       transcript.runId = artifact.runId;
-      const asset = await archiveArtifact({ runId: artifact.runId, relativePath: artifact.path, employeeId: employee.id, projectId: input.projectId });
-      if (!transcript.assets.some((item) => item.id === asset.id)) transcript.assets.push({ id: asset.id, name: asset.name, sizeBytes: asset.sizeBytes, runId: asset.runId });
+      const normalized = artifact.path.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!isUserFacingDeliverablePath(normalized)) return;
+      if (transcript.assets.some((item) => item.runId === artifact.runId && item.name === (normalized.split('/').pop() || normalized))) return;
+      try {
+        const asset = await archiveArtifact({ runId: artifact.runId, relativePath: normalized, employeeId: employee.id, projectId: input.projectId });
+        if (!transcript.assets.some((item) => item.id === asset.id)) transcript.assets.push({ id: asset.id, name: asset.name, sizeBytes: asset.sizeBytes, runId: asset.runId });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '';
+        if (/Only business deliverables|Only user-facing deliverables|no longer available/i.test(message)) return;
+        throw error;
+      }
     });
     return transcript;
   };

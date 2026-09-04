@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import type { Employee, EmployeeDraft, EmployeeId } from '../../app/workspace';
 import { useI18n } from '../../app/i18n';
 import { baselineWorkspaceSkillMeta } from '../../app/baseline-skills';
-import { useCapabilities, type PolicyMode } from '../../app/capabilities';
+import { useCapabilities, type PolicyMode, type SkillRecord } from '../../app/capabilities';
 import { chatEndpointLabel, useModelConfig } from '../../app/model-config';
 import { searchProviderIds, useSearchConfig } from '../../app/search-config';
 import {
@@ -70,11 +70,31 @@ const draftKnowledgeProvider = ref<EmployeeKnowledgeProvider>('off');
 const draftKnowledgeBaseIds = ref<string[]>([]);
 const mcpPickerOpen = ref(false);
 const mcpPickerDraft = ref<string[]>([]);
+const skillPickerOpen = ref(false);
+const skillPickerDraft = ref<string[]>([]);
+const skillPickerQuery = ref('');
+const savingSkills = ref(false);
 
 const selectedEmployee = computed(() => props.employees.find((employee) => employee.id === selected.value) ?? null);
 const availableMcps = computed(() => mcpConnections.value.filter((item) => isAssociableMcp(item)));
 const useMcpModal = computed(() => availableMcps.value.length > 5);
 const selectedMcpItems = computed(() => availableMcps.value.filter((item) => draftMcpIds.value.includes(item.id)));
+const associableSkills = computed(() =>
+  skills.value.filter((skill) => !(skill.systemOnly && selected.value !== 'administrator')),
+);
+const linkedSkills = computed(() =>
+  associableSkills.value.filter((skill) => {
+    const current = mode(skill.id);
+    return current === 'available' || current === 'default';
+  }),
+);
+const pickerSkills = computed(() => {
+  const q = skillPickerQuery.value.trim().toLowerCase();
+  if (!q) return associableSkills.value;
+  return associableSkills.value.filter((skill) =>
+    `${skill.name} ${skill.description} ${(skill.tags || []).join(' ')}`.toLowerCase().includes(q),
+  );
+});
 const knowledgeProviderOptions = computed(() => [
   { value: 'off' as const, label: t('employee.kbProviderOff') },
   ...enabledProviders.value.map((item) => ({
@@ -137,6 +157,20 @@ function mode(skillId: string): PolicyMode {
   return selected.value ? policyFor(selected.value, skillId)?.mode ?? 'disabled' : 'disabled';
 }
 
+function skillRiskLabel(risk: SkillRecord['risk']) {
+  return t(`capabilities.risk.${risk}`);
+}
+
+function skillRiskTone(risk: SkillRecord['risk']) {
+  if (risk === 'high') return 'bg-rose-500/12 text-rose-700 dark:text-rose-300';
+  if (risk === 'medium') return 'bg-amber-500/12 text-amber-700 dark:text-amber-300';
+  return 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300';
+}
+
+function skillSourceLabel(skill: SkillRecord) {
+  return t(`capabilities.source.${skill.source}`);
+}
+
 async function update(skillId: string, event: Event) {
   if (!selected.value) return;
   savingSkillId.value = skillId;
@@ -147,6 +181,54 @@ async function update(skillId: string, event: Event) {
     notify.error(cause, 'notify.saveFailed');
   } finally {
     savingSkillId.value = null;
+  }
+}
+
+async function unlinkSkill(skillId: string) {
+  if (!selected.value) return;
+  savingSkillId.value = skillId;
+  try {
+    await setPolicy(selected.value, skillId, 'disabled');
+    notify.success('notify.saved');
+  } catch (cause) {
+    notify.error(cause, 'notify.saveFailed');
+  } finally {
+    savingSkillId.value = null;
+  }
+}
+
+function openSkillPicker() {
+  skillPickerDraft.value = linkedSkills.value.map((skill) => skill.id);
+  skillPickerQuery.value = '';
+  skillPickerOpen.value = true;
+}
+
+function toggleSkillPickerDraft(id: string) {
+  skillPickerDraft.value = skillPickerDraft.value.includes(id)
+    ? skillPickerDraft.value.filter((item) => item !== id)
+    : [...skillPickerDraft.value, id];
+}
+
+async function confirmSkillPicker() {
+  if (!selected.value || savingSkills.value) return;
+  savingSkills.value = true;
+  try {
+    const picked = new Set(skillPickerDraft.value);
+    for (const skill of associableSkills.value) {
+      const current = mode(skill.id);
+      const wantLinked = picked.has(skill.id);
+      if (wantLinked && current === 'disabled') {
+        await setPolicy(selected.value, skill.id, 'available');
+      } else if (!wantLinked && current !== 'disabled') {
+        await setPolicy(selected.value, skill.id, 'disabled');
+      }
+    }
+    skillPickerOpen.value = false;
+    notify.success('notify.saved');
+  } catch (cause) {
+    notify.error(cause, 'notify.saveFailed');
+  } finally {
+    savingSkills.value = false;
   }
 }
 
@@ -573,9 +655,22 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
         </div>
 
         <div class="mt-8 border-t border-[var(--border)] pt-6">
-          <p class="text-[11px] font-extrabold tracking-[.12em] text-[var(--accent)]">{{ t('employee.skillPolicy') }}</p>
-          <h3 class="mt-1 text-lg font-bold">{{ t('employee.capabilityTitle') }}</h3>
-          <p class="mt-1 text-sm text-[var(--muted)]">{{ t('employee.skillPolicyHelp') }}</p>
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="text-[11px] font-extrabold tracking-[.12em] text-[var(--accent)]">{{ t('employee.skillPolicy') }}</p>
+              <h3 class="mt-1 text-lg font-bold">{{ t('employee.capabilityTitle') }}</h3>
+              <p class="mt-1 text-sm text-[var(--muted)]">{{ t('employee.skillPolicyHelp') }}</p>
+            </div>
+            <button
+              class="rounded-lg bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-50"
+              type="button"
+              :disabled="!associableSkills.length"
+              @click="openSkillPicker"
+            >
+              {{ t('employee.skillPick') }}
+            </button>
+          </div>
+
           <div class="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/40 px-4 py-3">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -587,24 +682,45 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
               <span class="text-xs font-semibold text-emerald-600">{{ t('employee.baselineSkillAlways') }}</span>
             </div>
           </div>
-          <div class="mt-3 divide-y divide-[var(--border)]">
-            <div v-for="skill in skills" :key="skill.id" class="flex flex-wrap items-center justify-between gap-3 py-3">
-              <div>
-                <strong class="text-sm">{{ skill.name }}</strong>
-                <p class="mt-1 text-xs text-[var(--muted)]">{{ skill.description }}</p>
+
+          <p v-if="!linkedSkills.length" class="mt-4 rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-sm text-[var(--muted)]">
+            {{ t('employee.skillLinkedEmpty') }}
+          </p>
+          <div v-else class="mt-4 grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
+            <article
+              v-for="skill in linkedSkills"
+              :key="skill.id"
+              class="flex flex-col rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3 transition hover:border-[var(--accent)]/25"
+            >
+              <div class="flex items-start justify-between gap-2">
+                <h4 class="min-w-0 flex-1 truncate text-sm font-bold">{{ skill.name }}</h4>
+                <button
+                  class="shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)] hover:bg-rose-500/10 hover:text-rose-600"
+                  type="button"
+                  :disabled="savingSkillId === skill.id"
+                  :title="t('employee.skillUnlink')"
+                  @click="unlinkSkill(skill.id)"
+                >×</button>
+              </div>
+              <p class="mt-1 line-clamp-2 text-[11px] leading-relaxed text-[var(--muted)]">{{ skill.description }}</p>
+              <div class="mt-2 flex flex-wrap items-center gap-1 text-[10px]">
+                <span :class="['rounded-md px-1.5 py-0.5 font-semibold', skillRiskTone(skill.risk)]">{{ skillRiskLabel(skill.risk) }}</span>
+                <span class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 text-[var(--muted)]">{{ skillSourceLabel(skill) }}</span>
+                <span v-for="tag in (skill.tags || []).slice(0, 2)" :key="tag" class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 text-[var(--muted)]">{{ tag }}</span>
               </div>
               <select
-                class="rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-2.5 py-2 text-xs"
+                class="mt-3 w-full rounded-lg border border-[var(--border)] bg-[var(--surface-muted)] px-2 py-1.5 text-[11px]"
                 :value="mode(skill.id)"
                 :disabled="savingSkillId === skill.id || Boolean(skill.systemOnly && selectedEmployee.id !== 'administrator')"
                 @change="update(skill.id, $event)"
               >
-                <option value="disabled">{{ t('employee.skillDisabled') }}</option>
                 <option value="available">{{ t('employee.skillAvailable') }}</option>
                 <option value="default">{{ t('employee.skillDefault') }}</option>
+                <option value="disabled">{{ t('employee.skillUnlink') }}</option>
               </select>
-            </div>
+            </article>
           </div>
+          <p class="mt-3 text-[11px] text-[var(--muted)]">{{ t('employee.skillLinkedCount', { n: linkedSkills.length }) }}</p>
         </div>
       </section>
     </template>
@@ -738,6 +854,67 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
           <div class="flex gap-2">
             <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold" type="button" @click="mcpPickerOpen = false">{{ t('common.cancel') }}</button>
             <button class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white" type="button" @click="confirmMcpPicker">{{ t('employee.mcpPickConfirm') }}</button>
+          </div>
+        </footer>
+      </article>
+    </div>
+
+    <div v-if="skillPickerOpen" class="fixed inset-0 z-40 grid place-items-center bg-slate-950/40 p-5" @click.self="skillPickerOpen = false">
+      <article class="flex max-h-[min(88vh,720px)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-2xl">
+        <header class="flex items-start justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
+          <div>
+            <h2 class="text-lg font-bold">{{ t('employee.skillPickTitle') }}</h2>
+            <p class="mt-1 text-xs text-[var(--muted)]">{{ t('employee.skillPickHelp') }}</p>
+          </div>
+          <button class="text-xl text-[var(--muted)]" type="button" @click="skillPickerOpen = false">×</button>
+        </header>
+        <div class="border-b border-[var(--border)] px-5 py-3">
+          <input
+            v-model="skillPickerQuery"
+            class="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2.5 text-sm"
+            :placeholder="t('employee.skillPickSearch')"
+          />
+        </div>
+        <div class="min-h-0 flex-1 space-y-2 overflow-y-auto p-4">
+          <p v-if="!pickerSkills.length" class="rounded-xl border border-dashed border-[var(--border)] px-4 py-10 text-center text-sm text-[var(--muted)]">
+            {{ t('employee.skillPickEmpty') }}
+          </p>
+          <button
+            v-for="skill in pickerSkills"
+            :key="skill.id"
+            type="button"
+            :class="[
+              'flex w-full items-start gap-3 rounded-xl border px-3 py-3 text-left transition',
+              skillPickerDraft.includes(skill.id)
+                ? 'border-[var(--accent)] bg-[var(--accent-soft)]'
+                : 'border-[var(--border)] hover:border-[var(--accent)]/40',
+            ]"
+            @click="toggleSkillPickerDraft(skill.id)"
+          >
+            <span
+              class="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-md border text-[11px] font-bold"
+              :class="skillPickerDraft.includes(skill.id) ? 'border-[var(--accent)] bg-[var(--accent)] text-white' : 'border-[var(--border)] text-transparent'"
+            >✓</span>
+            <span class="min-w-0 flex-1">
+              <span class="flex flex-wrap items-center gap-1.5">
+                <strong class="text-sm">{{ skill.name }}</strong>
+                <span :class="['rounded-md px-1.5 py-0.5 text-[10px] font-semibold', skillRiskTone(skill.risk)]">{{ skillRiskLabel(skill.risk) }}</span>
+                <span class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">{{ skillSourceLabel(skill) }}</span>
+              </span>
+              <span class="mt-1 line-clamp-2 block text-[11px] leading-relaxed text-[var(--muted)]">{{ skill.description }}</span>
+              <span v-if="(skill.tags || []).length" class="mt-1.5 flex flex-wrap gap-1">
+                <span v-for="tag in skill.tags.slice(0, 4)" :key="tag" class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">{{ tag }}</span>
+              </span>
+            </span>
+          </button>
+        </div>
+        <footer class="flex items-center justify-between gap-3 border-t border-[var(--border)] bg-[var(--surface-muted)]/50 px-5 py-3">
+          <span class="text-[11px] text-[var(--muted)]">{{ t('employee.skillSelectedCount', { n: skillPickerDraft.length }) }}</span>
+          <div class="flex gap-2">
+            <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold" type="button" @click="skillPickerOpen = false">{{ t('common.cancel') }}</button>
+            <button class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-50" type="button" :disabled="savingSkills" @click="confirmSkillPicker">
+              {{ savingSkills ? t('employee.saving') : t('employee.skillPickConfirm') }}
+            </button>
           </div>
         </footer>
       </article>

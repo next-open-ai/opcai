@@ -151,9 +151,16 @@ export class ProjectService {
         if (this.taskAborts.has(task.id)) continue;
         const run = await this.engine.load(task.runId);
         if (run && run.status !== 'running') {
-          task.status = run.status === 'completed' ? 'completed' : run.status === 'cancelled' ? 'cancelled' : 'failed';
+          const shipped = (run.artifacts?.length ?? 0) > 0;
+          // Soft-complete when deliverables already exist (e.g. maxSteps after publish).
+          if (run.status === 'completed' || (run.status === 'failed' && shipped)) {
+            task.status = 'completed';
+            task.error = run.status === 'failed' ? undefined : run.error;
+          } else {
+            task.status = run.status === 'cancelled' ? 'cancelled' : 'failed';
+            task.error = run.error;
+          }
           task.finishedAt = run.finishedAt ?? Date.now();
-          task.error = run.error;
           changed = true;
           tasksTouched += 1;
           continue;
@@ -743,13 +750,24 @@ export class ProjectService {
       if (!target || target.runId !== run.id) return;
       if (latest.status !== 'running' && latest.status !== 'cancelled') return;
       target.finishedAt = Date.now();
-      target.error = run.error;
-      if (run.status === 'completed') target.status = 'completed';
-      else if (run.status === 'cancelled') target.status = 'cancelled';
-      else if (run.status === 'waiting-approval') {
+      if (run.status === 'completed') {
+        target.status = 'completed';
+        target.error = run.error;
+      } else if (run.status === 'cancelled') {
+        target.status = 'cancelled';
+        target.error = run.error;
+      } else if (run.status === 'waiting-approval') {
         target.status = 'running';
         target.error = '任务等待审批后继续。';
-      } else target.status = 'failed';
+      } else if ((run.artifacts?.length ?? 0) > 0) {
+        // Deliverables already shipped (publish/register) — don't surface as「需要处理」
+        // just because the model later hit maxSteps / soft tool failures.
+        target.status = 'completed';
+        target.error = undefined;
+      } else {
+        target.status = 'failed';
+        target.error = run.error;
+      }
       this.hub.publish(`project:${latest.id}`, { type: 'project.task', projectId: latest.id, taskId: task.id, status: target.status, runId: run.id });
     });
     return true;

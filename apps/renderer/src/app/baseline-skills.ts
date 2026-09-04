@@ -14,44 +14,49 @@ You are using the **OPCAI workspace harness** (\`opcai-workspace\`). It is alway
 
 ## Two directories (do not confuse them)
 
-1. **Run workspace** (isolated, per attempt) — write generators, \`.py\`/\`.sh\` scripts, scratch files here with \`write_workspace_file\`. Users do **not** browse this tree in the project UI.
-2. **Project workspace** (shared deliverables) — only when this run is bound to a project. Call \`publish_to_project\` to copy finished user-facing assets into the directory shown in the left **项目文件** tree. The platform also auto-promotes remaining deliverables when the run completes successfully.
+1. **Run workspace** (isolated, per attempt) — generators, scratch, and process scripts live here (prefer \`scripts/\`). Users do **not** browse this tree in the project UI.
+2. **Business outputs** — finished products the user should keep. They **must** live under \`output/\`. Only \`output/\` is archived to the asset library / auto-promoted to a project.
 
 ## Tools (always pass skillId \`opcai-workspace\` unless noted)
 
-- \`read_workspace_file\` — read text artifacts already in the **run** workspace (no skillId).
-- \`write_workspace_file\` — create/replace/append text under the **run** workspace (requires workspace-write).
-- \`run_workspace_script\` — execute a \`.py\`, \`.sh\`, or \`.js\` script **you wrote into the run workspace** (requires script permission).
+- \`read_workspace_file\` — read text already in the **run** workspace (no skillId).
+- \`write_workspace_file\` — create/replace/append text. Process files: any path outside \`output/\`. Deliverables: path under \`output/\` **or** \`deliverable: true\` (auto-places under \`output/\`).
+- \`run_workspace_script\` — execute a \`.py\` / \`.sh\` / \`.js\` you wrote (prefer \`scripts/…\`). Scripts should write finals to \`output/<name>\`.
+- \`register_deliverable\` — copy an existing finished file into \`output/\` and mark it for the asset library (use for final \`.py\`/\`.js\` products — never for throwaway generators).
 - \`install_python_dependency\` — install a PyPI package into \`.python-packages\` for workspace scripts only.
-- \`publish_to_project\` — promote a finished deliverable from the run workspace into the **shared project workspace** (requires workspace-write + project-bound run). Rejects process scripts.
+- \`publish_to_project\` — promote an \`output/\` deliverable into the **shared project workspace** (project-bound runs only).
+
+### Deliverable contract (important)
+
+- **Intent, not file-type guessing:** a final product may be PDF, HTML, **or** a \`.py\`/\`.js\` the user asked for.
+- Generators stay outside \`output/\` (e.g. \`scripts/generate_pdf.py\`).
+- Finished products go to \`output/上海到桂林5日游行程.pdf\` or \`output/analyze.py\`.
+- Do **not** register \`__pycache__\`, tooling under \`scripts/\`, or other process paths.
 
 ### write_workspace_file contract
 
-- Args: \`skillId\`, \`path\`, and either \`content\` (≤12KB) or \`chunks\` (each ≤4KB), optional \`mode\`: \`replace\` (default) | \`append\`.
-- **Keep each call small** (ideally ≤6KB). Huge single-call HTML/CSS often fails with JSON parse errors before the file is saved.
-- For a website: write \`index.html\`, then CSS/JS as separate files. If one file is long, write the first part with \`mode: replace\`, then continue with \`mode: append\`.
-- After a failed oversized write, shrink the payload and retry — still deliver HTML, not only CSS/Markdown.
+- Args: \`skillId\`, \`path\`, and either \`content\` (≤12KB) or \`chunks\` (each ≤4KB), optional \`mode\`: \`replace\` | \`append\`, optional \`deliverable\`: boolean.
+- **Keep each call small** (ideally ≤6KB).
+- For a website: write pages under \`output/\` (or \`deliverable: true\`).
 - Do not claim a file was saved unless the tool returned \`ok: true\`.
 
 ### publish_to_project contract
 
-- Args: \`skillId\`, \`path\` (run-workspace relative), optional \`destPath\` (project relative; defaults to same path).
-- Allowed: HTML/CSS/JS/Markdown/images/data (and similar deliverables).
-- Forbidden: \`.py\` / \`.sh\` / \`scripts/\` / \`tools/\` / \`tmp/\` and other process paths — they stay in the run workspace.
-- The left project file tree updates after a successful publish, end-of-run auto-promote, or client deliverable sync.
+- Source should be under \`output/\`. Process paths are rejected.
+- The left project file tree updates after publish, end-of-run auto-promote of \`output/\`, or client sync.
 
 ## Rules
 
-1. Prefer \`write_workspace_file\` while building; call \`publish_to_project\` for each user-facing asset when a project is bound (auto-promote also runs at the end).
-2. Skill packages from the library are optional extras; this harness covers basic workspace I/O without loading another Skill.
+1. Build with process files; finish by placing products under \`output/\` (or \`register_deliverable\`).
+2. When a project is bound, \`publish_to_project\` each \`output/\` asset (auto-promote also runs at the end).
 3. Respect the run permission tier: read-only runs cannot write, execute scripts, or publish.
-4. Missing files on \`read_workspace_file\` simply mean they are not created yet — write them; do not treat ENOENT as a hard stop.
+4. Missing files on \`read_workspace_file\` mean they are not created yet — write them; do not treat ENOENT as a hard stop.
 `;
 
 export const baselineWorkspaceSkillMeta = {
   id: BASELINE_WORKSPACE_SKILL_ID,
   name: 'OPCAI Workspace',
-  description: 'Platform harness: isolated run workspace I/O/scripts, plus publish_to_project for shared project deliverables.',
+  description: 'Platform harness: isolated run workspace I/O/scripts, output/ deliverables, plus publish_to_project for shared project trees.',
   source: 'builtin' as const,
   status: 'ready' as const,
   risk: 'medium' as const,

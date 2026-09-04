@@ -99,7 +99,7 @@ function toggleSidebar() { sidebarCollapsed.value = !sidebarCollapsed.value; voi
         :has-employee-override="hasEmployeeOverride"
         @start-chat="startChat"
       />
-      <CapabilitiesPage v-else-if="view === 'capabilities'" @open-knowledge="setView('knowledge')" />
+      <CapabilitiesPage v-else-if="view === 'capabilities'" />
       <KnowledgePage v-else-if="view === 'knowledge'" @open-settings="setView('settings')" />
       <AssetsPage v-else-if="view === 'assets'" :conversations="conversations" @open-conversation="(id) => { selectConversation(id); setView('chat'); }" @open-project="openProjectFromAssets" />
       <AutomationsPage

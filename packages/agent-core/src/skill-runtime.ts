@@ -15,30 +15,91 @@ const MAX_SCRIPT_OUTPUT = 32_000;
 const SCRIPT_TIMEOUT_MS = 30_000;
 const textFilePattern = /\.(md|txt|json|ya?ml|csv|html?|css|ts|js|mjs|cjs|py|sh)$/i;
 const executablePattern = /^scripts\/.+\.(sh|js|mjs|cjs|py)$/i;
-/** Extensions allowed into the shared project workspace (user-facing deliverables). */
-const PROJECT_DELIVERABLE_EXT = new Set([
-  'html', 'htm', 'css', 'js', 'md', 'markdown', 'txt', 'csv', 'json', 'pdf',
-  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico', 'woff', 'woff2', 'ttf',
-]);
-const PROJECT_INTERMEDIATE_DIRS = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
 
-/** True when a run-workspace relative path may be promoted into the project tree. */
-export function isProjectDeliverablePath(relative: string) {
-  const normalized = relative.replace(/\\/g, '/').replace(/^\/+/, '');
-  const parts = normalized.split('/');
-  if (!normalized || parts.some((part) => !part || part === '.' || part === '..')) return false;
-  if (parts.some((part) => PROJECT_INTERMEDIATE_DIRS.has(part))) return false;
-  const base = parts[parts.length - 1] || '';
-  if (base.startsWith('.') && base !== '.gitkeep') return false;
+/** Canonical directory for finished business deliverables inside a run workspace. */
+export const WORKSPACE_OUTPUT_DIR = 'output';
+
+/** Process / cache directories — never auto-archived or promoted. */
+const PROCESS_ONLY_DIRS = new Set(['tools', 'scripts', 'tmp', 'deps', '.python-packages', '__pycache__', 'node_modules']);
+
+/** Bytecode / native objects — never deliverables, even under output/. */
+const NEVER_DELIVERABLE_EXT = new Set([
+  'pyc', 'pyo', 'pyd', 'class', 'o', 'obj', 'exe', 'dll', 'so', 'dylib', 'map',
+]);
+
+/**
+ * Document-like files that LLMs often write at workspace root by mistake.
+ * After a script run we stage these into output/ so they still reach the asset library,
+ * without treating generator sources (.py/.sh/…) as deliverables.
+ */
+const STAGEABLE_ROOT_DOCUMENT_EXT = new Set([
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'rtf',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico',
+  'html', 'htm', 'css', 'md', 'markdown', 'txt', 'csv', 'json',
+  'zip', 'gz', 'tgz', 'mp3', 'mp4', 'webm', 'wav',
+]);
+
+function normalizeWorkspacePath(relative: string) {
+  return relative.replace(/\\/g, '/').replace(/^\/+/, '');
+}
+
+function pathParts(relative: string) {
+  return normalizeWorkspacePath(relative).split('/').filter(Boolean);
+}
+
+function safeRelative(value: string) {
+  const normalized = normalizeWorkspacePath(value);
+  if (!normalized || normalized.split('/').some((part) => !part || part === '.' || part === '..')) {
+    throw new Error('Path must be a safe relative path.');
+  }
+  return normalized;
+}
+
+function isNeverDeliverableFile(base: string) {
+  if (!base || (base.startsWith('.') && base !== '.gitkeep')) return true;
   const ext = path.extname(base).slice(1).toLowerCase();
-  if (['py', 'sh', 'cjs', 'mjs', 'ts', 'tsx', 'jsx', 'map'].includes(ext)) return false;
-  return PROJECT_DELIVERABLE_EXT.has(ext);
+  return !ext || NEVER_DELIVERABLE_EXT.has(ext);
+}
+
+/** True when the path is under the canonical business-output directory. */
+export function isUnderWorkspaceOutput(relative: string) {
+  const parts = pathParts(relative);
+  return parts[0] === WORKSPACE_OUTPUT_DIR && parts.length >= 2;
 }
 
 /**
- * Copy every deliverable file from an isolated run workspace into the shared
- * project workspace. Used as a reliable end-of-run promotion so the project
- * file tree does not depend solely on the model calling `publish_to_project`.
+ * True when a run-workspace relative path is a finished business deliverable.
+ * Policy (intent, not extension guesswork):
+ * - Must live under `output/` (or be placed there via register_deliverable).
+ * - Process trees (scripts/tools/tmp/…) are never deliverables.
+ * - Bytecode/cache files are never deliverables even under output/.
+ * - Under output/, source files such as .py/.js ARE allowed (they can be the product).
+ */
+export function isBusinessDeliverablePath(relative: string) {
+  const normalized = normalizeWorkspacePath(relative);
+  const parts = pathParts(normalized);
+  if (!normalized || parts.some((part) => part === '.' || part === '..')) return false;
+  if (parts.some((part) => PROCESS_ONLY_DIRS.has(part))) return false;
+  if (!isUnderWorkspaceOutput(normalized)) return false;
+  return !isNeverDeliverableFile(parts[parts.length - 1] || '');
+}
+
+/** @deprecated Use isBusinessDeliverablePath — kept for call-site compatibility. */
+export function isProjectDeliverablePath(relative: string) {
+  return isBusinessDeliverablePath(relative);
+}
+
+function toOutputPath(relative: string, destName?: string) {
+  const normalized = safeRelative(relative);
+  if (isUnderWorkspaceOutput(normalized) && !destName) return normalized;
+  const base = destName ? path.basename(safeRelative(destName)) : path.basename(normalized);
+  if (!base || base === '.' || base === '..') throw new Error('Invalid deliverable file name.');
+  return `${WORKSPACE_OUTPUT_DIR}/${base}`;
+}
+
+/**
+ * Copy every deliverable under output/ from an isolated run workspace into the
+ * shared project workspace. End-of-run safety net; prefer explicit publish.
  */
 export async function promoteWorkspaceDeliverablesToProject(
   workspaceRoot: string,
@@ -47,6 +108,8 @@ export async function promoteWorkspaceDeliverablesToProject(
   const published: Array<{ path: string; projectPath: string }> = [];
   const root = path.resolve(workspaceRoot);
   const destRoot = path.resolve(projectRoot);
+  const outputRoot = path.join(root, WORKSPACE_OUTPUT_DIR);
+
   async function walk(folder: string, depth = 0) {
     if (depth > 8 || published.length >= 200) return;
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
@@ -56,7 +119,7 @@ export async function promoteWorkspaceDeliverablesToProject(
       return;
     }
     for (const entry of entries) {
-      if (entry.name.startsWith('.') || PROJECT_INTERMEDIATE_DIRS.has(entry.name)) continue;
+      if (entry.name.startsWith('.') || PROCESS_ONLY_DIRS.has(entry.name)) continue;
       const target = path.join(folder, entry.name);
       if (entry.isDirectory()) {
         await walk(target, depth + 1);
@@ -64,30 +127,30 @@ export async function promoteWorkspaceDeliverablesToProject(
       }
       if (!entry.isFile()) continue;
       const relative = path.relative(root, target).split(path.sep).join('/');
-      if (!isProjectDeliverablePath(relative)) continue;
-      const dest = path.join(destRoot, ...relative.split('/'));
+      if (!isBusinessDeliverablePath(relative)) continue;
+      // Promote as output-relative path without forcing the "output/" prefix into the project tree.
+      const projectPath = relative.startsWith(`${WORKSPACE_OUTPUT_DIR}/`)
+        ? relative.slice(WORKSPACE_OUTPUT_DIR.length + 1)
+        : relative;
+      if (!projectPath || projectPath.split('/').some((part) => !part || part === '.' || part === '..')) continue;
+      const dest = path.join(destRoot, ...projectPath.split('/'));
       await mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
       await copyFile(target, dest);
-      published.push({ path: relative, projectPath: relative });
+      published.push({ path: relative, projectPath });
       if (published.length >= 200) return;
     }
   }
+
   try {
-    await walk(root);
+    await walk(outputRoot);
   } catch {
-    /* best-effort: leave whatever was already published */
+    /* best-effort */
   }
   return published;
 }
 
 function truncate(value: string, limit: number) {
   return value.length > limit ? `${value.slice(0, limit)}\n…[truncated]` : value;
-}
-
-function safeRelative(value: string) {
-  const normalized = value.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (!normalized || normalized.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('Path must be a safe relative path.');
-  return normalized;
 }
 
 async function pathInside(root: string, relative: string) {
@@ -110,20 +173,93 @@ async function listSkillFiles(root: string, folder = root, depth = 0, entries: s
   return entries;
 }
 
-async function listWorkspaceArtifacts(root: string, folder = root, depth = 0, entries: string[] = []): Promise<string[]> {
+/**
+ * List finished deliverables under output/ only.
+ */
+async function listOutputDeliverables(root: string, folder = path.join(root, WORKSPACE_OUTPUT_DIR), depth = 0, entries: string[] = []): Promise<string[]> {
   if (depth > 5 || entries.length >= 40) return entries;
-  for (const entry of await readdir(folder, { withFileTypes: true })) {
+  let listing: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+  try {
+    listing = await readdir(folder, { withFileTypes: true });
+  } catch {
+    return entries;
+  }
+  for (const entry of listing) {
+    if (entry.name.startsWith('.') || PROCESS_ONLY_DIRS.has(entry.name)) continue;
     const target = path.join(folder, entry.name);
     if (entry.isDirectory()) {
-      if (!entry.name.startsWith('.')) await listWorkspaceArtifacts(root, target, depth + 1, entries);
+      await listOutputDeliverables(root, target, depth + 1, entries);
     } else if (entry.isFile()) {
       const relative = path.relative(root, target).split(path.sep).join('/');
-      // Generator sources are execution plumbing, not user-facing outputs.
-      if (!/\.(sh|js|mjs|cjs|py)$/i.test(relative)) entries.push(relative);
+      if (isBusinessDeliverablePath(relative)) entries.push(relative);
     }
     if (entries.length >= 40) break;
   }
   return entries;
+}
+
+function isStageableRootDocument(relative: string) {
+  const parts = pathParts(relative);
+  if (parts.length !== 1) return false;
+  if (isNeverDeliverableFile(parts[0])) return false;
+  const ext = path.extname(parts[0]).slice(1).toLowerCase();
+  return STAGEABLE_ROOT_DOCUMENT_EXT.has(ext);
+}
+
+/**
+ * After a generator script runs:
+ * 1) collect new/changed files under output/
+ * 2) stage accidental root documents (pdf/html/…) into output/ (generators stay put)
+ */
+async function collectScriptDeliverables(root: string, before: Set<string>, startedAtMs: number): Promise<string[]> {
+  const staged = new Set<string>();
+
+  // Walk whole tree lightly for root-document staging + output discovery.
+  async function walk(folder: string, depth = 0) {
+    if (depth > 5) return;
+    let listing: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      listing = await readdir(folder, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of listing) {
+      if (entry.name.startsWith('.') || PROCESS_ONLY_DIRS.has(entry.name)) continue;
+      const target = path.join(folder, entry.name);
+      if (entry.isDirectory()) {
+        await walk(target, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const relative = path.relative(root, target).split(path.sep).join('/');
+      let info: { mtimeMs: number };
+      try {
+        info = await stat(target);
+      } catch {
+        continue;
+      }
+      const isNewOrTouched = !before.has(relative) || info.mtimeMs >= startedAtMs - 1_000;
+      if (!isNewOrTouched) continue;
+
+      if (isBusinessDeliverablePath(relative)) {
+        staged.add(relative);
+        continue;
+      }
+      if (!isStageableRootDocument(relative)) continue;
+      const destRel = toOutputPath(relative);
+      const destAbs = path.join(root, ...destRel.split('/'));
+      await mkdir(path.dirname(destAbs), { recursive: true, mode: 0o700 });
+      await copyFile(target, destAbs);
+      staged.add(destRel);
+    }
+  }
+
+  await walk(root);
+  // Also pick up anything already under output/ that may have been missed if walk skipped.
+  for (const item of await listOutputDeliverables(root).catch(() => [])) {
+    if (!before.has(item)) staged.add(item);
+  }
+  return [...staged];
 }
 
 function approvedSkillRoot(skill: AgentSkillRuntime) {
@@ -195,8 +331,10 @@ export function createSkillExecutionTools(input: {
     const extension = path.extname(script).toLowerCase();
     const command = extension === '.py' ? 'python3' : extension === '.sh' ? 'bash' : process.execPath;
     const dependencyRoot = path.join(workspaceRoot, '.python-packages');
+    const before = new Set(await listOutputDeliverables(workspaceRoot).catch(() => []));
+    const startedAtMs = Date.now();
     const result = await runProcess(command, [script, ...args], workspaceRoot, { env: { ...process.env, PYTHONPATH: dependencyRoot } });
-    const artifacts = await listWorkspaceArtifacts(workspaceRoot).catch(() => []);
+    const artifacts = await collectScriptDeliverables(workspaceRoot, before, startedAtMs).catch(() => []);
     return { ok: result.exitCode === 0, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, artifacts };
   };
 
@@ -230,7 +368,7 @@ export function createSkillExecutionTools(input: {
         try {
           const file = await pathInside(root, relative);
           return { ok: true, path: safeRelative(relative), content: truncate(await readFile(file, 'utf8'), MAX_FILE_BYTES) };
-        } catch (error) {
+        } catch {
           return { ok: false, error: `Skill file is unavailable: ${safeRelative(relative)}. Load the Skill and use only a path returned in its files list.` };
         }
       },
@@ -245,32 +383,70 @@ export function createSkillExecutionTools(input: {
       },
     }),
     write_workspace_file: tool({
-      description: 'Write a text artifact to this run\'s isolated workspace. Keep each call small: prefer content ≤8KB, or pass chunks (≤4KB each). For larger HTML/CSS/JS, call again with mode "append". Never put an entire multi-page site into one call.',
+      description: 'Write a text file to this run\'s isolated workspace. Process files stay outside output/. Finished business deliverables must use path under output/ or pass deliverable=true (auto-places under output/). Keep each call small.',
       inputSchema: z.object({
         skillId: z.string().min(1).default('opcai-workspace'),
         path: z.string().min(1).max(240),
         content: z.string().max(MAX_WRITE_CONTENT).optional(),
         chunks: z.array(z.string().max(MAX_WRITE_CHUNK)).max(MAX_WRITE_CHUNKS).optional(),
         mode: z.enum(['replace', 'append']).default('replace'),
+        deliverable: z.boolean().optional(),
       }).superRefine((value, ctx) => {
         const hasContent = typeof value.content === 'string' && value.content.length > 0;
         const hasChunks = Array.isArray(value.chunks) && value.chunks.length > 0;
         if (!hasContent && !hasChunks) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Provide content or chunks.' });
       }),
-      execute: async ({ skillId, path: relative, content, chunks, mode }) => {
+      execute: async ({ skillId, path: relative, content, chunks, mode, deliverable }) => {
         ensureLoaded(skillId);
         const skill = getSkill(skillId);
         if (!skill.execution.allowWorkspaceWrite) return approval(skillId, 'workspace-write', 'Writing an artifact to this run workspace requires your approval.');
-        if (!textFilePattern.test(relative)) return { ok: false, error: 'Only approved text formats can be written.' };
+        const requested = safeRelative(relative);
+        const asDeliverable = Boolean(deliverable) || isUnderWorkspaceOutput(requested);
+        const targetRel = asDeliverable ? toOutputPath(requested) : requested;
+        if (!textFilePattern.test(targetRel)) return { ok: false, error: 'Only approved text formats can be written.' };
+        if (asDeliverable && !isBusinessDeliverablePath(targetRel)) {
+          return { ok: false, error: 'Deliverable path is invalid. Use output/<filename> and avoid cache/bytecode names.' };
+        }
         const body = typeof content === 'string' && content.length ? content : (chunks ?? []).join('');
         if (!body) return { ok: false, error: 'Write body is empty. Pass content or chunks.' };
         if (Buffer.byteLength(body) > MAX_FILE_BYTES) return { ok: false, error: `Single write exceeds ${MAX_FILE_BYTES} bytes. Split with mode "append".` };
-        const file = await workspacePath(relative);
+        const file = await workspacePath(targetRel);
         await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
         if (mode === 'append') await writeFile(file, body, { encoding: 'utf8', flag: 'a', mode: 0o600 });
         else await writeFile(file, body, { encoding: 'utf8', mode: 0o600 });
         const size = (await stat(file)).size;
-        return { ok: true, path: safeRelative(relative), bytes: Buffer.byteLength(body), totalBytes: size, mode };
+        return { ok: true, path: targetRel, bytes: Buffer.byteLength(body), totalBytes: size, mode, deliverable: asDeliverable };
+      },
+    }),
+    register_deliverable: tool({
+      description: 'Mark an existing run-workspace file as a finished business deliverable. Copies it into output/ (if needed) so it can be archived. Use for final products of any type (including .py/.js) — never for throwaway generators.',
+      inputSchema: z.object({
+        skillId: z.string().min(1).default('opcai-workspace'),
+        path: z.string().min(1).max(240),
+        destName: z.string().min(1).max(180).optional(),
+      }),
+      execute: async ({ skillId, path: relative, destName }) => {
+        ensureLoaded(skillId);
+        const skill = getSkill(skillId);
+        if (!skill.execution.allowWorkspaceWrite) return approval(skillId, 'workspace-write', 'Registering a deliverable requires your approval.');
+        const sourceRel = safeRelative(relative);
+        if (PROCESS_ONLY_DIRS.has(pathParts(sourceRel)[0] || '')) {
+          return { ok: false, error: 'Files under scripts/tools/tmp/… are process files and cannot be registered as deliverables.' };
+        }
+        let source: string;
+        try {
+          source = await workspacePath(sourceRel);
+          if (!(await stat(source)).isFile()) throw new Error('Not a file');
+        } catch {
+          return { ok: false, error: `Run workspace file is unavailable: ${sourceRel}.` };
+        }
+        const destRel = toOutputPath(sourceRel, destName);
+        if (!isBusinessDeliverablePath(destRel)) return { ok: false, error: 'Deliverable name is invalid (cache/bytecode names are blocked).' };
+        const dest = await workspacePath(destRel);
+        await mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+        if (path.resolve(source) !== path.resolve(dest)) await copyFile(source, dest);
+        const bytes = (await stat(dest)).size;
+        return { ok: true, path: destRel, sourcePath: sourceRel, bytes, deliverable: true };
       },
     }),
     run_skill_script: tool({
@@ -288,7 +464,9 @@ export function createSkillExecutionTools(input: {
         try {
           script = await pathInside(root, normalized);
           if (!(await stat(script)).isFile()) throw new Error('Not a file');
-        } catch (_) { return { ok: false, error: `Script is unavailable: ${normalized}. Use only a script listed by load_skill.` }; }
+        } catch {
+          return { ok: false, error: `Script is unavailable: ${normalized}. Use only a script listed by load_skill.` };
+        }
         await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
         const extension = path.extname(script).toLowerCase();
         const command = extension === '.py' ? 'python3' : extension === '.sh' ? 'bash' : process.execPath;
@@ -297,18 +475,15 @@ export function createSkillExecutionTools(input: {
       },
     }),
     run_workspace_script: tool({
-      description: 'Run a script previously written to this isolated run workspace. Use this only to create an artifact when the loaded Skill permits both workspace writes and script execution. No shell expressions are accepted.',
+      description: 'Run a script previously written to this isolated run workspace. Prefer scripts under scripts/; finals should be written to output/.',
       inputSchema: z.object({ skillId: z.string().min(1).default('opcai-workspace'), path: z.string().min(1).max(240), args: z.array(z.string().max(500)).max(16).default([]) }),
       execute: async ({ skillId, path: relative, args }) => runWorkspaceScript(skillId, relative, args),
     }),
     publish_to_project: tool({
-      description:
-        'Promote a finished deliverable from this run workspace into the shared project workspace (the directory shown in the project file tree). Intermediate scripts (.py/.sh) and tools/scripts/tmp stay in the run workspace — only user-facing assets (HTML/CSS/JS/Markdown/images/…) may be published. Requires a project-bound run.',
+      description: 'Promote a finished business deliverable from this run workspace into the shared project workspace. Source must be under output/ (or already registered). Requires a project-bound run.',
       inputSchema: z.object({
         skillId: z.string().min(1).default('opcai-workspace'),
-        /** Relative path inside the isolated run workspace. */
         path: z.string().min(1).max(240),
-        /** Optional destination relative path under the project root (defaults to the same relative path). */
         destPath: z.string().min(1).max(240).optional(),
       }),
       execute: async ({ skillId, path: relative, destPath }) => {
@@ -321,25 +496,34 @@ export function createSkillExecutionTools(input: {
           return { ok: false, error: 'Current run is not bound to a project workspace. publish_to_project is only available for project tasks.' };
         }
         const sourceRel = safeRelative(relative);
-        const destRel = safeRelative(destPath || relative);
-        if (!isProjectDeliverablePath(sourceRel) || !isProjectDeliverablePath(destRel)) {
-          return {
-            ok: false,
-            error: 'Only project deliverables may be published (HTML/CSS/JS/Markdown/images/data). Keep process scripts under the run workspace (e.g. scripts/, *.py, *.sh).',
-          };
+        const stagedRel = isBusinessDeliverablePath(sourceRel) ? sourceRel : toOutputPath(sourceRel);
+        const destRel = safeRelative(destPath || (isUnderWorkspaceOutput(sourceRel)
+          ? sourceRel.slice(WORKSPACE_OUTPUT_DIR.length + 1)
+          : path.basename(sourceRel)));
+        if (!isBusinessDeliverablePath(stagedRel)) {
+          return { ok: false, error: 'Only files under output/ may be published. Write/register the finished product with deliverable=true or register_deliverable first.' };
         }
         let source: string;
         try {
-          source = await workspacePath(sourceRel);
+          source = await workspacePath(isBusinessDeliverablePath(sourceRel) ? sourceRel : stagedRel);
           if (!(await stat(source)).isFile()) throw new Error('Not a file');
         } catch {
-          return { ok: false, error: `Run workspace file is unavailable: ${sourceRel}. Write it with write_workspace_file first.` };
+          try {
+            const raw = await workspacePath(sourceRel);
+            if (!(await stat(raw)).isFile()) throw new Error('Not a file');
+            const stagedAbs = await workspacePath(stagedRel);
+            await mkdir(path.dirname(stagedAbs), { recursive: true, mode: 0o700 });
+            await copyFile(raw, stagedAbs);
+            source = stagedAbs;
+          } catch {
+            return { ok: false, error: `Run workspace file is unavailable: ${sourceRel}. Write it with write_workspace_file first.` };
+          }
         }
         const dest = await projectPath(destRel);
         await mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
         await copyFile(source, dest);
         const bytes = (await stat(dest)).size;
-        return { ok: true, path: sourceRel, projectPath: destRel, bytes, projectRoot };
+        return { ok: true, path: stagedRel, projectPath: destRel, bytes, projectRoot, deliverable: true };
       },
     }),
     install_python_dependency: tool({

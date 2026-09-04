@@ -6,7 +6,7 @@ import { stepCountIs, streamText } from 'ai';
 import type { AgentEvent, AgentProfile, AgentSkillRuntime, ModelConfig } from '@opcai/contracts';
 import type { OpcaiTool, ToolPolicy } from '@opcai/tools';
 import { compactMessagesForStep, summarizePlainTurns } from './context-compaction.js';
-import { createSkillExecutionTools, promoteWorkspaceDeliverablesToProject } from './skill-runtime.js';
+import { createSkillExecutionTools, isBusinessDeliverablePath, promoteWorkspaceDeliverablesToProject } from './skill-runtime.js';
 import { createWebSearchTools } from './search-runtime.js';
 import { createKnowledgeTools } from './knowledge-runtime.js';
 import { createExperienceTools, recallExperienceBlock } from './experience/index.js';
@@ -206,6 +206,7 @@ function toolInputSummary(toolName: string, input: unknown) {
     const dest = value.destPath ? ` → ${String(value.destPath)}` : '';
     return `正在发布到项目空间：${String(value.path || '')}${dest}`;
   }
+  if (toolName === 'register_deliverable') return `正在登记业务交付物：${String(value.path || '')}`;
   if (toolName === 'run_skill_script') return `正在执行脚本：${String(value.path || '')}`;
   if (toolName === 'run_workspace_script') return `正在执行生成脚本：${String(value.path || '')}`;
   if (toolName === 'fetch_skill_url') return `正在访问网络资源：${String(value.url || '')}`;
@@ -218,8 +219,21 @@ function toolInputSummary(toolName: string, input: unknown) {
 
 function toolResultSummary(toolName: string, output: unknown) {
   const value = output && typeof output === 'object' ? output as Record<string, unknown> : {};
-  if (toolName === 'web_search' && value.ok === false) return `联网搜索未完成：${String(value.provider || '')} · ${String(value.durationMs ?? 0)}ms · ${String(value.error || '请求失败')}`;
-  if (value.ok === false) return String(value.error || `${toolName} 未完成。`);
+  const failText = () => String(value.message || value.error || `${toolName} 未完成。`);
+  if (toolName === 'web_search' && value.ok === false) {
+    return `联网搜索未完成：${String(value.provider || '')} · ${String(value.durationMs ?? 0)}ms · ${String(value.error || value.message || '请求失败')}`;
+  }
+  if (toolName === 'save_experience') {
+    return value.ok === false
+      ? `经验保存失败：${failText()}`
+      : `经验已保存${value.merged ? '（已合并近似条目）' : ''}：${String(value.title || value.id || '')}`;
+  }
+  if (toolName === 'load_experience') {
+    if (value.ok === false) return `经验加载失败：${failText()}`;
+    const count = Number(value.count) || 0;
+    return count > 0 ? `已加载 ${count} 条高置信经验。` : '未命中高置信经验（已忽略）。';
+  }
+  if (value.ok === false) return failText();
   if (toolName === 'run_skill_script') return `脚本执行完成（退出码 ${String(value.exitCode ?? 0)}）。`;
   if (toolName === 'run_workspace_script') {
     const artifacts = Array.isArray(value.artifacts) ? value.artifacts.filter((item): item is string => typeof item === 'string') : [];
@@ -232,6 +246,9 @@ function toolResultSummary(toolName: string, output: unknown) {
   if (toolName === 'publish_to_project') {
     return `已发布到项目空间：${String(value.projectPath || value.path || '')}${typeof value.bytes === 'number' ? `（${value.bytes} 字节）` : ''}`;
   }
+  if (toolName === 'register_deliverable') {
+    return `已登记业务交付物：${String(value.path || '')}${typeof value.bytes === 'number' ? `（${value.bytes} 字节）` : ''}`;
+  }
   if (toolName === 'fetch_skill_url') return `已获取网络资源（${String(value.contentType || 'text')}）。`;
   if (toolName === 'web_search') {
     const count = Array.isArray(value.results) ? value.results.length : 0;
@@ -241,16 +258,11 @@ function toolResultSummary(toolName: string, output: unknown) {
   if (toolName === 'load_skill') return `Skill 已加载：${String((value.skill as Record<string, unknown> | undefined)?.name || '')}`;
   if (toolName === 'read_skill_file') return `已读取 Skill 文件：${String(value.path || '')}`;
   if (toolName === 'read_workspace_file') return `已读取运行工作区文件：${String(value.path || '')}`;
-  if (toolName === 'save_experience') {
-    return value.ok === false
-      ? `经验保存失败：${String(value.message || '')}`
-      : `经验已保存${value.merged ? '（已合并近似条目）' : ''}：${String(value.title || value.id || '')}`;
-  }
-  if (toolName === 'load_experience') {
-    const count = Number(value.count) || 0;
-    return count > 0 ? `已加载 ${count} 条高置信经验。` : '未命中高置信经验（已忽略）。';
-  }
   return '工具调用完成。';
+}
+
+function isSoftFailTool(toolName: string) {
+  return toolName === 'save_experience' || toolName === 'load_experience';
 }
 
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
@@ -342,9 +354,9 @@ export async function* streamAgentReply(input: {
         ? 'Agent experience memory is available for this employee only. After a meaningful multi-step success (or a hard-won pitfall), call save_experience with a short structured card (situation/action/pitfall/whenNot). Use load_experience when pivoting to a task that may match prior work. Low-similarity loads return empty—do not invent memories.'
         : '',
       projectRoot
-        ? 'This run is bound to a shared project workspace. Keep intermediate generators and process scripts in the isolated run workspace (write_workspace_file / run_workspace_script). Prefer publish_to_project as soon as a user-facing deliverable is ready (HTML/CSS/JS/Markdown/images/data) so it appears in the project file tree mid-run. At run end the platform also auto-promotes remaining deliverables from the run workspace into the project tree.'
+        ? 'This run is bound to a shared project workspace. Keep generators under the run workspace (prefer scripts/). Put finished business products under output/ (or write_workspace_file with deliverable=true / register_deliverable). Prefer publish_to_project for each finished output/ file so it appears in the project tree mid-run; end-of-run auto-promotes remaining output/ files.'
         : '',
-      'Use load_skill only for a relevant authorized Skill. The platform harness `opcai-workspace` is pre-authorized for this run: use skillId `opcai-workspace` for write_workspace_file, run_workspace_script, install_python_dependency, and publish_to_project (when a project workspace is bound) when the run permission tier allows. Skill files are read-only. Generated process files belong in the isolated run workspace; project deliverables should be published (or will be auto-promoted at run end). Default work permission allows workspace writes, script execution, and isolated Python dependency installation through that harness. Direct network access is capability-gated; never claim an operation ran unless its tool returned a successful result. After load_skill, only read or execute paths explicitly returned in its files list; never guess a filename from an instruction example. For artifact requests (for example PDFs, reports, code, or data files), do not stop at a plan or ask avoidable follow-up questions. When writing websites or large codebases: (1) keep each write_workspace_file body under ~8KB, (2) split CSS/JS/HTML into multiple files or use mode "append" / chunks, (3) ship the critical HTML pages before polish, (4) if a write fails with JSON/parse/input errors, immediately retry with a much smaller chunk—never paste the same huge payload again, (5) after the deliverable is ready in the run workspace and a project is bound, call publish_to_project for each final asset (auto-promote also runs at the end). If the Skill documents a creation workflow but has no generator script, write a minimal generator script to the run workspace and invoke run_workspace_script with skillId `opcai-workspace`. If a Python dependency such as reportlab is required, use install_python_dependency before executing. Use reasonable defaults for non-critical details. If a required permission, script, dependency, or output path is unavailable, state the exact blocker and the one next user action in the final answer.',
+      'Use load_skill only for a relevant authorized Skill. The platform harness `opcai-workspace` is pre-authorized for this run: use skillId `opcai-workspace` for write_workspace_file, run_workspace_script, register_deliverable, install_python_dependency, and publish_to_project (when a project workspace is bound) when the run permission tier allows. Skill files are read-only. Process files (generators, caches) stay outside output/ and are never archived. Finished business deliverables MUST be under output/ — write there directly, pass deliverable=true, or call register_deliverable (this allows final .py/.js products without mistaking them for tooling). Scripts should write finals to output/<name>; the platform also stages accidental root documents (pdf/html/…) into output/ after script runs. Default work permission allows workspace writes, script execution, and isolated Python dependency installation. Direct network access is capability-gated; never claim an operation ran unless its tool returned a successful result. After load_skill, only read or execute paths explicitly returned in its files list. For artifact requests (PDFs, reports, code packages, data files), do not stop at a plan: produce the file under output/. When writing websites or large codebases: (1) keep each write_workspace_file body under ~8KB, (2) split CSS/JS/HTML or use mode "append" / chunks, (3) ship critical pages under output/ before polish, (4) on JSON/parse write failures retry with a much smaller chunk, (5) if a project is bound, publish_to_project each output/ asset (auto-promote also runs at the end). If a Skill needs a generator but has none, write a minimal script outside output/ (e.g. scripts/generate.py) and run it with run_workspace_script; use install_python_dependency when needed. Use reasonable defaults for non-critical details. If a required permission, script, dependency, or output path is unavailable, state the exact blocker and the one next user action.',
     ].filter(Boolean).join('\n\n');
     const model = languageModel(input.model);
     const providerOptions = streamProviderOptions(input.model);
@@ -375,6 +387,13 @@ export async function* streamAgentReply(input: {
     });
     let emittedText = false;
     let lastToolSucceeded: boolean | undefined;
+    const emittedArtifactPaths = new Set<string>();
+    const pushDeliverable = function* (rawPath: string): Generator<AgentEvent> {
+      const normalized = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!isBusinessDeliverablePath(normalized) || emittedArtifactPaths.has(normalized)) return;
+      emittedArtifactPaths.add(normalized);
+      yield { type: 'artifact.created', runId, path: normalized };
+    };
     for await (const part of result.fullStream) {
       if (abortSignal.aborted) break;
       if (part.type === 'text-delta') { emittedText = true; yield { type: 'message.delta', runId, text: part.text }; }
@@ -389,25 +408,26 @@ export async function* streamAgentReply(input: {
             yield { type: 'tool.approval_required', runId, skillId: approval.skillId, capability, summary: toolResultSummary(part.toolName, output) };
           }
         }
-        const ok = !(output && typeof output === 'object' && (output as Record<string, unknown>).ok === false);
-        lastToolSucceeded = ok;
+        const logicalOk = !(output && typeof output === 'object' && (output as Record<string, unknown>).ok === false);
+        const ok = logicalOk || isSoftFailTool(part.toolName);
+        lastToolSucceeded = logicalOk;
         yield { type: 'tool.completed', runId, toolName: part.toolName, summary: toolResultSummary(part.toolName, output), ok };
-        if (ok && (part.toolName === 'run_workspace_script' || part.toolName === 'run_skill_script') && output && typeof output === 'object') {
+        if (logicalOk && (part.toolName === 'run_workspace_script' || part.toolName === 'run_skill_script') && output && typeof output === 'object') {
           const artifacts = (output as Record<string, unknown>).artifacts;
-          if (Array.isArray(artifacts)) for (const artifact of artifacts) if (typeof artifact === 'string') yield { type: 'artifact.created', runId, path: artifact };
+          if (Array.isArray(artifacts)) for (const artifact of artifacts) if (typeof artifact === 'string') yield* pushDeliverable(artifact);
         }
-        if (ok && part.toolName === 'write_workspace_file' && output && typeof output === 'object') {
-          const artifact = (output as Record<string, unknown>).path;
-          if (typeof artifact === 'string' && !/\.(sh|js|mjs|cjs|py)$/i.test(artifact)) yield { type: 'artifact.created', runId, path: artifact };
+        if (logicalOk && (part.toolName === 'write_workspace_file' || part.toolName === 'register_deliverable') && output && typeof output === 'object') {
+          const value = output as Record<string, unknown>;
+          if (value.deliverable === true && typeof value.path === 'string') yield* pushDeliverable(value.path);
         }
-        if (ok && part.toolName === 'publish_to_project' && output && typeof output === 'object') {
+        if (logicalOk && part.toolName === 'publish_to_project' && output && typeof output === 'object') {
           const value = output as Record<string, unknown>;
           if (typeof value.path === 'string' && typeof value.projectPath === 'string') {
             yield { type: 'project.file.published', runId, path: value.path, projectPath: value.projectPath };
-            yield { type: 'artifact.created', runId, path: value.projectPath };
+            yield* pushDeliverable(value.path);
           }
         }
-        if (ok && part.toolName === 'web_search' && output && typeof output === 'object') {
+        if (logicalOk && part.toolName === 'web_search' && output && typeof output === 'object') {
           const value = output as Record<string, unknown>; const sources = Array.isArray(value.sources) ? value.sources.filter((item): item is { title: string; url: string; source?: string } => Boolean(item && typeof item === 'object' && typeof (item as any).title === 'string' && typeof (item as any).url === 'string')).slice(0, 10) : [];
           if (sources.length) yield { type: 'search.sources', runId, provider: String(value.provider || ''), sources };
         }
@@ -435,7 +455,7 @@ export async function* streamAgentReply(input: {
       return;
     }
     if (!emittedText && lastToolSucceeded !== undefined) yield { type: 'message.delta', runId, text: lastToolSucceeded ? '工具调用已完成。请查看上方执行记录和运行工作区产物。' : '工具未能完成请求；请查看上方执行记录中的权限或输入原因。' };
-    // Auto-promote deliverables so the project file tree is filled even when the
+    // Auto-promote deliverables under output/ so the project file tree is filled even when the
     // model never called publish_to_project (or only published a subset).
     if (projectRoot) {
       const workspaceRoot = path.join(
@@ -445,7 +465,7 @@ export async function* streamAgentReply(input: {
       const published = await promoteWorkspaceDeliverablesToProject(workspaceRoot, projectRoot);
       for (const item of published) {
         yield { type: 'project.file.published', runId, path: item.path, projectPath: item.projectPath };
-        yield { type: 'artifact.created', runId, path: item.projectPath };
+        yield* pushDeliverable(item.path);
       }
     }
     yield { type: 'run.completed', runId };
