@@ -14,7 +14,7 @@ export interface RuntimeSkill {
 }
 
 export interface ToolActivity { toolName: string; summary: string; status: 'running' | 'completed' | 'failed'; }
-export interface ToolApproval { skillId: string; capability: 'workspace-write' | 'script-execution' | 'network-access'; summary: string; }
+export interface ToolApproval { skillId: string; capability: 'workspace-write' | 'script-execution' | 'network-access'; summary: string; /** Server-side approval id when originating from /api/orch sessions. */ id?: string; }
 export interface GeneratedArtifact { runId: string; path: string; }
 export interface SearchSource { title: string; url: string; source?: string; }
 export type McpConnectionPayload =

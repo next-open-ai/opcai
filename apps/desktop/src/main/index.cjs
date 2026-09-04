@@ -23,6 +23,7 @@ protocol.registerSchemesAsPrivileged([
 const apiPort = Number(process.env.OPCAI_API_PORT || 4318);
 let mainWindow;
 let apiProcess;
+let gatewayProcess = null;
 let database;
 const storageRoot = () => path.join(app.getPath('home'), '.opcai');
 const databaseFile = () => path.join(storageRoot(), 'opcai.sqlite');
@@ -405,6 +406,107 @@ function writeSearchConfig(value) {
   setStoredValue('search-settings', JSON.stringify(persisted)); return config;
 }
 
+/* ------------------------------------------------------------------ *
+ * M2: channel/connection settings (P1)
+ * Meta (enabled/allowlist/defaults) → orchestrator KV channels.v1.
+ * Secrets (tokens) → main-process sql.js key settings.channels.v1
+ * encrypted via safeStorage; released to children only over fork IPC.
+ * ------------------------------------------------------------------ */
+
+function channelEncrypt(value) {
+  if (!value) return '';
+  return safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(String(value)).toString('base64') : String(value);
+}
+function channelDecrypt(encoded) {
+  if (!encoded) return '';
+  try {
+    return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(Buffer.from(String(encoded), 'base64')) : String(encoded);
+  } catch (_) { return String(encoded || ''); }
+}
+
+function readChannelSecrets() {
+  try {
+    const raw = JSON.parse(getStoredValue('settings.channels.v1') || '{}');
+    const secrets = raw?.secrets && typeof raw.secrets === 'object' ? raw.secrets : {};
+    return {
+      telegram: { botToken: channelDecrypt(secrets.telegram?.botToken) },
+      feishu: { appSecret: channelDecrypt(secrets.feishu?.appSecret) },
+      relay: { token: channelDecrypt(secrets.relay?.token) },
+    };
+  } catch (_) {
+    return { telegram: { botToken: '' }, feishu: { appSecret: '' }, relay: { token: '' } };
+  }
+}
+
+function writeChannelSecrets(tokens) {
+  const secrets = {
+    telegram: { botToken: channelEncrypt(tokens?.telegram?.botToken) },
+    feishu: { appSecret: channelEncrypt(tokens?.feishu?.appSecret) },
+    relay: { token: channelEncrypt(tokens?.relay?.token) },
+  };
+  setStoredValue('settings.channels.v1', JSON.stringify({ version: 1, secrets, updatedAt: Date.now() }));
+}
+
+function cleanChannelMeta(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const channels = source.channels && typeof source.channels === 'object' ? source.channels : {};
+  const cleanChannels = {};
+  for (const id of ['telegram', 'feishu', 'relay']) {
+    const entry = channels[id] && typeof channels[id] === 'object' ? channels[id] : {};
+    cleanChannels[id] = { enabled: Boolean(entry.enabled) };
+  }
+  const allowlist = Array.isArray(source.allowlist) ? source.allowlist.map((entry) => String(entry).trim()).filter(Boolean) : [];
+  return {
+    version: 1,
+    defaultEmployeeId: String(source.defaultEmployeeId || 'general'),
+    channels: cleanChannels,
+    ...(allowlist.length ? { allowlist } : {}),
+  };
+}
+
+async function getChannelSettings() {
+  let meta = {};
+  try {
+    const raw = await apiKvGet('channels.v1');
+    meta = raw ? JSON.parse(raw) : {};
+  } catch { /* not configured */ }
+  return { meta, secrets: readChannelSecrets() };
+}
+
+async function saveChannelSettings(payload) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const meta = cleanChannelMeta(source.meta);
+  const secretsIn = source.secrets && typeof source.secrets === 'object' ? source.secrets : {};
+  const hasSecret = Boolean(
+    secretsIn.telegram?.botToken || secretsIn.feishu?.appSecret || secretsIn.relay?.token,
+  );
+  if (hasSecret) {
+    writeChannelSecrets({
+      telegram: { botToken: secretsIn.telegram?.botToken },
+      feishu: { appSecret: secretsIn.feishu?.appSecret },
+      relay: { token: secretsIn.relay?.token },
+    });
+  }
+  await apiKvSet('channels.v1', JSON.stringify(meta));
+  return { ok: true, meta };
+}
+
+function gatewayStatus() {
+  return {
+    running: Boolean(gatewayProcess && !gatewayProcess.killed && gatewayProcess.exitCode === null),
+    pid: gatewayProcess && !gatewayProcess.killed ? gatewayProcess.pid : null,
+  };
+}
+
+async function gatewayRestart() {
+  if (gatewayProcess && !gatewayProcess.killed) {
+    gatewayProcess.kill('SIGTERM');
+    gatewayProcess = null;
+  }
+  await startGatewayIfEnabled().catch((error) => console.warn('[gateway] restart failed:', error));
+  return gatewayStatus();
+}
+
 async function testProviderConnection(value) {
   const type = String(value?.type || '');
   const baseUrl = String(value?.baseUrl || '').trim();
@@ -683,12 +785,67 @@ function apiEntry() {
     : path.resolve(__dirname, '../../../api/dist/main.cjs');
 }
 
+const orchestratorApiBase = () => `http://127.0.0.1:${apiPort}/api/orch`;
+
+/**
+ * M0 domain-storage unification: the API process is the single writer of
+ * domain KV (employees/skills/policies/sessions/projects/...). The renderer's
+ * existing `storageGet/storageSet` IPC handlers are forwarded to the
+ * orchestrator's KV endpoint; secrets (model/search settings) stay in the
+ * main-process store behind safeStorage and are never migrated.
+ */
+async function apiKvGet(key) {
+  try {
+    const response = await fetch(`${orchestratorApiBase()}/kv?key=${encodeURIComponent(String(key))}`, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) return null;
+    const body = await response.json();
+    return body?.value ?? null;
+  } catch {
+    return getStoredValue(String(key)); // degrade to the legacy sql.js store
+  }
+}
+
+async function apiKvSet(key, value) {
+  try {
+    const response = await fetch(`${orchestratorApiBase()}/kv`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key: String(key), value: String(value) }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) throw new Error(`orchestrator kv ${response.status}`);
+  } catch {
+    setStoredValue(String(key), String(value)); // degrade to the legacy sql.js store
+  }
+}
+
+async function migrateDomainKvToApi() {
+  const marker = 'kv.api.migrated.v1';
+  if (getStoredValue(marker)) return 0;
+  const rows = database.exec('SELECT key, value FROM app_kv');
+  const skip = new Set(['model-settings', 'search-settings']);
+  let migrated = 0;
+  for (const row of rows[0]?.values || []) {
+    const key = String(row[0]);
+    const value = String(row[1] ?? '');
+    if (skip.has(key)) continue;
+    const existing = await apiKvGet(key);
+    if (existing == null) {
+      await apiKvSet(key, value);
+      migrated += 1;
+    }
+  }
+  setStoredValue(marker, String(Date.now()));
+  return migrated;
+}
+
 function startApi() {
   apiProcess = fork(apiEntry(), [], {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1',
       OPCAI_API_PORT: String(apiPort),
+      OPCAI_DATA_DIR: storageRoot(),
       OPCAI_SKILLS_DIR: path.join(storageRoot(), 'skills'),
       OPCAI_WORKSPACES_DIR: path.join(storageRoot(), 'workspaces'),
       OPCAI_KNOWLEDGE_DIR: path.join(storageRoot(), 'knowledge'),
@@ -698,6 +855,57 @@ function startApi() {
       ...(app.isPackaged ? { NODE_PATH: path.join(process.resourcesPath, 'api', 'node_deps') } : {}),
     },
     stdio: 'inherit',
+  });
+  // M0 keyring: the child requests a one-time decrypted snapshot of model and
+  // search provider settings over the fork IPC channel. Never persisted.
+  apiProcess.on('message', (message) => {
+    if (!message || typeof message !== 'object') return;
+    const payload = /** @type {{type?: string}} */ (message);
+    if (payload.type !== 'opcai:secrets:request') return;
+    apiProcess.send?.({
+      type: 'opcai:secrets',
+      payload: { model: readModelConfig(), search: readSearchConfig() },
+    });
+  });
+}
+
+function gatewayEntry() {
+  // M1 channel gateway child (apps/gateway). Packaged layout is staged later.
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'gateway', 'main.js')
+    : path.resolve(__dirname, '../../../gateway/dist/main.js');
+}
+
+/** Forks the gateway child when channels.v1 has any enabled channel. */
+async function startGatewayIfEnabled() {
+  let config = null;
+  try {
+    const raw = await apiKvGet('channels.v1');
+    config = raw ? JSON.parse(raw) : null;
+  } catch { /* not configured yet */ }
+  const channels = config?.channels && typeof config.channels === 'object' ? config.channels : {};
+  const enabled = Object.values(channels).some((entry) => Boolean(entry && entry.enabled));
+  if (!enabled) {
+    console.log('[gateway] disabled (no enabled channel in channels.v1)');
+    return;
+  }
+  gatewayProcess = fork(gatewayEntry(), [], {
+    env: {
+      ...process.env,
+      OPCAI_API_URL: `http://127.0.0.1:${apiPort}/api/orch`,
+    },
+    stdio: 'inherit',
+  });
+  console.log(`[gateway] started pid ${gatewayProcess.pid}`);
+  // M2: release decrypted channel credentials to the gateway child on demand.
+  gatewayProcess.on('message', (message) => {
+    if (!message || typeof message !== 'object') return;
+    const payload = /** @type {{type?: string}} */ (message);
+    if (payload.type !== 'opcai:channels:secrets:request') return;
+    gatewayProcess.send?.({
+      type: 'opcai:channels:secrets',
+      payload: { channels: readChannelSecrets() },
+    });
   });
 }
 
@@ -843,8 +1051,12 @@ app.whenReady().then(async () => {
     const payload = await response.json();
     return String(payload.status || 'success');
   });
-  ipcMain.handle('opcai:storage-get', (_, key) => getStoredValue(String(key)));
-  ipcMain.handle('opcai:storage-set', (_, key, value) => { setStoredValue(String(key), String(value)); });
+  ipcMain.handle('opcai:storage-get', async (_, key) => apiKvGet(key));
+  ipcMain.handle('opcai:storage-set', async (_, key, value) => { await apiKvSet(key, value); });
+  ipcMain.handle('opcai:get-channel-settings', () => getChannelSettings());
+  ipcMain.handle('opcai:save-channel-settings', async (_, payload) => saveChannelSettings(payload));
+  ipcMain.handle('opcai:gateway-status', () => gatewayStatus());
+  ipcMain.handle('opcai:gateway-restart', () => gatewayRestart());
   ipcMain.handle('opcai:list-assets', () => listAssets());
   ipcMain.handle('opcai:archive-artifact', (_, value) => archiveArtifact(value));
   ipcMain.handle('opcai:link-assets-to-project', (_, value) => linkAssetsToProject(value));
@@ -857,9 +1069,16 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle('opcai:reveal-asset', (_, assetId) => { const { target } = assetFile(assetId); shell.showItemInFolder(target); });
+  // One-time one-way seed of legacy sql.js domain keys into the orchestrator
+  // store (only keys the orchestrator does not already have). Runs after the
+  // local API is reachable so renderer stores and the gateway see one state.
+  await waitForApi().catch(() => { /* fall back to legacy sql.js forwarding */ });
+  const migratedCount = await migrateDomainKvToApi().catch(() => 0);
+  if (migratedCount > 0) console.log(`[orch] migrated ${migratedCount} legacy domain keys`);
+  await startGatewayIfEnabled().catch((error) => console.warn('[gateway] start failed:', error));
   await createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) void createWindow(); });
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => apiProcess?.kill('SIGTERM'));
+app.on('before-quit', () => { apiProcess?.kill('SIGTERM'); gatewayProcess?.kill('SIGTERM'); });

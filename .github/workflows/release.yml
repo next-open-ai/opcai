@@ -14,9 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS: Apple Silicon 与 Intel 各一个原生 runner（macos-14 为 arm64、
+          # macos-13 为 Intel x64），产出两个 .dmg。
           - os: macos-14
             artifact: macos-arm64
             arch: arm64
+            expected_extension: dmg
+            max_package_mb: 200
+          - os: macos-13
+            artifact: macos-intel
+            arch: x64
             expected_extension: dmg
             max_package_mb: 200
           - os: windows-latest
@@ -24,7 +31,7 @@ jobs:
             arch: x64
             expected_extension: exe
             max_package_mb: 220
-          # Linux 发布暂时停用；恢复时同时把发布阶段的资产数量校验改回 3。
+          # Linux 发布暂时停用；恢复时同时把发布阶段的资产数量校验改回 4。
           # - os: ubuntu-latest
           #   artifact: linux-x64
           #   arch: x64
@@ -85,7 +92,8 @@ jobs:
         run: |
           mkdir publish-assets
           find release-assets -type f \( -name '*.dmg' -o -name '*.exe' \) -exec cp {} publish-assets/ \;
-          test "$(find publish-assets -type f | wc -l)" -eq 2
+          # 3 个安装包：macOS Apple Silicon .dmg、macOS Intel .dmg、Windows x64 .exe
+          test "$(find publish-assets -type f | wc -l)" -eq 3
           cd publish-assets
           shasum -a 256 * > checksums-sha256.txt
       - name: Create GitHub Release and upload final installers

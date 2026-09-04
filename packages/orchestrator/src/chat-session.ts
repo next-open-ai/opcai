@@ -1,0 +1,336 @@
+import { randomUUID } from 'node:crypto';
+import type { ChatRequest } from '@opcai/contracts';
+import type { EventHub, HubListener } from './hub.js';
+import { deleteKey, listJsonIds, readJson, writeJson } from './repo.js';
+import type { OrcEvent } from './run-engine.js';
+import { RunEngine } from './run-engine.js';
+import type { KeyValueStore } from './storage/kv.js';
+import { namespaceKey } from './storage/kv.js';
+import type { ChatMessage, ChatSession, GrantCapability, RunRecord } from './types.js';
+
+export const SESSION_KEY_PREFIX = 'sessions:';
+const SESSION_NS = 'sessions';
+const RUN_NS = 'run';
+
+/**
+ * A full run request minus its message history. The caller (desktop UI or a
+ * gateway) supplies resolved runtime context (employee profile, model, skill
+ * runtime payloads, providers). Secrets never cross the persistence boundary.
+ */
+export type ChatRunContext = Omit<ChatRequest, 'messages'>;
+
+export interface ChatSessionServiceOptions {
+  store: KeyValueStore;
+  hub: EventHub<OrcEvent>;
+  engine: RunEngine;
+  /**
+   * Server-side run-context assembly fallback for chat messages / approval
+   * resumes when the caller sends no `context` (remote gateway, desktop in
+   * server-backed mode). Resolves for the session's employee; null → the
+   * caller sees a clear "model not configured" style error.
+   */
+  contextResolver?: (employeeId: string) => ChatRunContext | null | Promise<ChatRunContext | null>;
+}
+
+export interface SendUserMessageInput {
+  content: string;
+  /** Resolved runtime context; when omitted the service uses its resolver. */
+  context?: ChatRunContext;
+  /** Override the session employee recorded with the message. */
+  employeeId?: string;
+}
+
+export interface ResolveApprovalInput {
+  sessionId: string;
+  approvalId: string;
+  allow: boolean;
+  scope?: 'session' | 'always';
+  /** Required to resume a waiting-approval run (fresh resolved runtime). */
+  resumeContext?: ChatRunContext;
+}
+
+const FALLBACK_EMPTY_REPLY = '（本轮未返回文本。可重试，或检查模型 / MCP 是否正常。）';
+
+export class ChatSessionService {
+  private readonly store: KeyValueStore;
+  private readonly hub: EventHub<OrcEvent>;
+  private readonly engine: RunEngine;
+  private readonly contextResolver?: ChatSessionServiceOptions['contextResolver'];
+  /** Active run aborts per session (one run at a time, mirroring the UI). */
+  private readonly activeAborts = new Map<string, AbortController>();
+  private readonly runAttempts = new Map<string, number>();
+
+  constructor(options: ChatSessionServiceOptions) {
+    this.store = options.store;
+    this.hub = options.hub;
+    this.engine = options.engine;
+    this.contextResolver = options.contextResolver;
+  }
+
+  /** Resolve a run context for an employee (caller payload first, else resolver). */
+  private async resolveContextFor(employeeId: string, explicit?: ChatRunContext): Promise<ChatRunContext | null> {
+    if (explicit) return explicit;
+    if (!this.contextResolver) return null;
+    try {
+      return (await this.contextResolver(employeeId)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private sessionKey(id: string): string {
+    return namespaceKey(SESSION_NS, id);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Session CRUD
+   * ------------------------------------------------------------------ */
+
+  async createChatSession(input: { title?: string; employeeId?: string; channelBinding?: ChatSession['channelBinding'] } = {}): Promise<ChatSession> {
+    const now = Date.now();
+    const session: ChatSession = {
+      id: randomUUID(),
+      kind: 'chat',
+      title: input.title?.trim() ? input.title.trim().slice(0, 80) : '新对话',
+      employeeId: input.employeeId ?? 'general',
+      messages: [],
+      grantsSession: {},
+      grantsAlways: {},
+      channelBinding: input.channelBinding ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await this.saveSession(session);
+    return session;
+  }
+
+  async getChatSession(id: string): Promise<ChatSession | null> {
+    return readJson<ChatSession>(this.store, this.sessionKey(id));
+  }
+
+  async listChatSessions(): Promise<ChatSession[]> {
+    const ids = await listJsonIds(this.store, SESSION_KEY_PREFIX);
+    const sessions: ChatSession[] = [];
+    for (const id of ids) {
+      const session = await this.getChatSession(id);
+      if (session) sessions.push(session);
+    }
+    return sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  async deleteChatSession(id: string): Promise<void> {
+    const session = await this.getChatSession(id);
+    if (!session) return;
+    await deleteKey(this.store, this.sessionKey(id));
+    for (const message of session.messages) {
+      if (message.runId) await deleteKey(this.store, namespaceKey(RUN_NS, message.runId));
+    }
+    this.hub.publish(`session:${id}`, { type: 'session.deleted', sessionId: id });
+  }
+
+  async getRun(runId: string): Promise<RunRecord | null> {
+    return this.engine.load(runId);
+  }
+
+  /** Canonical conversation view (superseded attempts of a turn are hidden). */
+  messagesOf(session: ChatSession): ChatMessage[] {
+    return session.messages.filter((message) => !message.superseded);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Messaging / runs
+   * ------------------------------------------------------------------ */
+
+  /**
+   * Append a user message and execute a run for it. Any active run in the
+   * same session is aborted first (same semantics as the desktop chat).
+   */
+  async sendUserMessage(sessionId: string, input: SendUserMessageInput): Promise<{ runId: string; turnId: string; attemptNo: number }> {
+    const session = await this.getChatSession(sessionId);
+    if (!session) throw new Error('Chat session not found.');
+
+    const text = input.content.trim();
+    if (!text) throw new Error('Message content is empty.');
+
+    const previous = this.activeAborts.get(sessionId);
+    if (previous && !previous.signal.aborted) previous.abort();
+    const abort = new AbortController();
+    this.activeAborts.set(sessionId, abort);
+
+    const turnId = randomUUID();
+    const runId = randomUUID();
+    const now = Date.now();
+    const userMessage: ChatMessage = { id: randomUUID(), role: 'user', content: text, createdAt: now, turnId };
+    const assistantMessage: ChatMessage = { id: randomUUID(), role: 'assistant', content: '', createdAt: now, turnId, runId };
+    const attemptNo = 1;
+
+    session.employeeId = input.employeeId ?? session.employeeId;
+    const employeeId = input.employeeId ?? session.employeeId;
+    const runContext = await this.resolveContextFor(employeeId, input.context);
+    if (!runContext) {
+      throw new Error('缺少运行上下文（模型/Skill 配置）。请先在桌面端配置模型。');
+    }
+    session.messages.push(userMessage, assistantMessage);
+    if (session.title === '新对话') session.title = text.slice(0, 28);
+    await this.saveSession(session);
+
+    const request = this.requestForTurn(session, runContext, turnId);
+    void this.settleRun(session.id, runId, turnId, attemptNo, request, assistantMessage.id, abort.signal);
+    return { runId, turnId, attemptNo };
+  }
+
+  async abortActiveRun(sessionId: string): Promise<boolean> {
+    const abort = this.activeAborts.get(sessionId);
+    if (!abort || abort.signal.aborted) return false;
+    abort.abort();
+    return true;
+  }
+
+  /** Build a ChatRequest for a turn: context + canonical history up to the turn. */
+  private requestForTurn(session: ChatSession, context: ChatRunContext, turnId: string): ChatRequest {
+    const history = this.messagesOf(session)
+      .filter((message) => message.turnId !== turnId || message.role === 'user')
+      .filter((message) => message.content.trim().length > 0)
+      .map((message) => ({ role: message.role as 'user' | 'assistant', content: message.content }));
+    return { ...context, messages: history };
+  }
+
+  private async settleRun(sessionId: string, runId: string, turnId: string, attemptNo: number, request: ChatRequest, assistantMessageId: string, signal: AbortSignal) {
+    try {
+      const run = await this.engine.execute({ runId, sessionId, kind: 'chat', turnId, attemptNo, request, signal });
+      const session = await this.getChatSession(sessionId);
+      if (!session) return;
+      const message = session.messages.find((item) => item.id === assistantMessageId);
+      if (message) {
+        // Supersede older assistant attempts of the same turn.
+        for (const other of session.messages) {
+          if (other.role === 'assistant' && other.turnId === turnId && other.id !== message.id && !other.superseded) other.superseded = true;
+        }
+        const text = run.transcript.trim();
+        if (text) message.content = text;
+        else if (run.status === 'cancelled') message.content = `⏹ ${run.error ?? '已中止当前执行。'}`;
+        else if (run.status === 'failed') message.content = `⚠ ${run.error ?? 'Model request failed.'}`;
+        else if (run.status !== 'waiting-approval') message.content = FALLBACK_EMPTY_REPLY;
+        message.runId = run.id;
+      }
+      session.updatedAt = Date.now();
+      await this.saveSession(session);
+    } finally {
+      if (this.activeAborts.get(sessionId)?.signal === signal) this.activeAborts.delete(sessionId);
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Approvals (resumable-run semantics)
+   * ------------------------------------------------------------------ */
+
+  /** Runs of this session that are parked waiting for approval. */
+  async pendingApprovals(sessionId: string): Promise<RunRecord[]> {
+    const session = await this.getChatSession(sessionId);
+    if (!session) return [];
+    const runs: RunRecord[] = [];
+    for (const message of session.messages) {
+      if (!message.runId) continue;
+      const run = await this.engine.load(message.runId);
+      if (run && run.status === 'waiting-approval' && run.approvals.some((approval) => approval.status === 'pending') && !runs.some((item) => item.id === run.id)) {
+        runs.push(run);
+      }
+    }
+    return runs;
+  }
+
+  /**
+   * Decide a pending approval. When allowed with `resumeContext`, the same
+   * turn is re-run as a fresh attempt with the grant applied — the durable
+   * equivalent of the desktop UI's approve-and-retry.
+   */
+  async resolveApproval(input: ResolveApprovalInput): Promise<{ run: RunRecord | null; resumedRunId?: string; turnId?: string }> {
+    const session = await this.getChatSession(input.sessionId);
+    if (!session) throw new Error('Chat session not found.');
+
+    const waiting = await this.findWaitingRun(session, input.approvalId);
+    if (!waiting) throw new Error('Approval is not pending.');
+
+    const approval = waiting.approvals.find((item) => item.id === input.approvalId);
+    await this.engine.decideApproval(waiting.id, input.approvalId, { allow: input.allow, scope: input.scope });
+    if (input.allow && approval) this.applyGrant(session, approval.skillId, approval.capability, input.scope ?? 'session');
+
+    // Allowed but no explicit resume payload: fall back to the server-side
+    // context resolver so a remote/desktop client can approve with no secrets.
+    const resumeContext = input.resumeContext ?? (await this.resolveContextFor(session.employeeId));
+    if (!input.allow || !resumeContext) {
+      await this.saveSession(session);
+      return { run: waiting };
+    }
+
+    const turnId = waiting.turnId;
+    if (!turnId) {
+      await this.saveSession(session);
+      return { run: waiting };
+    }
+    const userMessage = this.messagesOf(session)
+      .filter((message) => message.role === 'user' && message.turnId === turnId)
+      .at(-1);
+    if (!userMessage) {
+      await this.saveSession(session);
+      return { run: waiting };
+    }
+
+    const previous = this.activeAborts.get(session.id);
+    if (previous && !previous.signal.aborted) previous.abort();
+    const abort = new AbortController();
+    this.activeAborts.set(session.id, abort);
+
+    const attemptNo = waiting.attemptNo + 1;
+    const resumedRunId = randomUUID();
+    const assistantId = this.assistantForTurn(session, turnId, resumedRunId);
+    const request = this.requestForTurn(session, resumeContext, turnId);
+    void this.settleRun(session.id, resumedRunId, turnId, attemptNo, request, assistantId, abort.signal);
+    await this.saveSession(session);
+    return { run: waiting, resumedRunId, turnId };
+  }
+
+  /** Record a grant on the session (session-scoped or always-scoped). */
+  private applyGrant(session: ChatSession, skillId: string, capability: GrantCapability, scope: 'session' | 'always') {
+    const target = scope === 'always' ? session.grantsAlways : session.grantsSession;
+    const list = target[skillId] ?? [];
+    if (!list.includes(capability)) list.push(capability);
+    target[skillId] = list;
+  }
+
+  private async findWaitingRun(session: ChatSession, approvalId: string): Promise<RunRecord | null> {
+    for (const message of session.messages) {
+      if (!message.runId) continue;
+      const run = await this.engine.load(message.runId);
+      if (run && run.approvals.some((approval) => approval.id === approvalId && approval.status === 'pending')) return run;
+    }
+    return null;
+  }
+
+  /** Reuse the turn's assistant placeholder for the resumed attempt. */
+  private assistantForTurn(session: ChatSession, turnId: string, runId: string): string {
+    const existing = session.messages.find((message) => message.role === 'assistant' && message.turnId === turnId && !message.superseded);
+    if (existing) {
+      existing.runId = runId;
+      existing.content = '';
+      return existing.id;
+    }
+    const id = randomUUID();
+    session.messages.push({ id, role: 'assistant', content: '', createdAt: Date.now(), turnId, runId });
+    return id;
+  }
+
+  private async saveSession(session: ChatSession): Promise<void> {
+    session.updatedAt = Date.now();
+    await writeJson(this.store, this.sessionKey(session.id), session);
+    this.hub.publish(`session:${session.id}`, { type: 'session.updated', sessionId: session.id });
+  }
+
+  /** Watch every orchestration event published on a session's topic. */
+  subscribe(sessionId: string, listener: HubListener<OrcEvent>): () => void {
+    return this.hub.subscribe(`session:${sessionId}`, listener);
+  }
+}
+
+/** Run records kept reachable from the session for engine bookkeeping. */
+export { RUN_NS };

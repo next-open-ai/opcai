@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue';
 import { streamChat, type RuntimeSkill, type ToolActivity, type ToolApproval, type SearchSource } from '../services/api.js';
+import * as orch from '../services/orchestration.js';
 import type { ProviderConfig } from './model-config.js';
 import { toModelPayload, useModelConfig } from './model-config.js';
 import { useSearchConfig } from './search-config.js';
@@ -22,11 +23,11 @@ import {
 } from './employees.js';
 
 export type { Employee, EmployeeDraft, EmployeeId } from './employees.js';
-export type View = 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'assets' | 'automations' | 'projects' | 'settings';
+export type View = 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'assets' | 'automations' | 'projects' | 'remote' | 'settings';
 export type CollaborationDelivery = 'synthesize' | 'direct';
 export interface CollaborationRun { employeeId: EmployeeId; task: string; status: 'running' | 'completed' | 'failed'; summary: string; activities: ToolActivity[]; error?: string; }
 export interface Message { id: string; role: 'user' | 'assistant'; content: string; activities?: ToolActivity[]; approvals?: ToolApproval[]; assets?: Asset[]; sources?: Array<SearchSource & { provider: string }>; collaborations?: CollaborationRun[]; collaborationDelivery?: CollaborationDelivery; }
-export interface Conversation { id: string; title: string; employeeId: EmployeeId; messages: Message[]; updatedAt: number; }
+export interface Conversation { id: string; title: string; employeeId: EmployeeId; messages: Message[]; updatedAt: number; serverSessionId?: string; }
 export interface ProjectTaskDraft { title: string; objective: string; employeeId: EmployeeId; skillIds: string[]; }
 export interface ProjectTaskTranscript { assistantContent: string; activities: ToolActivity[]; approvals: ToolApproval[]; assets: Array<{ id: string; name: string; sizeBytes: number; runId?: string }>; runId?: string; }
 
@@ -91,6 +92,8 @@ function collaboratorFocus(employee: Employee) {
 }
 
 async function persist() { await writeStored('workspace.conversations', JSON.stringify(conversations.value)); }
+/** Set inside useWorkspace() once server-backed chat helpers exist. */
+let hydrateServerHook: (() => Promise<void>) | null = null;
 async function load() {
   await catalog.load();
   try { conversations.value = JSON.parse((await readStored('workspace.conversations')) ?? '[]') as Conversation[]; } catch { conversations.value = []; }
@@ -99,6 +102,7 @@ async function load() {
   else if (!employees.value.some((item) => item.id === currentEmployeeId.value)) currentEmployeeId.value = employees.value[0]?.id ?? 'general';
   activeConversationId.value = conversations.value[0]?.id ?? null;
   permissionTierByEmployee.value = parsePermissionTiers(await readStored('workspace.permission-tiers'));
+  await hydrateServerHook?.();
 }
 function parsePermissionTiers(value: string | null): Record<string, ExecutionLevel> { try { const parsed = JSON.parse(value || '{}') as Record<string, unknown>; return Object.fromEntries(Object.entries(parsed).filter(([, tier]) => tier === 'read-only' || tier === 'default' || tier === 'extended' || tier === 'full')) as Record<string, ExecutionLevel>; } catch { return {}; } }
 
@@ -144,10 +148,238 @@ export function useWorkspace() {
   };
 
   const abortActiveRun = () => {
-    if (!activeRunAbort) return false;
-    activeRunAbort.abort();
-    return true;
+    const serverRun = activeConversationId.value ? serverActiveRuns.get(activeConversationId.value) : undefined;
+    if (serverRun) void orch.cancelChatRun(serverRun.sessionId).catch(() => undefined);
+    if (activeRunAbort) {
+      activeRunAbort.abort();
+      return true;
+    }
+    return Boolean(serverRun);
   };
+
+  /* ------------------------------------------------------------------ *
+   * Server-backed chat sessions (M0)
+   *
+   * Desktop conversations may live on the orchestration server
+   * (`/api/orch/sessions`); the server owns run/approval state machines and
+   * the page mirrors it via SSE + polling. Enabled when the renderer runs
+   * inside Electron (window.opcaiDesktop present) and the caller does not
+   * request legacy collaborator briefs.
+   * ------------------------------------------------------------------ */
+
+  const serverChatActive = () => Boolean(window.opcaiDesktop);
+  const serverActiveRuns = new Map<string, { sessionId: string; unsubscribe: () => void }>();
+  const serverBump = () => {
+    conversations.value = [...conversations.value];
+  };
+
+  async function ensureServerSession(conversation: Conversation, firstText: string): Promise<string> {
+    if (conversation.serverSessionId) return conversation.serverSessionId;
+    const session = await orch.createChatSession({ title: conversation.title || firstText.slice(0, 28), employeeId: conversation.employeeId });
+    conversation.serverSessionId = session.id;
+    await persist();
+    return session.id;
+  }
+
+  /** Align a local conversation mirror with the server's canonical session. */
+  async function alignServerConversation(conversation: Conversation, sessionId: string): Promise<void> {
+    const session = await orch.getChatSession(sessionId);
+    if (!session) return;
+    const preserved = new Map<string, Message>(conversation.messages.map((message) => [message.id, message]));
+    conversation.messages = session.messages
+      .filter((message) => !message.superseded)
+      .map((message) => {
+        const old = preserved.get(message.id);
+        const base: Message = {
+          id: message.id,
+          role: message.role,
+          content: message.content,
+        };
+        if (message.role === 'assistant' && old) {
+          base.activities = old.activities ?? [];
+          base.approvals = old.approvals ?? [];
+          base.assets = old.assets ?? [];
+          base.sources = old.sources ?? [];
+        }
+        return base;
+      });
+    conversation.updatedAt = session.updatedAt;
+    serverBump();
+    await persist();
+  }
+
+  async function archiveServerArtifact(conversation: Conversation, assistantMessage: Message, runId: string, relativePath: string) {
+    try {
+      const asset = await archiveArtifact({
+        runId,
+        relativePath,
+        conversationId: conversation.id,
+        employeeId: conversation.employeeId,
+      });
+      if (!assistantMessage.assets?.some((item) => item.id === asset.id)) assistantMessage.assets?.push(asset as Asset);
+      serverBump();
+    } catch (error) {
+      assistantMessage.activities?.push({ toolName: 'archive_asset', status: 'failed', summary: error instanceof Error ? error.message : '资产归档失败。' });
+    }
+  }
+
+  /**
+   * Merge a settled server turn into the local mirror without discarding the
+   * SSE-collected detail of this turn. The server owns durable message ids and
+   * the final assistant text (it persists content only after the run settles),
+   * so we adopt the server ids/content for THIS turn while keeping the local
+   * activities/approvals/assets gathered live via SSE.
+   */
+  async function syncServerTurnToMirror(conversation: Conversation, userMessage: Message, assistantMessage: Message, sessionId: string, runId: string): Promise<void> {
+    const session = await orch.getChatSession(sessionId);
+    if (!session) return;
+    const visible = session.messages.filter((message) => !message.superseded);
+    const serverUser = [...visible].reverse().find((message) => message.role === 'user' && message.content === userMessage.content);
+    const serverAssistant = visible.find((message) => message.role === 'assistant' && message.runId === runId);
+    if (serverUser && userMessage.id !== serverUser.id) userMessage.id = serverUser.id;
+    if (serverAssistant) {
+      if (assistantMessage.id !== serverAssistant.id) assistantMessage.id = serverAssistant.id;
+      // Adopt the durable final text. This is what makes the reply appear even
+      // when deltas were missed (SSE gap) or the run outlived the subscription.
+      if (serverAssistant.content && assistantMessage.content !== serverAssistant.content) assistantMessage.content = serverAssistant.content;
+    }
+    conversation.updatedAt = session.updatedAt;
+    serverBump();
+    await persist();
+  }
+
+  async function serverChatTurn(
+    conversation: Conversation,
+    userMessage: Message,
+    assistantMessage: Message,
+    text: string,
+  ) {
+    const sessionId = await ensureServerSession(conversation, text);
+    const previous = serverActiveRuns.get(conversation.id);
+    if (previous) previous.unsubscribe();
+
+    const abort = new AbortController();
+    activeRunAbort = abort;
+    // Subscribe BEFORE posting the message so no early run event (first delta,
+    // approval/activity, artifact…) is lost between the POST and the subscribe.
+    let currentRunId: string | null = null;
+    const unsubscribe = orch.subscribeSessionEvents(
+      sessionId,
+      (event) => {
+        if (!currentRunId || (event.runId && event.runId !== currentRunId)) return;
+        if (event.type === 'run.delta' && event.text) {
+          assistantMessage.content += event.text;
+          serverBump();
+        } else if (event.type === 'run.activity' && event.activity) {
+          const activity = event.activity;
+          const existing = assistantMessage.activities?.find((item) => item.toolName === activity.toolName && item.status === 'running');
+          if (existing && activity.status !== 'running') Object.assign(existing, activity);
+          else assistantMessage.activities?.push({ toolName: activity.toolName, summary: activity.summary, status: activity.status });
+          serverBump();
+        } else if (event.type === 'run.approval' && event.approval) {
+          const approval = event.approval;
+          if (!assistantMessage.approvals?.some((item) => item.skillId === approval.skillId && item.capability === approval.capability)) {
+            assistantMessage.approvals?.push({ id: approval.id, skillId: approval.skillId, capability: approval.capability, summary: approval.summary });
+            serverBump();
+          }
+        } else if (event.type === 'run.artifact' && event.artifact && event.runId) {
+          void archiveServerArtifact(conversation, assistantMessage, event.runId, event.artifact.path);
+        } else if (event.type === 'run.sources' && event.sources) {
+          assistantMessage.sources = event.sources.map((source) => ({ ...source, provider: String(event.provider ?? '') }));
+          serverBump();
+        }
+      },
+      { signal: abort.signal },
+    );
+    serverActiveRuns.set(conversation.id, { sessionId, unsubscribe });
+    try {
+      const result = await orch.sendChatMessage(sessionId, { content: text, employeeId: conversation.employeeId });
+      const runId = result.runId;
+      currentRunId = runId;
+      await waitForServerSettled(sessionId, runId, abort);
+    } finally {
+      unsubscribe();
+      serverActiveRuns.delete(conversation.id);
+      if (activeRunAbort === abort) activeRunAbort = null;
+    }
+    if (abort.signal.aborted || !currentRunId) {
+      throw Object.assign(new Error('已由用户中止当前执行。'), { name: 'AbortError' });
+    }
+    await syncServerTurnToMirror(conversation, userMessage, assistantMessage, sessionId, currentRunId);
+    return {
+      conversationId: conversation.id,
+      transcript: {
+        prompt: userMessage.content,
+        conversationId: conversation.id,
+        assistantContent: assistantMessage.content,
+        activities: [...(assistantMessage.activities ?? [])],
+        approvals: [...(assistantMessage.approvals ?? [])],
+        assets: (assistantMessage.assets ?? []).map((asset) => ({ id: asset.id, name: asset.name, sizeBytes: asset.sizeBytes })),
+        runId: currentRunId,
+      },
+    };
+  }
+
+  /**
+   * Wait until a server run is truly settled and durable.
+   *
+   * The orchestration server only persists the run record AND the assistant
+   * message content AFTER the run finishes (RunEngine saves at the end;
+   * ChatSessionService writes the final text right after). So while the run is
+   * executing, `GET /sessions/:id/runs` has NO entry for it and the session's
+   * assistant message is still empty — neither means "done". We keep polling
+   * until the run record is terminal AND (the assistant content is persisted
+   * OR the run ended in an error / is parked for approval).
+   */
+  async function waitForServerSettled(sessionId: string, runId: string, abort: AbortController): Promise<void> {
+    const deadline = Date.now() + 12 * 60_000;
+    while (Date.now() < deadline) {
+      if (abort.signal.aborted) return;
+      const [session, runs] = await Promise.all([
+        orch.getChatSession(sessionId).catch(() => null),
+        orch.sessionRuns(sessionId).catch(() => [] as orch.ServerRunRecord[]),
+      ]);
+      const run = runs.find((item) => item.id === runId);
+      const assistant = session?.messages.find(
+        (message) => message.role === 'assistant' && message.runId === runId,
+      );
+      if (run && run.status !== 'running') {
+        const contentReady = Boolean(assistant?.content.trim());
+        const errored = run.status === 'failed' || run.status === 'cancelled';
+        const parked = run.status === 'waiting-approval';
+        if (contentReady || errored || parked) return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+
+  async function hydrateServerConversations(): Promise<void> {
+    if (!serverChatActive()) return;
+    const sessions = await orch.listChatSessions().catch(() => [] as orch.ServerChatSession[]);
+    if (!sessions.length) return;
+    const next = [...conversations.value];
+    const byServerId = new Map(next.filter((c) => c.serverSessionId).map((c) => [c.serverSessionId!, c]));
+    for (const session of sessions) {
+      const existing = byServerId.get(session.id);
+      if (existing) {
+        await alignServerConversation(existing, session.id).catch(() => undefined);
+      } else {
+        const conversation: Conversation = {
+          id: crypto.randomUUID(),
+          title: session.title || '服务端会话',
+          employeeId: session.employeeId,
+          messages: [],
+          updatedAt: session.updatedAt,
+          serverSessionId: session.id,
+        };
+        next.unshift(conversation);
+        await alignServerConversation(conversation, session.id).catch(() => undefined);
+      }
+    }
+    conversations.value = next;
+  }
+  hydrateServerHook = hydrateServerConversations;
+
   const permissionTier = computed<ExecutionLevel>(() => permissionTierByEmployee.value[currentEmployeeId.value] ?? 'default');
   const skillRuntimeFor = async (employeeId: EmployeeId, onlySkillIds?: string[], tierOverride?: ExecutionLevel): Promise<RuntimeSkill[]> => {
     const tier = tierOverride ?? permissionTierByEmployee.value[employeeId] ?? 'default';
@@ -212,8 +444,14 @@ export function useWorkspace() {
     await persist();
   };
   const deleteConversation = async (id: string) => {
+    const conversation = conversations.value.find((item) => item.id === id);
     const index = conversations.value.findIndex((item) => item.id === id);
     if (index < 0) return;
+    const serverRun = serverActiveRuns.get(id);
+    if (serverRun) serverRun.unsubscribe();
+    if (conversation?.serverSessionId) {
+      await orch.deleteChatSession(conversation.serverSessionId).catch(() => undefined);
+    }
     conversations.value = conversations.value.filter((item) => item.id !== id);
     if (activeConversationId.value === id) activeConversationId.value = conversations.value[0]?.id ?? null;
     await persist();
@@ -248,6 +486,39 @@ export function useWorkspace() {
     const skills = await skillRuntimeFor(employee.id, options.skillIds);
     const assistantMessage: Message = { id: crypto.randomUUID(), role: 'assistant', content: '', activities: [], approvals: [], assets: [], collaborations: [] };
     conversation.messages.push(assistantMessage);
+    const plannedCollaborators = [...new Set(options.collaboratorIds ?? [])].filter((cid) => cid !== employee.id).slice(0, 3);
+    if (serverChatActive() && !plannedCollaborators.length) {
+      // M0 server-backed turn: the orchestration server owns the run/approval
+      // state machine; UI only mirrors deltas and persists the local copy.
+      const runAbortCtl = new AbortController();
+      activeRunAbort = runAbortCtl;
+      try {
+        const outcome = await serverChatTurn(conversation, userMessage, assistantMessage, text);
+        return outcome;
+      } catch (cause) {
+        if (isAbortError(cause)) {
+          const reason = cause instanceof Error ? cause.message : '已由用户中止当前执行。';
+          assistantMessage.content = assistantMessage.content.trim()
+            ? `${assistantMessage.content.trim()}\n\n⏹ ${reason}`
+            : `⏹ ${reason}`;
+          markActivitiesInterrupted(assistantMessage.activities);
+        } else {
+          assistantMessage.content = cause instanceof Error ? `⚠ ${cause.message}` : '⚠ Model request failed.';
+        }
+        void persist();
+        return {
+          conversationId: conversation.id,
+          transcript: {
+            prompt: userMessage.content,
+            conversationId: conversation.id,
+            assistantContent: assistantMessage.content,
+            activities: assistantMessage.activities ?? [],
+            approvals: assistantMessage.approvals ?? [],
+            assets: (assistantMessage.assets ?? []).map((asset) => ({ id: asset.id, name: asset.name, sizeBytes: asset.sizeBytes })),
+          },
+        };
+      }
+    }
     const onlineSearch = options.onlineSearch ?? (getEmployeePrefs(employee.id).searchMode !== 'off');
     /** Collaborators inherit the primary employee's search strategy for this turn. */
     const primarySearch = runOptionsFor(employee.id, onlineSearch);
@@ -469,14 +740,59 @@ export function useWorkspace() {
     ];
   };
   const approveAndRetry = async (conversationId: string, approval: ToolApproval, scope: 'session' | 'always', model: ProviderConfig) => {
+    const conversation = conversations.value.find((item) => item.id === conversationId);
+    // Server-backed session: resolve on the server (it re-runs the same turn
+    // automatically via its context resolver), then align the mirror.
+    if (conversation?.serverSessionId) {
+      const sessionId = conversation.serverSessionId;
+      if (!approval.id) {
+        // Legacy approvals without a server id cannot be resolved remotely.
+        return;
+      }
+      const resolved = await orch
+        .resolveChatApproval(sessionId, approval.id, { allow: true, scope })
+        .catch(() => undefined);
+      // The server auto-resumes the same turn as a new attempt; wait until that
+      // resumed run is settled and its content persisted before re-aligning.
+      if (resolved?.resumedRunId) {
+        const resumeAbort = new AbortController();
+        await waitForServerSettled(sessionId, resolved.resumedRunId, resumeAbort);
+      }
+      await waitForServerApprovalResume(sessionId, conversation);
+      if (conversation) {
+        for (const message of conversation.messages) {
+          if (!message.approvals) continue;
+          message.approvals = message.approvals.filter(
+            (item) => !(item.skillId === approval.skillId && item.capability === approval.capability),
+          );
+        }
+        void persist();
+      }
+      return;
+    }
     if (scope === 'session') { const grants = sessionGrants.get(approval.skillId) ?? new Set<ToolApproval['capability']>(); grants.add(approval.capability); sessionGrants.set(approval.skillId, grants); }
     else {
       const skill = skills.value.find((item) => item.id === approval.skillId);
       if (skill) await setExecutionPolicy(skill.id, { ...skill.execution, allowWorkspaceWrite: approval.capability === 'workspace-write' ? true : skill.execution.allowWorkspaceWrite, allowScriptExecution: approval.capability === 'script-execution' ? true : skill.execution.allowScriptExecution });
     }
-    const conversation = conversations.value.find((item) => item.id === conversationId);
     const lastUser = [...(conversation?.messages ?? [])].reverse().find((message) => message.role === 'user');
     if (lastUser) { activeConversationId.value = conversationId; await addMessage(lastUser.content, model); }
+  };
+  /** Wait for a server-side approval resume (new attempt) to settle. */
+  const waitForServerApprovalResume = async (sessionId: string, conversation: Conversation): Promise<void> => {
+    const deadline = Date.now() + 3 * 60_000;
+    const before = conversation.updatedAt;
+    while (Date.now() < deadline) {
+      const session = await orch.getChatSession(sessionId).catch(() => null);
+      if (session && session.updatedAt > before) {
+        const pending = await orch.chatPendingApprovals(sessionId).catch(() => []);
+        if (pending.length === 0) {
+          await alignServerConversation(conversation, sessionId).catch(() => undefined);
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
   };
   return { employees, view, currentEmployeeId, currentEmployee, conversations, activeConversation, permissionTier, load, setView, startChat, selectConversation, selectEmployee, setDefaultEmployee, setPermissionTier, clearConversation, deleteConversation, addMessage, abortActiveRun, runAutomation, runProjectTask, generateProjectDraft, approveAndRetry, createEmployee, updateEmployee, removeEmployee };
 }

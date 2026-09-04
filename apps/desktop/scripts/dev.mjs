@@ -30,19 +30,31 @@ function stop() { stopping = true; clearTimeout(restartTimer); electron?.kill('S
 const build = run(pnpm, ['--filter', '@opcai/contracts', 'build']);
 build.on('exit', (code) => {
   if (code !== 0) process.exit(code ?? 1);
-  const agentBuild = run(pnpm, ['--filter', '@opcai/agent-core', 'build']);
-  agentBuild.on('exit', (agentCode) => {
-    if (agentCode !== 0) process.exit(agentCode ?? 1);
-    const apiBuild = run(pnpm, ['--filter', '@opcai/api', 'build']);
-    apiBuild.on('exit', (apiCode) => {
-      if (apiCode !== 0) process.exit(apiCode ?? 1);
-      vite = run(pnpm, ['--filter', '@opcai/renderer', 'dev']);
-      startElectron();
-      // Renderer changes are handled by Vite HMR. Restart Electron only for IPC/main changes.
-      watch(path.join(desktopRoot, 'src'), { recursive: process.platform !== 'linux' }, (_event, filename) => {
-        if (!filename || !/^(main|preload)[/\\]/.test(filename)) return;
-        clearTimeout(restartTimer);
-        restartTimer = setTimeout(restartElectron, 180);
+  const channelBuild = run(pnpm, ['--filter', '@opcai/channel', 'build']);
+  channelBuild.on('exit', (channelCode) => {
+    if (channelCode !== 0) process.exit(channelCode ?? 1);
+    const gatewayBuild = run(pnpm, ['--filter', '@opcai/gateway', 'build']);
+    gatewayBuild.on('exit', (gatewayCode) => {
+      if (gatewayCode !== 0) process.exit(gatewayCode ?? 1);
+      const agentBuild = run(pnpm, ['--filter', '@opcai/agent-core', 'build']);
+      agentBuild.on('exit', (agentCode) => {
+        if (agentCode !== 0) process.exit(agentCode ?? 1);
+        const orchestratorBuild = run(pnpm, ['--filter', '@opcai/orchestrator', 'build']);
+        orchestratorBuild.on('exit', (orchestratorCode) => {
+          if (orchestratorCode !== 0) process.exit(orchestratorCode ?? 1);
+          const apiBuild = run(pnpm, ['--filter', '@opcai/api', 'build']);
+          apiBuild.on('exit', (apiCode) => {
+            if (apiCode !== 0) process.exit(apiCode ?? 1);
+            vite = run(pnpm, ['--filter', '@opcai/renderer', 'dev']);
+            startElectron();
+            // Renderer changes are handled by Vite HMR. Restart Electron only for IPC/main changes.
+            watch(path.join(desktopRoot, 'src'), { recursive: process.platform !== 'linux' }, (_event, filename) => {
+              if (!filename || !/^(main|preload)[/\\]/.test(filename)) return;
+              clearTimeout(restartTimer);
+              restartTimer = setTimeout(restartElectron, 180);
+            });
+          });
+        });
       });
     });
   });

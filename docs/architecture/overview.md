@@ -1,5 +1,9 @@
 # OPCAI architecture baseline
 
+> **历史参考**：本文为早期基线。当前权威架构（含 orchestrator / channel / gateway /
+> 远程中继与 M0–M2 演化）见 `docs/design/architecture.md`；设计文档索引见
+> `docs/design/README.md`。与本文冲突处以新文档为准。
+
 ## Boundaries
 
 - `apps/desktop` owns only Electron lifecycle, native dialogs, controlled IPC, and packaging.

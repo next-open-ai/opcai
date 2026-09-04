@@ -44,4 +44,8 @@ contextBridge.exposeInMainWorld('opcaiDesktop', {
   unlinkAssetsFromProject: (assetIds) => ipcRenderer.invoke('opcai:unlink-assets-from-project', assetIds),
   saveAsset: (assetId) => ipcRenderer.invoke('opcai:save-asset', assetId),
   revealAsset: (assetId) => ipcRenderer.invoke('opcai:reveal-asset', assetId),
+  getChannelSettings: () => ipcRenderer.invoke('opcai:get-channel-settings'),
+  saveChannelSettings: (payload) => ipcRenderer.invoke('opcai:save-channel-settings', payload),
+  gatewayStatus: () => ipcRenderer.invoke('opcai:gateway-status'),
+  gatewayRestart: () => ipcRenderer.invoke('opcai:gateway-restart'),
 });

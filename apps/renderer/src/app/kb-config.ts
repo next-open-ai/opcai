@@ -367,7 +367,7 @@ export function useKnowledgeConfig() {
   const runtimePayload = (ids?: string[], provider?: KnowledgeProviderId | 'off' | null) => {
     if (provider === 'off') return [];
     let rows = ids?.length ? byIds(ids) : bases.value.filter((item) => isReady(item) && isProviderEnabled(item.provider));
-    if (provider && provider !== 'off') rows = rows.filter((item) => item.provider === provider);
+    if (provider) rows = rows.filter((item) => item.provider === provider);
     return rows.map(toRuntime);
   };
 

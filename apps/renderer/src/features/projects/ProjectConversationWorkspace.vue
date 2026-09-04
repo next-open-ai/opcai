@@ -1,4 +1,3 @@
-import { employeeDisplayName } from '../../app/employees';
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
@@ -10,6 +9,7 @@ import {
   type ProjectFileEntry,
 } from "../../app/project-files.js";
 import type { Project } from "../../app/projects.js";
+import { employeeDisplayName } from "../../app/employees";
 
 const props = defineProps<{
   project: Project;
@@ -23,6 +23,7 @@ const emit = defineEmits<{
   cancel: [];
   remove: [];
   dispatch: [input: { employeeId: EmployeeId; content: string }];
+  approve: [input: { taskId: string; approvalId: string; allow: boolean; scope: "session" | "always" }];
 }>();
 
 const draft = ref("");
@@ -88,7 +89,7 @@ const statusText = (status: string) =>
 const statusClass = (status: string) =>
   ({
     queued: "bg-slate-500/10 text-slate-600",
-    running: "bg-blue-500/10 text-blue-600",
+    running: "opcai-running-pill",
     completed: "bg-emerald-500/10 text-emerald-600",
     failed: "bg-rose-500/10 text-rose-600",
     cancelled: "bg-amber-500/10 text-amber-700",
@@ -110,6 +111,15 @@ const employeeName = (id?: EmployeeId) => {
     'employee.administrator.name': '系统管理员',
   } as Record<string, string>)[key] || key) || id || '';
 };
+const approvalLabel: Record<string, string> = {
+  "workspace-write": "写入运行工作区",
+  "script-execution": "执行本地脚本",
+  "network-access": "访问网络资源",
+};
+function approve(input: { approvalId?: string; allow: boolean; scope: "session" | "always" }, taskId?: string) {
+  if (!taskId || !input.approvalId) return;
+  emit("approve", { taskId, approvalId: input.approvalId, allow: input.allow, scope: input.scope });
+}
 const date = (value: number) =>
   new Intl.DateTimeFormat("zh-CN", {
     hour: "2-digit",
@@ -488,6 +498,38 @@ onBeforeUnmount(() => editor?.dispose());
                     ><strong>{{ activity.toolName }}</strong> · {{ activity.summary }}</p>
                   </div>
                 </details>
+                <section
+                  v-if="message.role === 'assistant' && message.approvals?.length"
+                  class="mt-2 space-y-2"
+                >
+                  <article
+                    v-for="item in message.approvals"
+                    :key="item.id"
+                    class="rounded-xl border border-amber-500/35 bg-amber-500/10 p-3 text-xs"
+                  >
+                    <p class="font-bold text-amber-700">
+                      需要你的批准 · {{ approvalLabel[item.capability] ?? item.capability }}
+                    </p>
+                    <p class="mt-1 text-[var(--muted)]">{{ item.summary }}</p>
+                    <div class="mt-2 flex flex-wrap gap-2">
+                      <button
+                        class="rounded-lg bg-[var(--accent)] px-2.5 py-1.5 font-semibold text-white"
+                        type="button"
+                        @click="approve({ approvalId: item.id, allow: true, scope: 'session' }, message.taskId)"
+                      >允许本次</button>
+                      <button
+                        class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 font-semibold"
+                        type="button"
+                        @click="approve({ approvalId: item.id, allow: true, scope: 'always' }, message.taskId)"
+                      >始终允许</button>
+                      <button
+                        class="rounded-lg border border-rose-500/40 px-2.5 py-1.5 font-semibold text-rose-600"
+                        type="button"
+                        @click="approve({ approvalId: item.id, allow: false, scope: 'session' }, message.taskId)"
+                      >拒绝</button>
+                    </div>
+                  </article>
+                </section>
                 <div v-if="message.assets?.length" class="mt-2 flex flex-wrap gap-2">
                   <button
                     v-for="asset in message.assets"
@@ -619,6 +661,8 @@ onBeforeUnmount(() => editor?.dispose());
             @click="openMember(employee.id)"
           >
             <span class="relative grid h-10 w-10 place-items-center rounded-xl text-[10px] font-bold text-white" :style="{ background: employee.color }">
+              <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-spin" />
+              <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-pulse" />
               {{ employee.initials }}
               <span :class="['absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-2 border-white', statusDotClass(statusFor(employee.id))]" />
             </span>
@@ -691,3 +735,49 @@ onBeforeUnmount(() => editor?.dispose());
     </div>
   </section>
 </template>
+
+<style scoped>
+/* Running-status polish: shimmering pill + orbiting/pulsing ring on the avatar. */
+.opcai-running-pill {
+  background: linear-gradient(90deg, #3b82f6 0%, #818cf8 45%, #22d3ee 100%);
+  background-size: 200% 100%;
+  color: #fff;
+  animation: opcai-shimmer 1.7s linear infinite;
+}
+.opcai-run-spin,
+.opcai-run-pulse {
+  position: absolute;
+  inset: -3px;
+  border-radius: 16px;
+  pointer-events: none;
+}
+.opcai-run-spin {
+  border: 2px solid transparent;
+  border-top-color: #818cf8;
+  border-right-color: rgba(129, 140, 248, 0.55);
+  filter: drop-shadow(0 0 4px rgba(99, 102, 241, 0.7));
+  animation: opcai-spin 1.05s linear infinite;
+}
+.opcai-run-pulse {
+  box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7);
+  animation: opcai-pulse 1.7s ease-out infinite;
+}
+@keyframes opcai-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+@keyframes opcai-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes opcai-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7);
+  }
+  100% {
+    box-shadow: 0 0 0 12px rgba(99, 102, 241, 0);
+  }
+}
+</style>

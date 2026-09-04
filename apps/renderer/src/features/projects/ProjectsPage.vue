@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type {
   Employee,
   EmployeeId,
@@ -20,6 +20,7 @@ import {
   type ProjectTaskInput,
 } from "../../app/projects.js";
 import ProjectConversationWorkspace from "./ProjectConversationWorkspace.vue";
+import * as orch from "../../services/orchestration.js";
 
 type Transcript = {
   assistantContent: string;
@@ -60,6 +61,444 @@ const {
   createRun,
   finishRun,
 } = useProjects();
+
+/* ------------------------------------------------------------------ *
+ * M0 managed (server-orchestrated) projects.
+ *
+ * New projects created from this page live on the orchestration server
+ * (`/api/orch/projects`); the server owns scheduling, approvals and durable
+ * state — the page only mirrors it (poll + on-demand transcript hydration).
+ * Legacy local projects keep the original scheduler below.
+ * ------------------------------------------------------------------ */
+const managedPollers = new Map<string, ReturnType<typeof setInterval>>();
+const hydratedKeys = new Set<string>();
+
+function managedProvider(): ProviderId {
+  return props.models[0]?.provider ?? "openai";
+}
+function managedModel(): string {
+  return props.models[0]?.chatModel ?? "";
+}
+
+function serverToTranscript(run: orch.ServerRunRecord): Transcript {
+  return {
+    assistantContent: run.transcript,
+    activities: run.activities.map((activity) => ({
+      toolName: activity.toolName,
+      summary: activity.summary,
+      status:
+        activity.status === "completed" || activity.status === "failed"
+          ? activity.status
+          : ("running" as const),
+    })),
+    approvals: run.approvals.map((approval) => ({
+      skillId: approval.skillId,
+      capability: approval.capability,
+      summary: approval.summary,
+    })),
+    assets: run.artifacts
+      .filter((artifact) => artifact.assetId)
+      .map((artifact) => ({
+        id: artifact.assetId!,
+        name: artifact.assetName || artifact.path,
+        sizeBytes: artifact.assetSizeBytes ?? 0,
+        runId: run.id,
+      })),
+    runId: run.id,
+  };
+}
+
+/** Server project → local Project mirror (keeps previously hydrated data). */
+function adoptServerProject(sp: orch.ServerProject, previous?: Project): Project {
+  const provider: ProviderId = (sp.coordinator?.provider ?? managedProvider()) as ProviderId;
+  const model = sp.coordinator?.model ?? managedModel();
+  const previousTasks = new Map((previous?.tasks ?? []).map((task) => [task.id, task]));
+  const previousMessages = previous?.messages ?? [];
+  const project: Project = {
+    id: sp.id,
+    name: sp.name,
+    goal: sp.goal,
+    status: sp.status,
+    coordinatorProvider: provider,
+    coordinatorModel: model,
+    mode: sp.mode,
+    workspacePath: sp.workspacePath,
+    tasks: sp.tasks.map((task) => {
+      const old = previousTasks.get(task.id);
+      const transcript = old?.transcript ? old.transcript : undefined;
+      return {
+        id: task.id,
+        title: task.title,
+        objective: task.objective,
+        employeeId: task.employeeId,
+        provider,
+        model,
+        skillIds: task.skillIds ?? [],
+        dependsOn: task.dependsOn ?? [],
+        permissionTier: task.permissionTier ?? "default",
+        status: task.status,
+        attempts: task.attempts ?? 0,
+        startedAt: task.startedAt,
+        finishedAt: task.finishedAt,
+        transcript,
+        runId: task.runId,
+        error: task.error,
+      };
+    }),
+    messages: [...previousMessages],
+    createdAt: sp.createdAt,
+    updatedAt: sp.updatedAt,
+    activeRunId: sp.activeRunId,
+    summary: sp.summary ?? previous?.summary,
+    managedServer: true,
+  };
+  // Append any server-side messages we have not mirrored yet.
+  const known = new Set(project.messages.map((message) => message.id));
+  for (const message of sp.messages) {
+    if (!known.has(message.id)) {
+      project.messages.push({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        employeeId: message.employeeId,
+        taskId: message.taskId,
+        createdAt: message.createdAt,
+        assets: [],
+        activities: [],
+      });
+    }
+  }
+  return project;
+}
+
+async function refreshManaged(projectId: string): Promise<boolean> {
+  const sp = await orch.getProject(projectId);
+  const index = projects.value.findIndex((item) => item.id === projectId);
+  if (!sp || index < 0) return false;
+  const next = adoptServerProject(sp, projects.value[index]);
+  projects.value = [...projects.value.slice(0, index), next, ...projects.value.slice(index + 1)];
+  // Hydrate transcripts for completed tasks the server settled (once each).
+  for (const task of next.tasks) {
+    if (task.status === "completed" && !task.transcript) {
+      void hydrateManagedTask(next, task.id);
+    } else if (task.status === "running" && /等待审批|approval/i.test(task.error ?? "")) {
+      void hydratePendingApprovals(next, task);
+    }
+  }
+  if (sp.status === "completed" || sp.status === "failed" || sp.status === "cancelled") {
+    await finishManagedRun(next);
+  }
+  return sp.status === "running";
+}
+
+async function hydrateManagedTask(project: Project, taskId: string): Promise<void> {
+  const key = `${project.id}:${taskId}`;
+  if (hydratedKeys.has(key)) return;
+  hydratedKeys.add(key);
+  const task = project.tasks.find((item) => item.id === taskId);
+  const run = task ? await orch.projectTranscript(project.id, taskId) : null;
+  if (!task || !run) {
+    hydratedKeys.delete(key);
+    return;
+  }
+  task.transcript = serverToTranscript(run);
+  task.runId = run.id;
+  const existingMsg = project.messages.find(
+    (message) => message.taskId === taskId && message.role === "assistant",
+  );
+  if (existingMsg) {
+    // Finalize the live-streamed message with the authoritative transcript.
+    existingMsg.content = run.transcript || existingMsg.content;
+    existingMsg.activities = task.transcript.activities;
+    existingMsg.assets = task.transcript.assets;
+  } else {
+    project.messages.push({
+      id: crypto.randomUUID(),
+      role: "assistant",
+      employeeId: task.employeeId,
+      taskId,
+      content: run.transcript || "(无文本输出)",
+      assets: task.transcript.assets,
+      activities: task.transcript.activities,
+      createdAt: Date.now(),
+    });
+  }
+  if (project.workspacePath && run.id) {
+    try {
+      await window.opcaiDesktop?.syncProjectWorkspace(project.workspacePath, run.id);
+    } catch {
+      /* keep going even if folder sync fails */
+    }
+  }
+  projects.value = [...projects.value];
+}
+
+async function finishManagedRun(project: Project): Promise<void> {
+  const index = projects.value.findIndex((item) => item.id === project.id);
+  if (index < 0) return;
+  const current = projects.value[index];
+  const stop = managedPollers.get(project.id);
+  if (stop) {
+    clearInterval(stop);
+    managedPollers.delete(project.id);
+  }
+  stopManagedStream(project.id);
+  if (!current.summary && (current.status === "completed" || current.status === "failed")) {
+    const completed = current.tasks.filter((task) => task.status === "completed").length;
+    const failed = current.tasks.filter((task) => task.status === "failed").length;
+    current.summary = failed
+      ? `项目已结束：${completed} 项任务完成，${failed} 项失败。${current.tasks.find((task) => task.error)?.error ?? ""}`
+      : `项目已完成：${completed} 项任务成功。`;
+    if (!current.messages.some((message) => message.role === "system" && message.content.startsWith("本轮调度已结束"))) {
+      current.messages.push({
+        id: crypto.randomUUID(),
+        role: "system",
+        content: "本轮调度已结束，服务端已完成任务编排。",
+        createdAt: Date.now(),
+      });
+    }
+    projects.value = [...projects.value];
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Live streaming per-task process info (managed projects).
+ *
+ * The server publishes run deltas/activities/artifacts on the project topic
+ * (`GET /events?project=`). We subscribe while the project is running and
+ * mirror them into the local tasks + conversation messages so the member's
+ * thinking/activity shows live instead of only after the task settles.
+ * The 800ms poll remains the source of truth for task status; this live pass
+ * is purely additive (delta text + activity/approval/asset progress).
+ * ------------------------------------------------------------------ */
+const managedStreams = new Map<string, () => void>();
+
+function stopManagedStream(projectId: string): void {
+  const stop = managedStreams.get(projectId);
+  if (stop) {
+    stop();
+    managedStreams.delete(projectId);
+  }
+}
+
+function startManagedStream(projectId: string): void {
+  if (managedStreams.has(projectId)) return;
+  const stop = orch.subscribeProjectEvents(projectId, (event) => {
+    applyManagedEvent(projectId, event);
+  });
+  managedStreams.set(projectId, stop);
+}
+
+function taskForEvent(project: Project, event: orch.OrcEvent): ProjectTask | undefined {
+  return project.tasks.find(
+    (task) =>
+      (event.taskId && task.id === event.taskId) ||
+      (event.runId && task.runId === event.runId),
+  );
+}
+
+function ensureTaskTranscript(task: ProjectTask): NonNullable<ProjectTask["transcript"]> {
+  if (!task.transcript) {
+    task.transcript = {
+      assistantContent: "",
+      activities: [],
+      approvals: [],
+      assets: [],
+      runId: task.runId,
+    };
+  }
+  return task.transcript;
+}
+
+function ensureTaskMessage(project: Project, task: ProjectTask): ProjectMessage {
+  const existing = project.messages.find(
+    (message) => message.taskId === task.id && message.role === "assistant",
+  );
+  if (existing) return existing;
+  const message: ProjectMessage = {
+    id: crypto.randomUUID(),
+    role: "assistant",
+    employeeId: task.employeeId,
+    taskId: task.id,
+    content: "",
+    activities: [],
+    assets: [],
+    createdAt: Date.now(),
+  };
+  project.messages.push(message);
+  return message;
+}
+
+function bumpProject(): void {
+  projects.value = [...projects.value];
+}
+
+function applyManagedEvent(projectId: string, event: orch.OrcEvent): void {
+  const project = projects.value.find((item) => item.id === projectId);
+  if (!project || project.status !== "running") return;
+  const task = taskForEvent(project, event);
+  if (!task) return;
+
+  if (event.type === "run.started") {
+    // A new attempt is beginning: reset the previous attempt's streamed state so
+    // an approval-resumed (or retried) run does not append onto stale content.
+    if (task.transcript && (task.transcript.assistantContent || task.transcript.activities.length)) {
+      task.transcript.assistantContent = "";
+      task.transcript.activities = [];
+      task.transcript.approvals = [];
+      task.transcript.assets = [];
+    }
+    const message = project.messages.find((m) => m.taskId === task.id && m.role === "assistant");
+    if (message) {
+      message.content = "";
+      message.activities = [];
+      message.approvals = [];
+      message.assets = [];
+    }
+    bumpProject();
+  } else if (event.type === "run.delta" && event.text) {
+    const transcript = ensureTaskTranscript(task);
+    transcript.assistantContent += event.text;
+    const message = ensureTaskMessage(project, task);
+    message.content += event.text;
+    bumpProject();
+  } else if (event.type === "run.activity" && event.activity) {
+    const transcript = ensureTaskTranscript(task);
+    const activity = event.activity;
+    const existing = transcript.activities.find(
+      (item) => item.toolName === activity.toolName && item.status === "running",
+    );
+    if (existing && activity.status !== "running") Object.assign(existing, activity);
+    else transcript.activities.push({ toolName: activity.toolName, summary: activity.summary, status: activity.status });
+    const message = ensureTaskMessage(project, task);
+    message.activities = [...transcript.activities];
+    bumpProject();
+  } else if (event.type === "run.approval" && event.approval) {
+    const transcript = ensureTaskTranscript(task);
+    const approval = event.approval;
+    if (!transcript.approvals.some((item) => item.skillId === approval.skillId && item.capability === approval.capability)) {
+      transcript.approvals.push({ id: approval.id, skillId: approval.skillId, capability: approval.capability, summary: approval.summary });
+    }
+    const message = ensureTaskMessage(project, task);
+    message.approvals = [...transcript.approvals];
+    bumpProject();
+  } else if (event.type === "run.artifact" && event.artifact && event.runId) {
+    bumpProject();
+  } else if (event.type === "project.task" && event.taskId && event.status) {
+    const target = project.tasks.find((task) => task.id === event.taskId);
+    if (target && target.status !== event.status) target.status = event.status as ProjectTask["status"];
+    bumpProject();
+  }
+}
+
+const pendingApprovalFetched = new Set<string>();
+
+/** Surface pending approvals for an already-parked task (e.g. after reload). */
+async function hydratePendingApprovals(project: Project, task: ProjectTask): Promise<void> {
+  if (!task.runId || pendingApprovalFetched.has(task.runId)) return;
+  pendingApprovalFetched.add(task.runId);
+  const run = await orch.projectTranscript(project.id, task.id).catch(() => null);
+  if (!run) return;
+  const pending = run.approvals.filter((approval) => approval.status === "pending");
+  if (!pending.length) return;
+  const transcript = ensureTaskTranscript(task);
+  for (const approval of pending) {
+    if (!transcript.approvals.some((item) => item.skillId === approval.skillId && item.capability === approval.capability)) {
+      transcript.approvals.push({ id: approval.id, skillId: approval.skillId, capability: approval.capability, summary: approval.summary });
+    }
+  }
+  const message = ensureTaskMessage(project, task);
+  message.approvals = [...transcript.approvals];
+  bumpProject();
+}
+
+async function loadManagedProjects(): Promise<void> {
+  const server = await orch.listProjects().catch(() => [] as orch.ServerProject[]);
+  if (!server.length) return;
+  const byId = new Map(projects.value.map((project) => [project.id, project]));
+  const next = [...projects.value];
+  const seen = new Set<string>();
+  for (const sp of server) {
+    seen.add(sp.id);
+    const existingIndex = next.findIndex((item) => item.id === sp.id);
+    const adopted = adoptServerProject(sp, existingIndex >= 0 ? next[existingIndex] : undefined);
+    if (existingIndex >= 0) next[existingIndex] = adopted;
+    else next.unshift(adopted);
+    if (sp.status === "running") {
+      managedPollers.set(
+        sp.id,
+        setInterval(() => void refreshManaged(sp.id), 800),
+      );
+      startManagedStream(sp.id);
+    }
+  }
+  projects.value = next.filter((project) => !project.managedServer || seen.has(project.id));
+}
+
+async function runManagedProject(project: Project): Promise<void> {
+  error.value = "";
+  try {
+    await orch.confirmProject(project.id);
+    await refreshManaged(project.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "服务端编排启动失败。";
+    return;
+  }
+  const existing = managedPollers.get(project.id);
+  if (existing) clearInterval(existing);
+  managedPollers.set(
+    project.id,
+    setInterval(() => void refreshManaged(project.id), 800),
+  );
+  startManagedStream(project.id);
+}
+
+async function cancelManagedProject(project: Project): Promise<void> {
+  try {
+    await orch.cancelProject(project.id);
+  } catch {
+    /* the poll will reflect server truth */
+  }
+  await refreshManaged(project.id);
+}
+
+async function resolveManagedApproval(input: { taskId: string; approvalId: string; allow: boolean; scope: "session" | "always" }): Promise<void> {
+  const project = selected.value;
+  if (!project || !project.managedServer) return;
+  try {
+    await orch.resolveTaskApproval({
+      projectId: project.id,
+      taskId: input.taskId,
+      approvalId: input.approvalId,
+      allow: input.allow,
+      scope: input.scope,
+    });
+  } catch {
+    /* surface via refresh below */
+  }
+  // Drop the resolved approval from the local mirror so the card disappears.
+  const task = project.tasks.find((item) => item.id === input.taskId);
+  if (task?.transcript) task.transcript.approvals = task.transcript.approvals.filter((item) => item.id !== input.approvalId);
+  const message = project.messages.find((m) => m.taskId === input.taskId);
+  if (message?.approvals) message.approvals = message.approvals.filter((item) => item.id !== input.approvalId);
+  projects.value = [...projects.value];
+  await refreshManaged(project.id);
+}
+
+async function deleteProject(project: Project | null): Promise<void> {
+  if (!project) return;
+  if (project.managedServer) {
+    const stop = managedPollers.get(project.id);
+    if (stop) {
+      clearInterval(stop);
+      managedPollers.delete(project.id);
+    }
+    stopManagedStream(project.id);
+    await orch.deleteProject(project.id).catch(() => undefined);
+  }
+  await remove(project.id);
+}
+
 const tab = ref<"projects" | "runs">("projects");
 const selectedId = ref<string | null>(null);
 const creating = ref(false);
@@ -358,17 +797,28 @@ async function confirmCreate() {
     error.value = "无法创建项目空间目录。";
     return;
   }
-  const project = await createDraft({
+  // M0: new projects are created on the orchestration server; the page
+  // mirrors server state (scheduling/persistence live server-side).
+  const serverProject = await orch.createProject({
     name: name.value,
     goal: goal.value,
-    provider: coordinator.value.provider,
-    model: coordinator.value.chatModel,
     mode: mode.value,
-    tasks: draftTasks.value,
     workspacePath,
+    coordinator: {
+      provider: coordinator.value.provider,
+      model: coordinator.value.chatModel,
+    },
+    tasks: draftTasks.value.map((task) => ({
+      title: task.title,
+      objective: task.objective,
+      employeeId: task.employeeId,
+      skillIds: task.skillIds ?? [],
+    })),
   });
-  selectedId.value = project.id;
-  detailTaskId.value = project.tasks[0]?.id ?? null;
+  const adopted = adoptServerProject(serverProject);
+  projects.value = [adopted, ...projects.value];
+  selectedId.value = adopted.id;
+  detailTaskId.value = adopted.tasks[0]?.id ?? null;
   closeCreate();
 }
 async function chooseWorkspaceParent() {
@@ -397,6 +847,10 @@ function isCancelled(project: Project) {
   return cancelling.has(project.id);
 }
 function cancel(project: Project) {
+  if (project.managedServer) {
+    void cancelManagedProject(project);
+    return;
+  }
   cancelling.add(project.id);
   project.tasks
     .filter((task) => task.status === "queued")
@@ -503,6 +957,10 @@ async function executeTask(project: Project, task: ProjectTask) {
   }
 }
 async function run(project: Project) {
+  if (project.managedServer) {
+    await runManagedProject(project);
+    return;
+  }
   if (project.status === "running") return;
   error.value = "";
   const record = await createRun(project);
@@ -615,6 +1073,10 @@ async function dispatchProjectInstruction(
   input: { employeeId: EmployeeId; content: string },
 ) {
   if (project.status === "running") return;
+  if (project.managedServer) {
+    error.value = "服务端托管的项目暂不支持对话式追加指令；请使用任务重试或新建项目。";
+    return;
+  }
   addProjectMessage(project, {
     id: crypto.randomUUID(),
     role: "user",
@@ -651,11 +1113,18 @@ async function dispatchProjectInstruction(
 }
 onMounted(async () => {
   await Promise.all([load(), loadSkills()]);
+  await loadManagedProjects();
   const focusId = await readStored("projects.focus-id");
   if (focusId && projects.value.some((project) => project.id === focusId)) {
     selectedId.value = focusId;
     await writeStored("projects.focus-id", "");
   }
+});
+
+onBeforeUnmount(() => {
+  for (const id of [...managedStreams.keys()]) stopManagedStream(id);
+  for (const timer of managedPollers.values()) clearInterval(timer);
+  managedPollers.clear();
 });
 </script>
 
@@ -1099,10 +1568,11 @@ onMounted(async () => {
           @start="run(selected!)"
           @cancel="cancel(selected!)"
           @remove="
-            remove(selected!.id);
+            deleteProject(selected);
             selectedId = null;
           "
           @dispatch="dispatchProjectInstruction(selected!, $event)"
+          @approve="resolveManagedApproval"
         />
 
         <!-- Legacy task-detail view retained temporarily as reference for the project workspace migration.
@@ -1149,7 +1619,7 @@ onMounted(async () => {
                 ><button
                   class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm text-rose-600"
                   @click="
-                    selected && remove(selected.id);
+                    deleteProject(selected);
                     selectedId = null;
                   "
                 >

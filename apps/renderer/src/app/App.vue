@@ -10,6 +10,7 @@ import KnowledgePage from '../features/knowledge/KnowledgePage.vue';
 import AssetsPage from '../features/assets/AssetsPage.vue';
 import AutomationsPage from '../features/automations/AutomationsPage.vue';
 import ProjectsPage from '../features/projects/ProjectsPage.vue';
+import RemoteOfficePage from '../features/remote/RemoteOfficePage.vue';
 import AppToastHost from '../features/common/AppToastHost.vue';
 import { useI18n } from './i18n';
 import { useWorkspace } from './workspace';
@@ -78,6 +79,7 @@ function toggleSidebar() { sidebarCollapsed.value = !sidebarCollapsed.value; voi
         :open-conversation="(id) => { selectConversation(id); setView('chat'); }"
       />
       <ProjectsPage v-else-if="view === 'projects'" :employees="employees" :models="availableChatModels" :generate-draft="generateProjectDraft" :run-task="runProjectTask" />
+      <RemoteOfficePage v-else-if="view === 'remote'" />
       <SettingsPage v-else :employees="employees" :default-employee-id="currentEmployeeId" @set-default-employee="setDefaultEmployee" />
     </main>
     <AppToastHost />

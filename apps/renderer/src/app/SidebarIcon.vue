@@ -9,6 +9,7 @@ defineProps<{
     | 'assets'
     | 'projects'
     | 'settings'
+    | 'remote'
     | 'plus'
     | 'chevron-left'
     | 'chevron-right'
@@ -57,6 +58,10 @@ defineProps<{
     <template v-else-if="name === 'settings'">
       <circle cx="12" cy="12" r="2.75" />
       <path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.55 1.55M16.85 16.85l1.55 1.55M5.6 18.4l1.55-1.55M16.85 7.15l1.55-1.55" />
+    </template>
+    <template v-else-if="name === 'remote'">
+      <path d="M12 20.5c3.2 0 5.5-3.8 5.5-8.5S15.2 3.5 12 3.5 6.5 7.3 6.5 12s2.3 8.5 5.5 8.5Z" />
+      <path d="M4.5 9.5h15M4.5 14.5h15M12 3.5v17" />
     </template>
     <template v-else-if="name === 'plus'">
       <path d="M12 5v14M5 12h14" />

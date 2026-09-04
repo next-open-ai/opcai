@@ -8,12 +8,19 @@
   "pnpm": { "onlyBuiltDependencies": ["electron", "esbuild"] },
   "scripts": {
     "dev": "pnpm --filter @opcai/desktop dev",
-    "build": "pnpm --filter @opcai/contracts build && pnpm --filter @opcai/tools build && pnpm --filter @opcai/storage build && pnpm --filter @opcai/agent-core build && pnpm --filter @opcai/api build && pnpm --filter @opcai/renderer build",
+    "build": "pnpm --filter @opcai/contracts build && pnpm --filter @opcai/tools build && pnpm --filter @opcai/storage build && pnpm --filter @opcai/channel build && pnpm --filter @opcai/gateway build && pnpm --filter @opcai/agent-core build && pnpm --filter @opcai/orchestrator build && pnpm --filter @opcai/api build && pnpm --filter @opcai/renderer build",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "lint": "pnpm -r --if-present lint",
     "package": "pnpm --filter @opcai/desktop package",
-    "size:check": "node scripts/check-size.mjs"
+    "size:check": "node scripts/check-size.mjs",
+    "orch:smoke": "node scripts/headless-gateway-smoke.mjs",
+    "orch:remote-confirm": "node scripts/remote-project-confirm.mjs",
+    "orch:remote-chat": "node scripts/remote-chat.mjs",
+    "gateway:stub": "node scripts/gateway-stub-smoke.mjs",
+    "gateway:config": "node scripts/gateway-config.mjs",
+    "gateway:feishu": "node scripts/gateway-feishu-smoke.mjs",
+    "gateway:relay": "node scripts/relay-smoke.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

@@ -37,6 +37,8 @@ export interface ProjectTask {
   startedAt?: number;
   finishedAt?: number;
   transcript?: ProjectTaskTranscript;
+  /** Server-side run id of the current/last attempt (maps SSE events → task). */
+  runId?: string;
   error?: string;
 }
 
@@ -48,6 +50,7 @@ export interface ProjectMessage {
   taskId?: string;
   createdAt: number;
   activities?: ProjectTaskTranscript["activities"];
+  approvals?: ProjectTaskTranscript["approvals"];
   assets?: ProjectTaskTranscript["assets"];
 }
 
@@ -77,6 +80,12 @@ export interface Project {
   updatedAt: number;
   activeRunId?: string;
   summary?: string;
+  /**
+   * M0: true when this project lives on the orchestration server
+   * (`/api/orch/projects`) — server owns scheduling/persistence and the page
+   * only mirrors it. Legacy local projects omit this field.
+   */
+  managedServer?: boolean;
 }
 
 const key = "projects.v1";

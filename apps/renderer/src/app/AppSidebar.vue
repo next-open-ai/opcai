@@ -10,7 +10,7 @@ const emit = defineEmits<{ toggle: []; navigate: [view: View]; newChat: []; sele
 const { t } = useI18n();
 const { preference, cycleTheme } = useTheme();
 
-type NavItem = { id: View; labelKey: string; icon: 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'automations' | 'assets' | 'projects' };
+type NavItem = { id: View; labelKey: string; icon: 'chat' | 'employees' | 'capabilities' | 'knowledge' | 'automations' | 'assets' | 'projects' | 'remote' };
 
 const navItems: NavItem[] = [
   { id: 'chat', labelKey: 'nav.workspace', icon: 'chat' },
@@ -20,6 +20,7 @@ const navItems: NavItem[] = [
   { id: 'knowledge', labelKey: 'nav.knowledge', icon: 'knowledge' },
   { id: 'automations', labelKey: 'nav.automations', icon: 'automations' },
   { id: 'assets', labelKey: 'nav.assets', icon: 'assets' },
+  { id: 'remote', labelKey: 'nav.remote', icon: 'remote' },
 ];
 
 const themeIcon = computed(() => themeIconNames[preference.value] as 'theme-system' | 'theme-light' | 'theme-dark' | 'theme-midnight' | 'theme-aurora');

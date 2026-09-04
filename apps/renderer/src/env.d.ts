@@ -43,5 +43,9 @@ interface Window {
     unlinkAssetsFromProject(assetIds: string[]): Promise<{ updated: number }>;
     saveAsset(assetId: string): Promise<boolean>;
     revealAsset(assetId: string): Promise<void>;
+    getChannelSettings(): Promise<{ meta: Record<string, unknown>; secrets: { telegram?: { botToken?: string }; feishu?: { appSecret?: string }; relay?: { token?: string } } }>;
+    saveChannelSettings(payload: unknown): Promise<{ ok: boolean; meta: Record<string, unknown> }>;
+    gatewayStatus(): Promise<{ running: boolean; pid: number | null }>;
+    gatewayRestart(): Promise<{ running: boolean; pid: number | null }>;
   };
 }
