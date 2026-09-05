@@ -3,8 +3,10 @@ import type { LanguageModel } from 'ai';
 
 /** Soft threshold (~10–12k tokens): prune reasoning + older tool traces. */
 const SOFT_CHAR_LIMIT = 40_000;
-/** Hard threshold after prune: summarize older turns with a short LLM call. */
+/** Hard threshold after prune: prefer 提配 before summarizing. */
 const HARD_CHAR_LIMIT = 56_000;
+/** Boosted hard limit (提配): continue without summarizing until this ceiling. */
+const HARD_BOOST_CHAR_LIMIT = 84_000;
 /** Keep the newest N messages verbatim after summarization. */
 const KEEP_RECENT_MESSAGES = 8;
 /** Cap the prompt fed into the summarizer. */
@@ -172,7 +174,8 @@ export async function compactMessagesForStep(input: {
 
   messages = pruneAggressively(messages, 'before-last-message');
 
-  if (estimateChars(messages) < HARD_CHAR_LIMIT) {
+  // 提配：放宽硬限，继续执行，不因超预算中断；仅在提配后仍超限才摘要。
+  if (estimateChars(messages) < HARD_BOOST_CHAR_LIMIT) {
     return { messages, didPrune, didSummarize };
   }
 

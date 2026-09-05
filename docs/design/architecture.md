@@ -74,7 +74,7 @@ OPCAI 是**本地优先的数字员工工作台**：不是单一聊天工具，�
 - `chat-session.ts`：会话 CRUD、消息回合（superseded 视图）、单会话单活动 run、审批决议与**续跑**；无 client context 时经 `contextResolver` 服务端组装；**Session Rolling Memory**（见 §5.1.1）。
 - `session-memory.ts`：滚动摘要预算/水位线/组装与 roll 纯逻辑。
 - `run-engine.ts`：一次 agent attempt 的执行与记录——结构事件持久化（tool/approval/artifact/sources/终态），`message.delta` 仅透传；审批出现则终态为 `waiting-approval`（停车）。
-- `project.ts`：项目状态机与调度器（parallel/DAG 并发+dependsOn、waterfall/discussion 串行）、任务级审批停车、取消/重试、协调汇总；并发写由 mutex 保护。
+- `project.ts` / `project-plan.ts`：项目 **Plan/Run/ChangeSet** 状态机与统一 DAG 调度器（strategy 仅建边与并发）、任务级审批停车、增量指令失效、成员 replan merge、取消/重试、协调汇总；并发写由 mutex 保护。
 - `types.ts` / `events.ts` / `hub.ts`：规范记录、统一 OrcEvent、进程内发布订阅（供 SSE）。
 - `runner.ts`/`echo-runner.ts`：真实 agent-core runner 与无网确定性 runner（验收/冒烟用）。
 
@@ -128,17 +128,59 @@ OPCAI 是**本地优先的数字员工工作台**：不是单一聊天工具，�
 
 实现：`packages/agent-core/src/skill-runtime.ts`（`publish_to_project` / auto-promote）、`packages/orchestrator/src/project.ts`（注入路径）、`apps/desktop/.../index.cjs`（sync）、`apps/renderer/.../ProjectConversationWorkspace.vue`。
 
-### 5.2 项目调度
+### 5.2 项目编排：Plan / Run / ChangeSet（P0–P1）
+
+项目调度从「整表重写任务列表」升级为**版本化计划 + 增量失效 + 统一 DAG 执行**：
+
+```text
+Goal
+  → Coordinator / 模板 产出 Plan v1（tasks + DAG edges + 可选 contract）
+  → 人确认 → 打开 ProjectRun（绑定 planVersion）
+  → Scheduler 始终按 DAG：dependsOn 满足才就绪；mode 只决定并发度与「如何生成边」
+  → 用户 @员工 发指令 → ChangeSet(instruction)
+        · 目标任务 append 指令并标 stale
+        · 下游依赖级联 stale（上游 completed 保留）
+        · 新开 Run，只重跑 stale/失败节点
+  → 成员增删 → Plan vN+1（replan）
+        · merge：尽量保留可复用的 completed 节点
+        · 移除节点 → superseded（历史保留，不参与调度）
+```
+
+| 概念 | 说明 |
+| --- | --- |
+| **Plan** | `project.plan`（version / strategy / taskIds）；`planHistory` 仅存元数据 |
+| **Run** | `ProjectRun` 一次执行实例，携带 `planVersion` / 可选 `changeSetId` |
+| **ChangeSet** | 增量变更记录（instruction / replan / invalidate），写入 `project.changeSets` |
+| **stale** | 因上游或指令失效、需重跑；不等于删除 |
+| **superseded** | 已退出当前 Plan，仅作历史 |
+| **contract** | 可选任务契约：`outputs` / `acceptance` / `timeoutMs` / `maxAttempts` |
+
+**统一 DAG**：`waterfall` / `discussion` 在建图时物化为线性 `dependsOn`；`parallel` 无边；`dag` 使用显式边。运行时 `drain` 只走依赖就绪集；策略控制并发。调度为 **P2 混合事件驱动**：就绪批次 await 完成，审批停车靠 `notifySchedule` 唤醒。任务 attempt 带 **P3 idempotency key**（`lastAttemptKey`）。
+
+新建时协作模板为**偏好**：协调员两阶段规划（结构→目标）；图形态与偏好不符时弹窗建议切换（见 `project-orchestration.md`）。
+
+API：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| confirm | `POST /projects/:id/confirm` | 打开 Run；completed/superseded 跳过，其余入队 |
+| instructions | `POST /projects/:id/instructions` | ChangeSet + 级联 stale + confirm |
+| replan | `POST /projects/:id/replan` | Plan vN+1 merge + 依赖校验 |
+
+实现：`packages/orchestrator/src/project-plan.ts`、`project.ts`；桌面镜像见 `apps/renderer/.../ProjectsPage.vue`。
+
+### 5.2.1 项目调度（执行环）
 
 ```
-创建(本地生成草案/模板) → POST /api/orch/projects(draft)
+创建(本地生成草案/模板) → POST /api/orch/projects(draft, Plan v1)
 → confirm {}（服务端按任务员工组装模型/Skills/权限档）
 → ProjectService.runScheduler/drain：
-    模式并发/顺序、依赖(dependsOn)解析、任务级审批 park、
-    取消(abort+队列标记)、失败重试、完成汇总(可选 summaryContext)
+    DAG 依赖解析、策略并发、任务级审批 park、
+    取消(abort+队列标记)、失败重试(contract.maxAttempts)、完成汇总
 → 任务 transcript、项目 runs、SSE project 主题事件（桌面轮询/订阅镜像）
 ```
 
+> 旧称「按 mode 分支串行/并行两套调度」已废弃；mode 只影响建图与并发。
 ### 5.3 域存储与密钥（单写者 + keyring）
 
 - Main 的 `storage-get/set` → 转发 `/api/orch/kv`（失败降级旧 sql.js）；启动时一次性迁移旧域键（跳过密钥键）。

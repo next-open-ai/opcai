@@ -7,6 +7,7 @@ import type { AgentRunner } from './runner.js';
 import type { KeyValueStore } from './storage/kv.js';
 import { namespaceKey } from './storage/kv.js';
 import type { GrantCapability, RunActivity, RunApproval, RunRecord, RunStatus } from './types.js';
+import { applyUsageEvent, modelInfoFromRequest } from './usage.js';
 
 export type { OrcEvent };
 
@@ -44,7 +45,7 @@ function isDeltaLike(event: AgentEvent): boolean {
  */
 export class RunEngine {
   constructor(
-    private readonly store: KeyValueStore,
+    readonly store: KeyValueStore,
     private readonly runner: AgentRunner,
     private readonly hub: EventHub<OrcEvent>,
     private readonly runTimeoutMs = 600_000,
@@ -60,6 +61,17 @@ export class RunEngine {
 
   async save(run: RunRecord): Promise<void> {
     await writeJson(this.store, this.runKey(run.id), run);
+  }
+
+  /** All persisted run records (for usage aggregation). */
+  async listRuns(): Promise<RunRecord[]> {
+    const keys = await this.store.keys(`${RUN_NS}:`);
+    const runs: RunRecord[] = [];
+    for (const key of keys) {
+      const run = await readJson<RunRecord>(this.store, key);
+      if (run) runs.push(run);
+    }
+    return runs;
   }
 
   /** Record an approval decision on a run (called by chat/project services). */
@@ -100,6 +112,7 @@ export class RunEngine {
       artifacts: [],
       sources: [],
       eventLog: [],
+      model: modelInfoFromRequest(options.request.model),
     };
 
     const topic = `run:${runId}`;
@@ -196,6 +209,18 @@ export class RunEngine {
           scheduleCheckpoint();
           break;
         }
+        case 'run.usage': {
+          applyUsageEvent(run, event.usage, event.model);
+          publish({
+            type: 'run.usage',
+            runId,
+            sessionId: options.sessionId,
+            usage: run.usage!,
+            model: run.model,
+          });
+          scheduleCheckpoint();
+          break;
+        }
         default:
           scheduleCheckpoint();
           break;
@@ -272,6 +297,12 @@ export class RunEngine {
     run.finishedAt = Date.now();
     await this.save(run);
     publish({ type: 'run.settled', runId, sessionId: options.sessionId, status: run.status, error: run.error });
+    if (run.usage) {
+      // Dynamic import avoids a circular init with usage.ts; compaction is best-effort.
+      void import('./usage.js')
+        .then((mod) => mod.maybeCompactUsage({ store: this.store, engine: this }))
+        .catch(() => undefined);
+    }
     return run;
   }
 

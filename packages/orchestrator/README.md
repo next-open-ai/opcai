@@ -39,3 +39,19 @@ memory?: {
 - 用户可见交付 → 调用 `publish_to_project` 写入 `project.workspacePath`（左侧项目文件树）
 
 详见架构文档 §5.1.2。
+
+## 项目 Plan / Run / ChangeSet（P0–P3）
+
+| 概念 | 含义 |
+| --- | --- |
+| Plan | 版本化任务图（`project.plan`）；`mode` 只用于生成 DAG 边与并发度 |
+| Run | 一次执行实例（`ProjectRun`），绑定 `planVersion` |
+| ChangeSet | 增量变更（指令 / replan）；指令级联 `stale`，不整图重写 |
+| contract | 可选任务契约：`outputs` / `acceptance` / `maxAttempts` 等 |
+| lastAttemptKey | P3 幂等键：`taskId:plan{v}:attempt{n}` |
+
+运行时调度**始终是 DAG**；审批停车靠 schedule pulse 唤醒（P2）。
+
+新建项目协作模板是**偏好**：协调员两阶段规划（结构→目标），形态不匹配时桌面弹窗建议切换。
+
+实现：`src/project-plan.ts` + `src/project.ts`。完整说明见 [`docs/design/project-orchestration.md`](../../docs/design/project-orchestration.md)。

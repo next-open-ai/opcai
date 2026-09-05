@@ -104,6 +104,37 @@ export interface RunSearchSource {
   source?: string;
 }
 
+/** Non-secret model / channel used for a run (for usage attribution). */
+export interface RunModelInfo {
+  provider: string;
+  chatModel: string;
+  baseUrl?: string;
+  providerLabel?: string;
+}
+
+/** One LLM step's token counters within a run. */
+export interface RunUsageStep {
+  at: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+  totalTokens: number;
+}
+
+/** Aggregated token usage for one execution record. */
+export interface RunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  /** Bounded per-step breakdown (newest kept when capped). */
+  steps: RunUsageStep[];
+}
+
 export interface RunRecord {
   id: string;
   /** Owning session id (chat session or project id). */
@@ -127,6 +158,10 @@ export interface RunRecord {
   eventLog: AgentEvent[];
   /** Reason when cancelled. */
   cancelReason?: 'user' | 'timeout';
+  /** Model / provider channel that executed this run. */
+  model?: RunModelInfo;
+  /** Token consumption for this execution (input/output/cache/…). */
+  usage?: RunUsage;
 }
 
 /* ------------------------------------------------------------------ *
@@ -134,9 +169,35 @@ export interface RunRecord {
  * ------------------------------------------------------------------ */
 
 export type ProjectStatus = 'draft' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type ProjectTaskStatus = 'draft' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+/**
+ * Task lifecycle on the active Plan.
+ * - `stale`: completed/queued work invalidated by a ChangeSet; must re-run
+ * - `superseded`: removed from the active Plan (kept for history only)
+ */
+export type ProjectTaskStatus =
+  | 'draft'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'stale'
+  | 'superseded';
+/** Planning strategy — only used to materialize DAG edges; runtime is always DAG. */
 export type ProjectMode = 'waterfall' | 'parallel' | 'discussion' | 'dag';
 export type PermissionTier = 'read-only' | 'default' | 'full';
+
+/** Optional contract attached to a plan node (P1). */
+export interface ProjectTaskContract {
+  /** Expected deliverable hints (paths / kinds). */
+  outputs?: string[];
+  /** Acceptance criteria in natural language. */
+  acceptance?: string;
+  /** Soft timeout for one attempt (ms). */
+  timeoutMs?: number;
+  /** Max attempts before the scheduler leaves the task failed. */
+  maxAttempts?: number;
+}
 
 export interface ProjectTask {
   id: string;
@@ -152,6 +213,45 @@ export interface ProjectTask {
   finishedAt?: number;
   runId?: string;
   error?: string;
+  /** Task-level contract (outputs / acceptance / retry budget). */
+  contract?: ProjectTaskContract;
+  /** Plan version that last mutated this node. */
+  planVersion?: number;
+  /**
+   * Idempotency key for the latest attempt (P3).
+   * Format: `{taskId}:plan{version}:attempt{n}` — prevents duplicate execution
+   * of the same logical attempt after crash/retry storms.
+   */
+  lastAttemptKey?: string;
+}
+
+/**
+ * Versioned execution plan (P0). `Project.tasks` is the materialized graph for
+ * the active plan; history keeps prior versions' metadata (not full snapshots).
+ */
+export interface ProjectPlan {
+  version: number;
+  createdAt: number;
+  strategy: ProjectMode;
+  taskIds: string[];
+  note?: string;
+}
+
+export type ProjectChangeSetKind = 'instruction' | 'replan' | 'invalidate';
+
+/**
+ * Incremental mutation against an active plan (P0). Instructions and partial
+ * invalidations produce a ChangeSet instead of rewriting the whole graph.
+ */
+export interface ProjectChangeSet {
+  id: string;
+  createdAt: number;
+  kind: ProjectChangeSetKind;
+  summary: string;
+  targetTaskIds: string[];
+  invalidatedTaskIds: string[];
+  planVersionBefore: number;
+  planVersionAfter: number;
 }
 
 export interface ProjectMessage {
@@ -161,6 +261,7 @@ export interface ProjectMessage {
   employeeId?: string;
   taskId?: string;
   createdAt: number;
+  changeSetId?: string;
 }
 
 export interface ProjectRun {
@@ -172,6 +273,10 @@ export interface ProjectRun {
   taskIds: string[];
   summary?: string;
   error?: string;
+  /** Plan version this run was opened against. */
+  planVersion?: number;
+  /** Originating ChangeSet when this run was opened by an instruction. */
+  changeSetId?: string;
 }
 
 export interface Project {
@@ -187,9 +292,14 @@ export interface Project {
   updatedAt: number;
   activeRunId?: string;
   summary?: string;
+  /** Active plan metadata (versioned). */
+  plan?: ProjectPlan;
+  /** Previous plan versions (metadata only, newest last). */
+  planHistory?: ProjectPlan[];
+  /** Recent change sets (capped). */
+  changeSets?: ProjectChangeSet[];
   /** Coordinator metadata supplied by the client at confirm time. */
   coordinator?: { provider: string; model: string };
-  /** Latest task transcripts (kept out of Project to bound payload size). */
   /** Grants applied while tasks of this project run (advisory for assemblers). */
   grantsSession?: Record<string, GrantCapability[]>;
   grantsAlways?: Record<string, GrantCapability[]>;

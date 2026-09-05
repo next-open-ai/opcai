@@ -5,6 +5,8 @@ import type {
   EmployeeId,
   ProjectTaskDraft,
 } from "../../app/workspace.js";
+import type { ProjectDraftResult } from "../../app/project-planning.js";
+import { modeLabel } from "../../app/project-planning.js";
 import { employeeDisplayName } from "../../app/employees.js";
 import type { ProviderConfig, ProviderId } from "../../app/model-config.js";
 import { useModelConfig } from "../../app/model-config.js";
@@ -19,6 +21,7 @@ import {
   type ProjectTask,
   type ProjectTaskInput,
 } from "../../app/projects.js";
+import { buildDependencyBlock, buildSummaryEvidence, fitObjective } from "../../app/context-budget.js";
 import ProjectConversationWorkspace from "./ProjectConversationWorkspace.vue";
 import * as orch from "../../services/orchestration.js";
 
@@ -35,7 +38,8 @@ const props = defineProps<{
   generateDraft: (
     goal: string,
     model: ProviderConfig,
-  ) => Promise<ProjectTaskDraft[]>;
+    options?: { employeeIds?: EmployeeId[]; preferredMode?: ProjectMode },
+  ) => Promise<ProjectDraftResult | ProjectTaskDraft[]>;
   runTask: (
     input: {
       projectId: string;
@@ -151,6 +155,8 @@ function adoptServerProject(sp: orch.ServerProject, previous?: Project): Project
         transcript,
         runId: task.runId,
         error: task.error,
+        contract: task.contract,
+        planVersion: task.planVersion,
       };
     }),
     messages: [...previousMessages],
@@ -158,6 +164,9 @@ function adoptServerProject(sp: orch.ServerProject, previous?: Project): Project
     updatedAt: sp.updatedAt,
     activeRunId: sp.activeRunId,
     summary: sp.summary ?? previous?.summary,
+    plan: sp.plan,
+    planHistory: sp.planHistory,
+    changeSets: sp.changeSets,
     managedServer: true,
   };
   // Append any server-side messages we have not mirrored yet.
@@ -561,6 +570,11 @@ const coordinator = computed(
 const workspaceParent = ref("");
 const draftTasks = ref<ProjectTaskInput[]>([]);
 const detailTaskId = ref<string | null>(null);
+const modeSuggestion = ref<{
+  from: ProjectMode;
+  to: ProjectMode;
+  rationale: string;
+} | null>(null);
 const cancelling = new Set<string>();
 const selected = computed(
   () => projects.value.find((item) => item.id === selectedId.value) ?? null,
@@ -782,6 +796,7 @@ function openCreate() {
   goal.value = "";
   mode.value = "parallel";
   draftTasks.value = templateTasks();
+  modeSuggestion.value = null;
   coordinatorId.value = props.models[0]?.id ?? "";
   workspaceParent.value = "";
 }
@@ -789,6 +804,7 @@ function closeCreate() {
   creating.value = false;
   createStep.value = 1;
   error.value = "";
+  modeSuggestion.value = null;
 }
 async function continueCreate() {
   // 名称可选；描述与协调员模型必填。规划成功进入「确认运行」步骤。
@@ -811,19 +827,48 @@ async function generateTasks() {
   }
   planning.value = true;
   error.value = "";
+  modeSuggestion.value = null;
   try {
-    const generated = await props.generateDraft(goal.value, coordinator.value);
-    draftTasks.value = generated.map((task, index) => ({
+    const raw = await props.generateDraft(goal.value, coordinator.value, {
+      preferredMode: mode.value,
+    });
+    const result: ProjectDraftResult = Array.isArray(raw)
+      ? {
+          tasks: raw,
+          preferredMode: mode.value,
+          suggestedMode: mode.value,
+          modeFitsPreferred: true,
+          modeRationale: "",
+        }
+      : raw;
+    draftTasks.value = result.tasks.map((task, index) => ({
       ...task,
       dependsOn:
-        template.value.tasks[index]?.dependsOn ??
-        (mode.value === "waterfall" && index ? [index - 1] : []),
+        task.dependsOn?.length
+          ? task.dependsOn
+          : template.value.tasks[index]?.dependsOn ??
+            (mode.value === "waterfall" && index ? [index - 1] : []),
     }));
+    if (!result.modeFitsPreferred && result.suggestedMode !== mode.value) {
+      modeSuggestion.value = {
+        from: mode.value,
+        to: result.suggestedMode,
+        rationale: result.modeRationale,
+      };
+    }
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "生成任务草案失败。";
   } finally {
     planning.value = false;
   }
+}
+function acceptModeSuggestion() {
+  if (!modeSuggestion.value) return;
+  mode.value = modeSuggestion.value.to;
+  modeSuggestion.value = null;
+}
+function dismissModeSuggestion() {
+  modeSuggestion.value = null;
 }
 async function confirmCreate() {
   if (
@@ -856,12 +901,19 @@ async function confirmCreate() {
       provider: coordinator.value.provider,
       model: coordinator.value.chatModel,
     },
-    tasks: draftTasks.value.map((task) => ({
-      title: task.title,
-      objective: task.objective,
-      employeeId: task.employeeId,
-      skillIds: task.skillIds ?? [],
-    })),
+    tasks: (() => {
+      const ids = draftTasks.value.map(() => crypto.randomUUID());
+      return draftTasks.value.map((task, index) => ({
+        id: ids[index],
+        title: task.title,
+        objective: task.objective,
+        employeeId: task.employeeId,
+        skillIds: task.skillIds ?? [],
+        dependsOn: (task.dependsOn ?? [])
+          .map((item) => ids[item])
+          .filter(Boolean),
+      }));
+    })(),
   });
   const adopted = adoptServerProject(serverProject);
   projects.value = [adopted, ...projects.value];
@@ -924,8 +976,12 @@ function dependencyContext(project: Project, task: ProjectTask) {
   const parents = project.tasks.filter((item) =>
     task.dependsOn.includes(item.id),
   );
-  if (!parents.length) return "";
-  return `\n\n前置任务结果（请以此为依据继续，不重复无关工作）：\n${parents.map((item) => `### ${item.title}\n${item.transcript?.assistantContent ?? "无可用结果"}`).join("\n\n")}`;
+  return buildDependencyBlock(
+    parents.map((item) => ({
+      title: item.title,
+      content: item.transcript?.assistantContent ?? "无可用结果",
+    })),
+  );
 }
 async function executeTask(project: Project, task: ProjectTask) {
   const model = modelFor(task);
@@ -967,7 +1023,7 @@ async function executeTask(project: Project, task: ProjectTask) {
       {
         projectId: project.id,
         taskId: task.id,
-        prompt: `项目模式：${template.value.name}\n项目目标：${project.goal}\n\n当前任务：${task.objective}${dependencyContext(project, task)}\n\n请给出结构化结果：结论、关键依据、交付物/资产、风险与下一步。`,
+        prompt: `项目模式：${template.value.name}\n项目目标：${project.goal}\n\n当前任务：${fitObjective(task.objective)}${dependencyContext(project, task)}\n\n请给出结构化结果：结论、关键依据、交付物/资产、风险与下一步。`,
         employeeId: task.employeeId,
         skillIds: task.skillIds,
         permissionTier: task.permissionTier,
@@ -1032,15 +1088,16 @@ async function run(project: Project) {
         (task) =>
           task.status === "queued" ||
           task.status === "draft" ||
+          task.status === "stale" ||
           task.status === "failed",
       );
       if (!pending.length) break;
       const ready = pending.filter((task) =>
-        task.dependsOn.every(
-          (id) =>
-            project.tasks.find((item) => item.id === id)?.status ===
-            "completed",
-        ),
+        task.dependsOn.every((id) => {
+          const dep = project.tasks.find((item) => item.id === id);
+          if (!dep || dep.status === "superseded") return true;
+          return dep.status === "completed" || dep.status === "cancelled";
+        }),
       );
       const blocked = pending.filter((task) =>
         task.dependsOn.some((id) =>
@@ -1076,12 +1133,12 @@ async function run(project: Project) {
     const aggregator =
       coordinator.value ?? modelFor(done[0] ?? project.tasks[0]);
     if (!aggregator) throw new Error("没有可用协调员模型。");
-    const evidence = done
-      .map(
-        (task) =>
-          `### ${task.title}（${employeeName(task.employeeId)}）\n${task.transcript?.assistantContent ?? ""}`,
-      )
-      .join("\n\n");
+    const evidence = buildSummaryEvidence(
+      done.map((task) => ({
+        title: `${task.title}（${employeeName(task.employeeId)}）`,
+        content: task.transcript?.assistantContent ?? "",
+      })),
+    );
     const synthesis = await props.runTask({
       projectId: project.id,
       taskId: `summary-${record.id}`,
@@ -1131,13 +1188,200 @@ function downstreamTasks(project: Project, taskId: string) {
   visit(taskId);
   return project.tasks.filter((task) => affected.has(task.id));
 }
+
+function validateLocalTaskGraph(tasks: ProjectTask[]): string | null {
+  const ids = new Set(tasks.map((task) => task.id));
+  for (const task of tasks) {
+    for (const dep of task.dependsOn) {
+      if (!ids.has(dep)) return `任务「${task.title}」依赖了不存在的任务。`;
+    }
+  }
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): string | null => {
+    if (visited.has(id)) return null;
+    if (visiting.has(id)) return "任务依赖存在环，无法调度。";
+    visiting.add(id);
+    for (const dep of byId.get(id)?.dependsOn ?? []) {
+      const err = visit(dep);
+      if (err) return err;
+    }
+    visiting.delete(id);
+    visited.add(id);
+    return null;
+  };
+  for (const task of tasks) {
+    const err = visit(task.id);
+    if (err) return err;
+  }
+  return null;
+}
+
+function buildReplannedTasks(
+  project: Project,
+  drafts: ProjectTaskDraft[],
+): ProjectTask[] {
+  const ids = drafts.map(() => crypto.randomUUID());
+  return drafts.map((draft, index) => ({
+    id: ids[index],
+    title: draft.title,
+    objective: draft.objective,
+    employeeId: draft.employeeId,
+    provider: project.coordinatorProvider,
+    model: project.coordinatorModel,
+    skillIds: [...(draft.skillIds ?? [])],
+    dependsOn: (draft.dependsOn ?? [])
+      .map((item) => ids[item])
+      .filter(Boolean),
+    permissionTier: "default" as const,
+    status: "draft" as const,
+    attempts: 0,
+  }));
+}
+
+const rosterBusy = ref(false);
+
+async function replanProjectRoster(project: Project, nextMemberIds: EmployeeId[]) {
+  if (project.status === "running" || rosterBusy.value) return;
+  const roster = [...new Set(nextMemberIds)];
+  if (!roster.length) {
+    error.value = "至少保留一名项目成员。";
+    return;
+  }
+  const model =
+    coordinator.value ??
+    props.models.find(
+      (item) =>
+        item.provider === project.coordinatorProvider &&
+        item.chatModel === project.coordinatorModel,
+    ) ??
+    props.models[0];
+  if (!model) {
+    error.value = "没有可用协调员模型，无法重新规划。";
+    return;
+  }
+  rosterBusy.value = true;
+  error.value = "";
+  try {
+    const generated = await props.generateDraft(project.goal, model, {
+      employeeIds: roster,
+      preferredMode: project.mode,
+    });
+    const taskDrafts = Array.isArray(generated) ? generated : generated.tasks;
+    const tasks = buildReplannedTasks(project, taskDrafts);
+    // Keep completed nodes when employee+title still match (local Plan merge).
+    const kept = new Map<string, ProjectTask>();
+    for (const old of project.tasks) {
+      if (old.status !== "completed") continue;
+      const hit = tasks.find(
+        (task) => task.employeeId === old.employeeId && task.title === old.title,
+      );
+      if (hit) kept.set(hit.id, old);
+    }
+    for (const task of tasks) {
+      const prev = kept.get(task.id);
+      if (!prev) continue;
+      task.status = "completed";
+      task.transcript = prev.transcript;
+      task.runId = prev.runId;
+      task.finishedAt = prev.finishedAt;
+      task.attempts = prev.attempts;
+    }
+    const graphError = validateLocalTaskGraph(tasks);
+    if (graphError) {
+      error.value = graphError;
+      return;
+    }
+    const planVersion = (project.plan?.version ?? 1) + 1;
+    const note = `协调员已发布 Plan v${planVersion}（${roster.map((id) => employeeName(id)).join("、")}），并完成依赖校验。调度器将按 DAG 执行。`;
+    project.planHistory = [...(project.planHistory ?? []), ...(project.plan ? [project.plan] : [])].slice(-20);
+    project.plan = {
+      version: planVersion,
+      createdAt: Date.now(),
+      strategy: project.mode,
+      taskIds: tasks.map((task) => task.id),
+      note,
+    };
+    if (project.managedServer) {
+      await orch.replanProject(project.id, {
+        tasks: tasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          objective: task.objective,
+          employeeId: task.employeeId,
+          skillIds: task.skillIds,
+          dependsOn: task.dependsOn,
+        })),
+        note,
+      });
+      await refreshManaged(project.id);
+      await runManagedProject(project);
+      return;
+    }
+    project.tasks = tasks;
+    project.status = "draft";
+    project.summary = undefined;
+    project.activeRunId = undefined;
+    addProjectMessage(project, {
+      id: crypto.randomUUID(),
+      role: "system",
+      content: note,
+      createdAt: Date.now(),
+    });
+    await update(project);
+    await run(project);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "成员变更后重新规划失败。";
+  } finally {
+    rosterBusy.value = false;
+  }
+}
+
+async function addProjectMember(project: Project, employeeId: EmployeeId) {
+  const current = [...new Set(project.tasks.map((task) => task.employeeId))];
+  if (current.includes(employeeId)) return;
+  await replanProjectRoster(project, [...current, employeeId]);
+}
+
+async function removeProjectMember(project: Project, employeeId: EmployeeId) {
+  const current = [...new Set(project.tasks.map((task) => task.employeeId))];
+  if (!current.includes(employeeId)) return;
+  if (current.length <= 1) {
+    error.value = "至少保留一名项目成员。";
+    return;
+  }
+  await replanProjectRoster(
+    project,
+    current.filter((id) => id !== employeeId),
+  );
+}
+
 async function dispatchProjectInstruction(
   project: Project,
   input: { employeeId: EmployeeId; content: string },
 ) {
-  if (project.status === "running") return;
+  if (project.status === "running" || rosterBusy.value) return;
   if (project.managedServer) {
-    error.value = "服务端托管的项目暂不支持对话式追加指令；请使用任务重试或新建项目。";
+    error.value = "";
+    try {
+      await orch.dispatchProjectInstruction(project.id, {
+        employeeId: input.employeeId,
+        content: input.content,
+        employeeLabel: employeeName(input.employeeId),
+      });
+      await refreshManaged(project.id);
+      const existing = managedPollers.get(project.id);
+      if (existing) clearInterval(existing);
+      managedPollers.set(
+        project.id,
+        setInterval(() => void refreshManaged(project.id), 3000),
+      );
+      startManagedStream(project.id);
+    } catch (cause) {
+      error.value =
+        cause instanceof Error ? cause.message : "服务端调度追加指令失败。";
+    }
     return;
   }
   addProjectMessage(project, {
@@ -1152,23 +1396,26 @@ async function dispatchProjectInstruction(
       .reverse()
       .find((task) => task.employeeId === input.employeeId) ??
     project.tasks.find((task) => task.employeeId === input.employeeId);
-  if (!target) return;
+  if (!target) {
+    error.value = "所选员工不在当前项目成员中。";
+    return;
+  }
   target.objective = `${target.objective}\n\n本轮项目指令：${input.content}`;
-  target.status = "draft";
+  target.status = "stale";
   target.error = undefined;
-  target.transcript = undefined;
+  // Keep prior transcript as evidence until the new attempt finishes.
   const downstream = downstreamTasks(project, target.id);
   downstream.forEach((task) => {
-    task.status = "draft";
+    if (task.status === "superseded") return;
+    task.status = "stale";
     task.error = undefined;
-    task.transcript = undefined;
   });
   addProjectMessage(project, {
     id: crypto.randomUUID(),
     role: "system",
     content: downstream.length
-      ? `调度器已将指令交给${employeeName(input.employeeId)}，并标记 ${downstream.length} 个下游任务将在前置结果更新后跟进。`
-      : `调度器已将指令交给${employeeName(input.employeeId)}；该任务没有下游依赖。`,
+      ? `ChangeSet 已应用：失效 ${employeeName(input.employeeId)} 及 ${downstream.length} 个下游节点（stale）；上游已完成任务保留，调度器按 DAG 增量重跑。`
+      : `ChangeSet 已应用：失效 ${employeeName(input.employeeId)}（无下游依赖）；调度器将增量重跑。`,
     createdAt: Date.now(),
   });
   await update(project);
@@ -1221,7 +1468,7 @@ onBeforeUnmount(() => {
                 {{ createStep === 1 ? '选择项目类型' : createStep === 2 ? '填写信息并规划' : '确认执行方案' }}
               </h2>
               <p class="mt-1 text-sm text-[var(--muted)]">
-                {{ createStep === 1 ? '先选协作模式，再填写目标与协调员模型。' : createStep === 2 ? '描述目标后，用协调员模型生成可编辑任务草案。' : '核对任务分工，确认后进入项目对话工作台由服务端调度。' }}
+                {{ createStep === 1 ? '先选协作偏好，再填写目标与协调员模型。' : createStep === 2 ? '描述目标后，协调员分两阶段规划（结构→目标）；形态不匹配时会建议切换。' : '核对任务分工，确认后进入项目对话工作台由服务端调度。' }}
               </p>
             </div>
             <button class="shrink-0 rounded-lg px-2 py-1 text-sm text-[var(--muted)] hover:bg-[var(--surface-muted)] hover:text-[var(--text)]" type="button" @click="closeCreate">关闭</button>
@@ -1250,7 +1497,7 @@ onBeforeUnmount(() => {
                   <span class="mt-3 inline-block text-[11px] font-semibold text-[var(--accent)]">{{ item.hint }}</span>
                 </button>
               </div>
-              <p class="mt-4 text-xs text-[var(--muted)]">选择项目类型模板后，下一步填写项目名称 / 描述、工作目录，并生成执行草案。</p>
+              <p class="mt-4 text-xs text-[var(--muted)]">协作类型是规划偏好：协调员会尽量按此形态建图；若目标无法匹配，规划后会弹出切换建议。</p>
               <div class="mt-6 flex items-center justify-between">
                 <button class="text-sm text-[var(--muted)]" @click="closeCreate">取消</button>
                 <button class="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white" @click="createStep = 2">下一步：项目信息</button>
@@ -1258,6 +1505,35 @@ onBeforeUnmount(() => {
             </div>
 
             <p v-if="error" class="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{{ error }}</p>
+
+            <!-- 协作类型切换建议（规划器认为当前偏好不匹配） -->
+            <div
+              v-if="modeSuggestion"
+              class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4"
+              @click.self="dismissModeSuggestion"
+            >
+              <div class="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-2xl">
+                <p class="text-[10px] font-bold tracking-[0.14em] text-[var(--accent)]">COLLABORATION FIT</p>
+                <h3 class="mt-2 text-lg font-bold">建议切换协作类型</h3>
+                <p class="mt-2 text-sm leading-6 text-[var(--muted)]">{{ modeSuggestion.rationale }}</p>
+                <div class="mt-4 rounded-xl bg-[var(--surface-muted)] px-3 py-3 text-sm">
+                  <p><span class="text-[var(--muted)]">当前偏好：</span><strong>{{ modeLabel(modeSuggestion.from) }}</strong></p>
+                  <p class="mt-1"><span class="text-[var(--muted)]">建议切换：</span><strong class="text-[var(--accent)]">{{ modeLabel(modeSuggestion.to) }}</strong></p>
+                </div>
+                <div class="mt-5 flex justify-end gap-2">
+                  <button
+                    class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm"
+                    type="button"
+                    @click="dismissModeSuggestion"
+                  >保持 {{ modeLabel(modeSuggestion.from) }}</button>
+                  <button
+                    class="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white"
+                    type="button"
+                    @click="acceptModeSuggestion"
+                  >切换为 {{ modeLabel(modeSuggestion.to) }}</button>
+                </div>
+              </div>
+            </div>
 
             <!-- ② 信息与规划：名称 → 描述 → 目录 → 底部操作 -->
             <div v-if="createStep === 2" class="space-y-5">
@@ -1440,13 +1716,15 @@ onBeforeUnmount(() => {
             :project="selected!"
             :employees="employees"
             :template-name="templates.find((item) => item.id === selected?.mode)?.name ?? '项目'"
-            :running="selected?.status === 'running'"
+            :running="selected?.status === 'running' || rosterBusy"
             :file-tree-epoch="fileTreeEpoch"
             @back="selectedId = null"
             @start="run(selected!)"
             @cancel="cancel(selected!)"
             @remove="deleteProject(selected!); selectedId = null;"
             @dispatch="dispatchProjectInstruction(selected!, $event)"
+            @add-member="addProjectMember(selected!, $event)"
+            @remove-member="removeProjectMember(selected!, $event)"
           />
         </section>
 

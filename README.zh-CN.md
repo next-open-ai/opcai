@@ -24,7 +24,8 @@ Vue renderer ────── HTTP / SSE ────────┘
 | --- | --- |
 | 数字员工 | 职责与授权载体：可配模型、Skills、运行时偏好与权限档位（read-only/default/extended/full） |
 | Skill（渐进加载） | 先授权元信息 → 按需读 `SKILL.md` → 才可在隔离运行工作区访问资源/执行脚本 |
-| 项目编排 | 目标 → 任务草案 → 人工确认 → 服务端调度器（parallel/waterfall/DAG）在多员工间派发 |
+| 项目编排 | 目标 → **Plan vN**（DAG）→ 确认 → **Run**；补充指令走 **ChangeSet** 增量失效下游；成员变更升 Plan 并尽量保留已完成节点 |
+| Skills / MCP / 知识库 | Skills 可安装与授权；MCP 连接；知识库检索可注入对话 |
 | 可续跑审批 | 工具审批把运行停在 `waiting-approval`；决议后自动以同 turn 新 attempt 续跑 |
 | 会话滚动记忆 | 本会话 `memory.summary` + 水位线；超预算自动摘要，切换会话 flush；消息全文仍是真相 |
 | 项目双工作区 | 过程产物在员工 run 空间；最终交付经 `publish_to_project` 进入项目目录并显示在左侧文件树 |

@@ -190,3 +190,120 @@ test('cancel aborts queued work and finishes as cancelled', async () => {
     await orch.close();
   }
 });
+
+test('createDraft materializes waterfall edges and stores Plan v1', async () => {
+  const orch = Orchestrator.memory({ runner: new FakeRunner() });
+  try {
+    const project = await createDraft(orch, '计划版本', 'waterfall', [
+      { title: '一', objective: 'A' },
+      { title: '二', objective: 'B' },
+    ]);
+    assert.equal(project.plan?.version, 1);
+    assert.equal(project.tasks[1].dependsOn[0], project.tasks[0].id);
+  } finally {
+    await orch.close();
+  }
+});
+
+test('dispatchInstruction invalidates target+downstream as ChangeSet without wiping upstream', async () => {
+  const fake = new FakeRunner();
+  const orch = Orchestrator.memory({ runner: fake });
+  try {
+    const project = await orch.projects.createDraft({
+      goal: '增量指令',
+      mode: 'dag',
+      workspacePath: '/tmp/opcai-workspace',
+      coordinator: { provider: 'ollama', model: 'fake-model' },
+      tasks: [
+        { id: 'a', title: '上游', objective: 'A', employeeId: 'research', skillIds: [] },
+        { id: 'b', title: '中游', objective: 'B', employeeId: 'general', skillIds: [], dependsOn: ['a'] },
+        { id: 'c', title: '下游', objective: 'C', employeeId: 'code', skillIds: [], dependsOn: ['b'] },
+      ],
+    });
+    await orch.projects.confirmProject(project.id, { defaultContext: runContext() });
+    await waitFor(async () => (await orch.projects.getProject(project.id))?.status === 'completed');
+
+    const before = await orch.projects.getProject(project.id);
+    assert.ok(before?.tasks.every((task) => task.status === 'completed'));
+    const callsBefore = fake.calls.length;
+
+    await orch.projects.dispatchInstruction(
+      project.id,
+      { employeeId: 'general', content: '补充修订中游', employeeLabel: '通用助理' },
+      { defaultContext: runContext() },
+    );
+    await waitFor(async () => (await orch.projects.getProject(project.id))?.status === 'completed');
+
+    const after = await orch.projects.getProject(project.id);
+    assert.equal(after?.plan?.version, 1);
+    assert.ok((after?.changeSets?.length ?? 0) >= 1);
+    assert.equal(after?.changeSets?.at(-1)?.kind, 'instruction');
+    const upstream = after?.tasks.find((task) => task.id === 'a');
+    assert.equal(upstream?.status, 'completed');
+    assert.ok(fake.calls.length > callsBefore);
+    // Mid + downstream re-executed; upstream kept.
+    assert.ok(fake.calls.length - callsBefore >= 2);
+  } finally {
+    await orch.close();
+  }
+});
+
+test('inferCollaborationMode classifies common graphs', async () => {
+  const { inferCollaborationMode, analyzeModeFit, buildAttemptKey } = await import('../project-plan.js');
+  assert.equal(inferCollaborationMode([{ dependsOn: [] }, { dependsOn: [] }]), 'parallel');
+  assert.equal(
+    inferCollaborationMode([{ dependsOn: [] }, { dependsOn: [0] }, { dependsOn: [1] }]),
+    'waterfall',
+  );
+  assert.equal(
+    inferCollaborationMode([{ dependsOn: [] }, { dependsOn: [] }, { dependsOn: [0, 1] }]),
+    'discussion',
+  );
+  assert.equal(
+    inferCollaborationMode([{ dependsOn: [] }, { dependsOn: [] }, { dependsOn: [0] }, { dependsOn: [1, 2] }]),
+    'dag',
+  );
+  const fit = analyzeModeFit('parallel', [{ dependsOn: [] }, { dependsOn: [0] }]);
+  assert.equal(fit.modeFitsPreferred, false);
+  assert.equal(fit.suggestedMode, 'waterfall');
+  assert.equal(buildAttemptKey('t1', 2, 3), 't1:plan2:attempt3');
+});
+
+test('replan bumps Plan version and can keep completed nodes', async () => {
+  const fake = new FakeRunner();
+  const orch = Orchestrator.memory({ runner: fake });
+  try {
+    const project = await orch.projects.createDraft({
+      goal: '成员变更',
+      mode: 'parallel',
+      workspacePath: '/tmp/opcai-workspace',
+      coordinator: { provider: 'ollama', model: 'fake-model' },
+      tasks: [
+        { id: 't1', title: '调研', objective: '调研', employeeId: 'research', skillIds: [] },
+        { id: 't2', title: '写作', objective: '写作', employeeId: 'general', skillIds: [] },
+      ],
+    });
+    await orch.projects.confirmProject(project.id, { defaultContext: runContext() });
+    await waitFor(async () => (await orch.projects.getProject(project.id))?.status === 'completed');
+
+    await orch.projects.replanProject(project.id, {
+      note: '加入编程助理',
+      tasks: [
+        { id: 't1', title: '调研', objective: '调研', employeeId: 'research', skillIds: [] },
+        { id: 't2', title: '写作', objective: '写作', employeeId: 'general', skillIds: [] },
+        { id: 't3', title: '实现', objective: '实现', employeeId: 'code', skillIds: [] },
+      ],
+    });
+    const replanned = await orch.projects.getProject(project.id);
+    assert.equal(replanned?.plan?.version, 2);
+    assert.equal(replanned?.tasks.find((task) => task.id === 't1')?.status, 'completed');
+    assert.equal(replanned?.tasks.find((task) => task.id === 't3')?.status, 'draft');
+
+    await orch.projects.confirmProject(project.id, { defaultContext: runContext() });
+    await waitFor(async () => (await orch.projects.getProject(project.id))?.status === 'completed');
+    const done = await orch.projects.getProject(project.id);
+    assert.equal(done?.tasks.find((task) => task.id === 't3')?.status, 'completed');
+  } finally {
+    await orch.close();
+  }
+});

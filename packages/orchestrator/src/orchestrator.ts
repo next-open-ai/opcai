@@ -84,4 +84,14 @@ export class Orchestrator {
     const chatRuns = await this.engine.recoverOrphanedRuns();
     return { ...projectResult, chatRuns };
   }
+
+  /** Aggregate token usage across all persisted runs (by model / project / chat). */
+  async usageStats() {
+    const { buildUsageStats } = await import('./usage.js');
+    return buildUsageStats({
+      engine: this.engine,
+      chat: this.chat,
+      projects: this.projects,
+    });
+  }
 }

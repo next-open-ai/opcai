@@ -3,7 +3,7 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { stepCountIs, streamText } from 'ai';
-import type { AgentEvent, AgentProfile, AgentSkillRuntime, ModelConfig } from '@opcai/contracts';
+import type { AgentEvent, AgentProfile, AgentSkillRuntime, ModelConfig, RunModelRef, TokenUsage } from '@opcai/contracts';
 import type { OpcaiTool, ToolPolicy } from '@opcai/tools';
 import { compactMessagesForStep, summarizePlainTurns } from './context-compaction.js';
 import { createSkillExecutionTools, isBusinessDeliverablePath, promoteWorkspaceDeliverablesToProject } from './skill-runtime.js';
@@ -31,6 +31,48 @@ export class PolicyEngine implements ToolPolicy {
   requiresApproval(risk: OpcaiTool['risk']): boolean {
     return risk !== 'read';
   }
+}
+
+function asNonNegInt(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n);
+}
+
+/** Map AI SDK LanguageModelUsage → contracts TokenUsage. */
+export function tokenUsageFromAiSdk(usage: {
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  totalTokens?: number | undefined;
+  inputTokenDetails?: { cacheReadTokens?: number | undefined; cacheWriteTokens?: number | undefined };
+  outputTokenDetails?: { reasoningTokens?: number | undefined };
+}): TokenUsage | null {
+  const inputTokens = asNonNegInt(usage.inputTokens);
+  const outputTokens = asNonNegInt(usage.outputTokens);
+  const cacheReadTokens = asNonNegInt(usage.inputTokenDetails?.cacheReadTokens);
+  const cacheWriteTokens = asNonNegInt(usage.inputTokenDetails?.cacheWriteTokens);
+  const reasoningTokens = asNonNegInt(usage.outputTokenDetails?.reasoningTokens);
+  const totalTokens = asNonNegInt(usage.totalTokens) || inputTokens + outputTokens;
+  if (inputTokens + outputTokens + totalTokens + cacheReadTokens + cacheWriteTokens + reasoningTokens <= 0) {
+    return null;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(cacheReadTokens ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens ? { cacheWriteTokens } : {}),
+    ...(reasoningTokens ? { reasoningTokens } : {}),
+  };
+}
+
+function modelRefFromConfig(model: ModelConfig): RunModelRef {
+  return {
+    provider: model.provider,
+    chatModel: model.chatModel,
+    ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
+    ...(model.providerLabel ? { providerLabel: model.providerLabel } : {}),
+  };
 }
 
 export const defaultProfile: AgentProfile = {
@@ -387,6 +429,8 @@ export async function* streamAgentReply(input: {
     });
     let emittedText = false;
     let lastToolSucceeded: boolean | undefined;
+    let usageSteps = 0;
+    const modelRef = modelRefFromConfig(input.model);
     const emittedArtifactPaths = new Set<string>();
     const pushDeliverable = function* (rawPath: string): Generator<AgentEvent> {
       const normalized = rawPath.replace(/\\/g, '/').replace(/^\/+/, '');
@@ -438,10 +482,35 @@ export async function* streamAgentReply(input: {
           ? ' 写入内容过大或转义失败：请改用更小的 content，或分多次 mode=append / chunks 写入。'
           : '';
         yield { type: 'tool.failed', runId, toolName: part.toolName, summary: `${raw}${hint}` };
+      } else if (part.type === 'finish-step') {
+        const mapped = tokenUsageFromAiSdk(part.usage);
+        if (mapped) {
+          yield { type: 'run.usage', runId, usage: mapped, model: modelRef, stepIndex: usageSteps };
+          usageSteps += 1;
+        }
+      } else if (part.type === 'finish') {
+        if (usageSteps === 0) {
+          const mapped = tokenUsageFromAiSdk(part.totalUsage);
+          if (mapped) {
+            yield { type: 'run.usage', runId, usage: mapped, model: modelRef, stepIndex: 0 };
+            usageSteps += 1;
+          }
+        }
       } else if (part.type === 'error') {
         const raw = part.error instanceof Error ? part.error.message : String(part.error);
         yield { type: 'run.failed', runId, message: friendlyModelError(raw) };
         return;
+      }
+    }
+    if (usageSteps === 0 && !abortSignal.aborted) {
+      try {
+        const mapped = tokenUsageFromAiSdk(await result.totalUsage);
+        if (mapped) {
+          yield { type: 'run.usage', runId, usage: mapped, model: modelRef, stepIndex: 0 };
+          usageSteps += 1;
+        }
+      } catch {
+        /* providers may omit usage */
       }
     }
     if (abortSignal.aborted) {

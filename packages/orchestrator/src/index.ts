@@ -17,16 +17,41 @@ export {
   uncoveredMessages,
 } from './session-memory.js';
 export { ProjectService, PROJECT_KEY_PREFIX, PROJECT_RUN_KEY_PREFIX } from './project.js';
+export {
+  validateProjectTaskGraph,
+} from './project.js';
+export {
+  applyPlanningStrategy,
+  analyzeModeFit,
+  bumpPlan,
+  buildAttemptKey,
+  concurrencyForStrategy,
+  createChangeSet,
+  ensureProjectPlan,
+  inferCollaborationMode,
+  invalidateTaskCascade,
+  isDependencySatisfied,
+  isSchedulableStatus,
+  isTerminalTaskStatus,
+  mergeReplanTasks,
+  normalizeContract,
+  pushChangeSet,
+} from './project-plan.js';
+export {
+  CONTEXT_BUDGET,
+  fitBudget,
+  fitObjective,
+  buildDependencyBlock,
+  buildSummaryEvidence,
+} from './context-budget.js';
 export type {
   CreateProjectDraftInput,
   ConfirmProjectInput,
   ProjectTaskDraft,
   ResolveProjectApprovalInput,
+  DispatchProjectInstructionInput,
+  ReplanProjectInput,
 } from './project.js';
-export { agentCoreRunner } from './runner.js';
-export type { AgentRunner } from './runner.js';
-export { ScriptedRunner, createScriptedRunner } from './echo-runner.js';
-export type { ScriptedRunnerMode } from './echo-runner.js';
 export type {
   ChatMessage,
   ChatSession,
@@ -46,4 +71,15 @@ export type {
   ProjectTaskStatus,
   ProjectMode,
   PermissionTier,
+  ProjectPlan,
+  ProjectChangeSet,
+  ProjectTaskContract,
+  ProjectChangeSetKind,
 } from './types.js';
+export { agentCoreRunner } from './runner.js';
+export type { AgentRunner } from './runner.js';
+export { ScriptedRunner, createScriptedRunner } from './echo-runner.js';
+export type { ScriptedRunnerMode } from './echo-runner.js';
+export { buildUsageStats, emptyRunUsage, modelInfoFromRequest, applyUsageEvent, maybeCompactUsage, usagePeriodKeys, USAGE_DETAIL_LIMIT, USAGE_DETAIL_KEEP } from './usage.js';
+export type { UsageStats, UsageBucketTotals, UsageRollup } from './usage.js';
+export type { RunModelInfo, RunUsage, RunUsageStep } from './types.js';

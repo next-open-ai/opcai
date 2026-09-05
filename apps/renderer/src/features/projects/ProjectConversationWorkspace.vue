@@ -25,14 +25,19 @@ const emit = defineEmits<{
   cancel: [];
   remove: [];
   dispatch: [input: { employeeId: EmployeeId; content: string }];
+  "add-member": [employeeId: EmployeeId];
+  "remove-member": [employeeId: EmployeeId];
   approve: [input: { taskId: string; approvalId: string; allow: boolean; scope: "session" | "always" }];
 }>();
 
 const draft = ref("");
 const pickerOpen = ref(false);
+const mentionMenuOpen = ref(false);
+const mentionActiveIndex = ref(0);
 const selectedEmployeeId = ref<EmployeeId | null>(null);
 const detailEmployeeId = ref<EmployeeId | null>(null);
 const membersDockOpen = ref(false);
+const addMemberOpen = ref(false);
 const sending = ref(false);
 const refreshing = ref(false);
 const filesError = ref("");
@@ -50,6 +55,21 @@ const members = computed(() => {
   return ids
     .map((id) => props.employees.find((employee) => employee.id === id))
     .filter(Boolean) as Employee[];
+});
+const candidateMembers = computed(() =>
+  props.employees.filter((employee) => !members.value.some((item) => item.id === employee.id)),
+);
+const mentionQuery = computed(() => {
+  const match = draft.value.match(/@([^\s]*)$/);
+  return (match?.[1] ?? "").toLowerCase();
+});
+const availableMentionEmployees = computed(() => {
+  const query = mentionQuery.value;
+  return members.value.filter((employee) => {
+    if (!query) return true;
+    const name = employeeName(employee.id).toLowerCase();
+    return name.includes(query) || employee.id.toLowerCase().includes(query);
+  });
 });
 const selectedEmployee = computed(
   () =>
@@ -79,10 +99,12 @@ const detailTasks = computed(() =>
 );
 const statusFor = (employeeId: EmployeeId) => {
   const tasks = props.project.tasks.filter(
-    (task) => task.employeeId === employeeId,
+    (task) => task.employeeId === employeeId && task.status !== "superseded",
   );
   if (tasks.some((task) => task.status === "running")) return "running";
   if (tasks.some((task) => task.status === "failed")) return "failed";
+  if (tasks.some((task) => task.status === "stale" || task.status === "queued" || task.status === "draft"))
+    return tasks.some((task) => task.status === "stale") ? "stale" : "queued";
   if (tasks.length && tasks.every((task) => task.status === "completed"))
     return "completed";
   return "queued";
@@ -94,6 +116,9 @@ const statusText = (status: string) =>
     completed: "已完成",
     failed: "需要处理",
     cancelled: "已取消",
+    stale: "待重跑",
+    superseded: "已替代",
+    draft: "草案",
   })[status] ?? status;
 const statusClass = (status: string) =>
   ({
@@ -102,6 +127,9 @@ const statusClass = (status: string) =>
     completed: "bg-emerald-500/10 text-emerald-600",
     failed: "bg-rose-500/10 text-rose-600",
     cancelled: "bg-amber-500/10 text-amber-700",
+    stale: "bg-amber-500/10 text-amber-700",
+    superseded: "bg-slate-500/10 text-slate-500",
+    draft: "bg-slate-500/10 text-slate-600",
   })[status] ?? "bg-slate-500/10 text-slate-600";
 const statusDotClass = (status: string) =>
   ({
@@ -110,6 +138,9 @@ const statusDotClass = (status: string) =>
     completed: "bg-emerald-500",
     failed: "bg-rose-500 ring-4 ring-rose-500/15",
     cancelled: "bg-amber-500",
+    stale: "bg-amber-500",
+    superseded: "bg-slate-300",
+    draft: "bg-slate-400",
   })[status] ?? "bg-slate-400";
 const employeeName = (id?: EmployeeId) => {
   const employee = props.employees.find((item) => item.id === id);
@@ -344,17 +375,67 @@ async function dispatch() {
     props.running
   )
     return;
+  const content = draft.value
+    .replace(new RegExp(`@${employeeName(selectedEmployeeId.value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`, "g"), "")
+    .trim();
+  if (!content) return;
   sending.value = true;
   try {
     emit("dispatch", {
       employeeId: selectedEmployeeId.value,
-      content: draft.value.trim(),
+      content,
     });
     draft.value = "";
     selectedEmployeeId.value = null;
     pickerOpen.value = false;
+    mentionMenuOpen.value = false;
   } finally {
     sending.value = false;
+  }
+}
+function handleDraftInput() {
+  const opened = /@[^\s]*$/.test(draft.value);
+  if (opened && !mentionMenuOpen.value) mentionActiveIndex.value = 0;
+  mentionMenuOpen.value = opened;
+  if (opened) pickerOpen.value = false;
+}
+function chooseMention(id: EmployeeId) {
+  selectedEmployeeId.value = id;
+  draft.value = draft.value.replace(/@[^\s]*$/, `@${employeeName(id)} `);
+  mentionMenuOpen.value = false;
+}
+function handleDraftKeydown(event: KeyboardEvent) {
+  if (mentionMenuOpen.value && availableMentionEmployees.value.length) {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      mentionActiveIndex.value =
+        (mentionActiveIndex.value + 1) % availableMentionEmployees.value.length;
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      mentionActiveIndex.value =
+        (mentionActiveIndex.value - 1 + availableMentionEmployees.value.length) %
+        availableMentionEmployees.value.length;
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const selected =
+        availableMentionEmployees.value[mentionActiveIndex.value] ??
+        availableMentionEmployees.value[0];
+      chooseMention(selected.id);
+      return;
+    }
+  }
+  if (event.key === "Escape" && mentionMenuOpen.value) {
+    event.preventDefault();
+    mentionMenuOpen.value = false;
+    return;
+  }
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    void dispatch();
   }
 }
 async function download(assetId: string) {
@@ -363,6 +444,19 @@ async function download(assetId: string) {
 function openMember(employeeId: EmployeeId) {
   detailEmployeeId.value = employeeId;
   membersDockOpen.value = false;
+}
+function requestAddMember(employeeId: EmployeeId) {
+  if (props.running) return;
+  addMemberOpen.value = false;
+  emit("add-member", employeeId);
+}
+function requestRemoveMember(employeeId: EmployeeId, event?: Event) {
+  event?.stopPropagation();
+  if (props.running) return;
+  if (members.value.length <= 1) return;
+  if (selectedEmployeeId.value === employeeId) selectedEmployeeId.value = null;
+  if (detailEmployeeId.value === employeeId) detailEmployeeId.value = null;
+  emit("remove-member", employeeId);
 }
 
 onMounted(() => { void loadFiles({ recover: true }); });
@@ -413,6 +507,11 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div class="flex items-center gap-2">
+        <span
+          v-if="project.plan?.version"
+          class="rounded-full bg-[var(--surface-muted)] px-2.5 py-1 text-[11px] font-semibold text-[var(--muted)]"
+          :title="project.plan.note || '当前执行计划版本'"
+        >Plan v{{ project.plan.version }}</span>
         <span :class="['rounded-full px-2.5 py-1 text-xs font-bold', statusClass(project.status)]">{{ statusText(project.status) }}</span>
         <button
           v-if="project.status === 'running'"
@@ -713,22 +812,58 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-6 py-4">
-          <div :class="['mx-auto rounded-2xl border border-[var(--border)] bg-[var(--background)] p-3 shadow-sm', editing ? 'max-w-none' : 'max-w-3xl']">
+          <div :class="['relative mx-auto rounded-2xl border border-[var(--border)] bg-[var(--background)] p-3 shadow-sm', editing ? 'max-w-none' : 'max-w-3xl']">
             <textarea
               v-model="draft"
               rows="3"
               class="w-full resize-none bg-transparent px-1 text-sm outline-none"
               :disabled="running"
-              placeholder="向项目成员下达补充指令；调度器会判断是否需要触发下游任务…"
-              @keydown.enter.exact.prevent="dispatch"
+              placeholder="输入 @ 选择项目员工，再下达补充指令；调度器会按依赖触发下游任务…"
+              @input="handleDraftInput"
+              @keydown="handleDraftKeydown"
             />
+            <div
+              v-if="mentionMenuOpen"
+              class="absolute bottom-[108px] left-3 z-30 w-[280px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-xl"
+            >
+              <div class="border-b border-[var(--border)] px-3 py-2">
+                <p class="text-xs font-bold">@ 选择项目员工</p>
+                <p class="mt-1 text-[11px] text-[var(--muted)]">仅显示当前项目成员；指令仍经调度器执行</p>
+              </div>
+              <div class="max-h-52 overflow-y-auto p-2">
+                <button
+                  v-for="employee in availableMentionEmployees"
+                  :key="employee.id"
+                  :class="[
+                    'flex w-full items-center gap-2 rounded-lg p-2 text-left text-sm hover:bg-[var(--surface-muted)]',
+                    availableMentionEmployees[mentionActiveIndex]?.id === employee.id
+                      ? 'bg-[var(--accent-soft)] text-[var(--accent)]'
+                      : '',
+                  ]"
+                  type="button"
+                  @click="chooseMention(employee.id)"
+                >
+                  <span class="relative grid h-7 w-7 place-items-center rounded-lg text-[10px] font-bold text-white" :style="{ background: employee.color }">
+                    {{ employee.initials }}
+                    <span :class="['absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-white', statusDotClass(statusFor(employee.id))]" />
+                  </span>
+                  <span class="min-w-0 flex-1">
+                    <strong class="block">{{ employeeName(employee.id) }}</strong>
+                    <small class="text-[11px] text-[var(--muted)]">{{ statusText(statusFor(employee.id)) }}</small>
+                  </span>
+                </button>
+                <p v-if="!availableMentionEmployees.length" class="px-2 py-3 text-xs text-[var(--muted)]">
+                  没有可选择的项目成员。请先在右侧新增员工。
+                </p>
+              </div>
+            </div>
             <div class="mt-2 flex items-center gap-2">
               <div class="relative">
                 <button
                   class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold"
                   type="button"
                   :disabled="running"
-                  @click="pickerOpen = !pickerOpen"
+                  @click="pickerOpen = !pickerOpen; mentionMenuOpen = false"
                 >@ {{ selectedEmployee ? employeeName(selectedEmployee.id) : "选择项目员工" }}</button>
                 <div
                   v-if="pickerOpen"
@@ -753,7 +888,7 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
               </div>
-              <span v-if="selectedEmployee" class="text-xs text-[var(--muted)]">将由调度器评估 {{ employeeName(selectedEmployee.id) }} 的后续依赖。</span>
+              <span v-if="selectedEmployee" class="text-xs text-[var(--muted)]">将由调度器评估 {{ employeeName(selectedEmployee.id) }} 及下游依赖。</span>
               <button
                 class="ml-auto rounded-lg bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-40"
                 type="button"
@@ -789,7 +924,37 @@ onBeforeUnmount(() => {
                 <strong class="block text-xs">{{ employeeName(employee.id) }}</strong>
                 <span :class="['mt-0.5 inline-block rounded-full px-1.5 py-0.5 text-[10px] font-bold', statusClass(statusFor(employee.id))]">{{ statusText(statusFor(employee.id)) }}</span>
               </span>
+              <button
+                class="rounded-md px-1.5 py-1 text-[10px] font-semibold text-rose-600 hover:bg-rose-500/10 disabled:opacity-40"
+                type="button"
+                :disabled="running || members.length <= 1"
+                title="移除成员并重新规划"
+                @click="requestRemoveMember(employee.id, $event)"
+              >移除</button>
             </button>
+            <div class="relative mt-2">
+              <button
+                class="w-full rounded-xl border border-dashed border-[var(--border)] px-3 py-2 text-xs font-semibold text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-40"
+                type="button"
+                :disabled="running || !candidateMembers.length"
+                @click="addMemberOpen = !addMemberOpen"
+              >＋ 新增成员</button>
+              <div
+                v-if="addMemberOpen"
+                class="absolute bottom-10 left-0 z-20 w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-xl"
+              >
+                <button
+                  v-for="employee in candidateMembers"
+                  :key="employee.id"
+                  class="flex w-full items-center gap-2 p-2.5 text-left text-xs hover:bg-[var(--surface-muted)]"
+                  type="button"
+                  @click="requestAddMember(employee.id)"
+                >
+                  <span class="grid h-7 w-7 place-items-center rounded-lg text-[10px] font-bold text-white" :style="{ background: employee.color }">{{ employee.initials }}</span>
+                  <strong>{{ employeeName(employee.id) }}</strong>
+                </button>
+              </div>
+            </div>
             <div v-if="totalAssets.length" class="mt-2 border-t border-[var(--border)] pt-2">
               <p class="px-1 text-[10px] font-bold text-[var(--muted)]">资产 · {{ totalAssets.length }}</p>
               <button
@@ -810,37 +975,75 @@ onBeforeUnmount(() => {
         class="min-h-0 border-l border-[var(--border)] bg-[var(--surface)]"
       >
         <div class="border-b border-[var(--border)] px-4 py-4">
-          <div class="flex items-center justify-between">
+          <div class="flex items-center justify-between gap-2">
             <h2 class="text-sm font-bold">项目成员</h2>
-            <span class="text-xs text-[var(--muted)]">{{ members.length }} 人</span>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-[var(--muted)]">{{ members.length }} 人</span>
+              <div class="relative">
+                <button
+                  class="rounded-lg border border-[var(--border)] px-2 py-1 text-[11px] font-semibold text-[var(--accent)] disabled:opacity-40"
+                  type="button"
+                  :disabled="running || !candidateMembers.length"
+                  @click="addMemberOpen = !addMemberOpen"
+                >＋ 新增</button>
+                <div
+                  v-if="addMemberOpen"
+                  class="absolute right-0 top-8 z-20 w-56 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-xl"
+                >
+                  <p class="border-b border-[var(--border)] px-3 py-2 text-[11px] text-[var(--muted)]">加入后将重新规划并校验依赖</p>
+                  <button
+                    v-for="employee in candidateMembers"
+                    :key="employee.id"
+                    class="flex w-full items-center gap-2 p-2.5 text-left text-xs hover:bg-[var(--surface-muted)]"
+                    type="button"
+                    @click="requestAddMember(employee.id)"
+                  >
+                    <span class="grid h-7 w-7 place-items-center rounded-lg text-[10px] font-bold text-white" :style="{ background: employee.color }">{{ employee.initials }}</span>
+                    <strong>{{ employeeName(employee.id) }}</strong>
+                  </button>
+                  <p v-if="!candidateMembers.length" class="px-3 py-3 text-xs text-[var(--muted)]">没有可新增的员工</p>
+                </div>
+              </div>
+            </div>
           </div>
-          <p class="mt-1 text-xs text-[var(--muted)]">点击成员查看任务记录与执行细节。</p>
+          <p class="mt-1 text-xs text-[var(--muted)]">点击成员查看执行细节；新增/移除会触发协调员重规划。</p>
         </div>
         <div class="min-h-0 overflow-y-auto p-3">
-          <button
+          <div
             v-for="employee in members"
             :key="employee.id"
-            class="mb-2 flex w-full items-center gap-3 rounded-xl border border-[var(--border)] p-3 text-left transition hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/30"
-            type="button"
-            @click="openMember(employee.id)"
+            class="mb-2 flex w-full items-center gap-2 rounded-xl border border-[var(--border)] p-3 transition hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/30"
           >
-            <span class="relative grid h-10 w-10 place-items-center rounded-xl text-[10px] font-bold text-white" :style="{ background: employee.color }">
-              <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-spin" />
-              <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-pulse" />
-              {{ employee.initials }}
-              <span :class="['absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-2 border-white', statusDotClass(statusFor(employee.id))]" />
-            </span>
-            <span class="min-w-0 flex-1">
-              <strong class="block text-sm">{{ employeeName(employee.id) }}</strong>
-              <small class="mt-1 block text-[11px] text-[var(--muted)]">
-                {{ project.tasks.filter((task) => task.employeeId === employee.id).length }} 个任务
-              </small>
-              <span :class="['mt-1.5 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold', statusClass(statusFor(employee.id))]">
-                <i :class="['h-1.5 w-1.5 rounded-full', statusDotClass(statusFor(employee.id))]" />
-                {{ statusText(statusFor(employee.id)) }}
+            <button
+              class="flex min-w-0 flex-1 items-center gap-3 text-left"
+              type="button"
+              @click="openMember(employee.id)"
+            >
+              <span class="relative grid h-10 w-10 place-items-center rounded-xl text-[10px] font-bold text-white" :style="{ background: employee.color }">
+                <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-spin" />
+                <i v-if="statusFor(employee.id) === 'running'" class="opcai-run-pulse" />
+                {{ employee.initials }}
+                <span :class="['absolute -right-0.5 -top-0.5 h-3 w-3 rounded-full border-2 border-white', statusDotClass(statusFor(employee.id))]" />
               </span>
-            </span>
-          </button>
+              <span class="min-w-0 flex-1">
+                <strong class="block text-sm">{{ employeeName(employee.id) }}</strong>
+                <small class="mt-1 block text-[11px] text-[var(--muted)]">
+                  {{ project.tasks.filter((task) => task.employeeId === employee.id).length }} 个任务
+                </small>
+                <span :class="['mt-1.5 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold', statusClass(statusFor(employee.id))]">
+                  <i :class="['h-1.5 w-1.5 rounded-full', statusDotClass(statusFor(employee.id))]" />
+                  {{ statusText(statusFor(employee.id)) }}
+                </span>
+              </span>
+            </button>
+            <button
+              class="shrink-0 rounded-lg px-2 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-500/10 disabled:opacity-40"
+              type="button"
+              :disabled="running || members.length <= 1"
+              title="移除成员并重新规划"
+              @click="requestRemoveMember(employee.id)"
+            >移除</button>
+          </div>
           <div v-if="totalAssets.length" class="mt-5 border-t border-[var(--border)] pt-4">
             <p class="text-xs font-bold">项目资产 · {{ totalAssets.length }}</p>
             <button

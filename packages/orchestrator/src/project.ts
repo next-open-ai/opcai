@@ -16,16 +16,30 @@ import type {
   ProjectMessage,
   ProjectRun,
   ProjectTask,
+  ProjectTaskContract,
   RunRecord,
 } from './types.js';
+import {
+  applyPlanningStrategy,
+  bumpPlan,
+  buildAttemptKey,
+  concurrencyForStrategy,
+  createChangeSet,
+  ensureProjectPlan,
+  invalidateTaskCascade,
+  isDependencySatisfied,
+  isTerminalTaskStatus,
+  mergeReplanTasks,
+  normalizeContract,
+  pushChangeSet,
+} from './project-plan.js';
+import { buildDependencyBlock, buildSummaryEvidence, fitObjective } from './context-budget.js';
 
 export const PROJECT_KEY_PREFIX = 'projects:';
 export const PROJECT_RUN_KEY_PREFIX = 'project-run:';
 const PROJECT_NS = 'projects';
 const PROJECT_RUN_NS = 'project-run';
 
-const DEFAULT_TASK_CONCURRENCY = 4;
-const TASK_SETTLE_POLL_MS = 200;
 const PARKED_POLL_MS = 400;
 
 function runWorkspaceRoot(runId: string) {
@@ -43,6 +57,9 @@ export interface ProjectTaskDraft {
   employeeId: string;
   skillIds: string[];
   dependsOn?: string[];
+  /** Optional task contract (outputs / acceptance / retry). */
+  contract?: ProjectTaskContract;
+  permissionTier?: ProjectTask['permissionTier'];
 }
 
 export interface CreateProjectDraftInput {
@@ -75,6 +92,8 @@ export interface ConfirmProjectInput {
   defaultContext?: ChatRunContext;
   /** Optional coordinator context; when given the project runs a summary turn. */
   summaryContext?: ChatRunContext;
+  /** Optional ChangeSet that opened this run (instruction / invalidate). */
+  changeSetId?: string;
 }
 
 export interface ResolveProjectApprovalInput {
@@ -95,10 +114,50 @@ function draftToTask(draft: ProjectTaskDraft): ProjectTask {
     employeeId: draft.employeeId,
     skillIds: [...(draft.skillIds ?? [])],
     dependsOn: [...(draft.dependsOn ?? [])],
-    permissionTier: 'default',
+    permissionTier: draft.permissionTier ?? 'default',
     status: 'draft',
     attempts: 0,
+    contract: normalizeContract(draft.contract),
   };
+}
+
+/** Validate dependsOn references and reject cycles before the scheduler runs. */
+export function validateProjectTaskGraph(
+  tasks: Array<{ id: string; title?: string; dependsOn?: string[]; status?: string }>,
+): void {
+  const active = tasks.filter((task) => task.status !== 'superseded');
+  const ids = new Set(active.map((task) => task.id));
+  for (const task of active) {
+    for (const dep of task.dependsOn ?? []) {
+      if (!ids.has(dep)) {
+        throw new Error(`任务「${task.title || task.id}」依赖了不存在的任务。`);
+      }
+    }
+  }
+  const byId = new Map(active.map((task) => [task.id, task]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    if (visiting.has(id)) throw new Error('任务依赖存在环，无法调度。');
+    visiting.add(id);
+    for (const dep of byId.get(id)?.dependsOn ?? []) visit(dep);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const task of active) visit(task.id);
+}
+
+export interface DispatchProjectInstructionInput {
+  employeeId: string;
+  content: string;
+  /** Optional display label for the system/user message (e.g. employee name). */
+  employeeLabel?: string;
+}
+
+export interface ReplanProjectInput {
+  tasks: ProjectTaskDraft[];
+  note?: string;
 }
 
 interface MutateResult<R> {
@@ -115,6 +174,12 @@ export class ProjectService {
   private readonly contextResolver?: ProjectServiceOptions['contextResolver'];
   /** Transient (never persisted): summary context keyed by active run id. */
   private readonly summaryContextByRun = new Map<string, ChatRunContext>();
+  /** Event-driven schedule waiters (P2): wake drain when a task settles. */
+  private readonly scheduleWaiters = new Map<string, Set<() => void>>();
+  /** Monotonic pulse counter to avoid lost wakeups between wait calls. */
+  private readonly scheduleEpoch = new Map<string, number>();
+  /** In-flight task starts for a project run (dedupe concurrent pulses). */
+  private readonly launchingTasks = new Map<string, Set<string>>();
 
   constructor(options: ProjectServiceOptions) {
     this.store = options.store;
@@ -264,6 +329,17 @@ export class ProjectService {
 
   async createDraft(input: CreateProjectDraftInput): Promise<Project> {
     const now = Date.now();
+    const tasks = input.tasks.map(draftToTask);
+    applyPlanningStrategy(input.mode, tasks);
+    validateProjectTaskGraph(tasks);
+    const plan = {
+      version: 1,
+      createdAt: now,
+      strategy: input.mode,
+      taskIds: tasks.map((task) => task.id),
+      note: '初始规划',
+    };
+    for (const task of tasks) task.planVersion = 1;
     const project: Project = {
       id: randomUUID(),
       name: (input.name ?? '').trim() || input.goal.trim().slice(0, 32),
@@ -274,12 +350,16 @@ export class ProjectService {
       coordinator: input.coordinator,
       grantsSession: {},
       grantsAlways: {},
-      tasks: input.tasks.map(draftToTask),
+      tasks,
+      plan,
+      planHistory: [],
+      changeSets: [],
       messages: [
         {
           id: randomUUID(),
           role: 'system',
-          content: '项目已创建。确认启动后，调度器会按模板编排首轮任务。',
+          content:
+            '项目已创建（Plan v1）。确认启动后，调度器按 DAG 依赖执行；waterfall/parallel 等仅用于生成边。',
           createdAt: now,
         },
       ],
@@ -300,15 +380,145 @@ export class ProjectService {
       if (patch.workspacePath !== undefined) project.workspacePath = patch.workspacePath;
       if (patch.tasks) {
         const byId = new Map(project.tasks.map((task) => [task.id, task]));
-        project.tasks = patch.tasks.map((draft) => {
+        const next = patch.tasks.map((draft) => {
           const task = draftToTask(draft);
           const existing = draft.id ? byId.get(draft.id) : undefined;
           if (existing) task.id = existing.id;
           return task;
         });
+        validateProjectTaskGraph(next);
+        project.tasks = next;
       }
     });
     return out?.project ?? null;
+  }
+
+  /**
+   * Rebuild the task graph after roster changes (Plan vN+1).
+   * Merges completed nodes when possible; marks removed nodes superseded.
+   */
+  async replanProject(id: string, input: ReplanProjectInput): Promise<Project | null> {
+    if (!input.tasks?.length) throw new Error('tasks are required.');
+    const out = await this.mutateProject(id, (project) => {
+      if (project.status === 'running') throw new Error('Project is running.');
+      ensureProjectPlan(project);
+      const incoming = input.tasks.map(draftToTask);
+      applyPlanningStrategy(project.mode, incoming);
+      const roster = new Set(incoming.map((task) => task.employeeId));
+      const merged = mergeReplanTasks(project.tasks, incoming, roster);
+      validateProjectTaskGraph(merged);
+      const active = merged.filter((task) => task.status !== 'superseded');
+      const plan = bumpPlan(
+        project,
+        input.note ?? '成员变更后重新规划',
+        active,
+      );
+      for (const task of active) {
+        if (task.status !== 'completed') {
+          task.status = 'draft';
+          task.error = undefined;
+          task.runId = undefined;
+        }
+        task.planVersion = plan.version;
+      }
+      project.tasks = merged;
+      project.status = 'draft';
+      project.summary = undefined;
+      project.activeRunId = undefined;
+      const changeSet = createChangeSet({
+        kind: 'replan',
+        summary: input.note ?? `Plan 升级到 v${plan.version}`,
+        targetTaskIds: active.map((task) => task.id),
+        invalidatedTaskIds: active.filter((task) => task.status !== 'completed').map((task) => task.id),
+        planVersionBefore: plan.version - 1,
+        planVersionAfter: plan.version,
+      });
+      pushChangeSet(project, changeSet);
+      project.messages.push({
+        id: randomUUID(),
+        role: 'system',
+        content:
+          input.note ??
+          `协调员已发布 Plan v${plan.version}：保留可复用的已完成节点，其余任务待调度器按 DAG 执行。`,
+        createdAt: Date.now(),
+        changeSetId: changeSet.id,
+      });
+    });
+    return out?.project ?? null;
+  }
+
+  /**
+   * Follow-up instruction as a ChangeSet: invalidate target + downstream (stale),
+   * keep upstream completed, then open a new Run via confirm.
+   */
+  async dispatchInstruction(
+    id: string,
+    input: DispatchProjectInstructionInput,
+    confirmInput: ConfirmProjectInput = {},
+  ): Promise<{ project: Project; run: ProjectRun } | null> {
+    const content = input.content.trim();
+    if (!content) throw new Error('Instruction content is required.');
+    const employeeId = input.employeeId.trim();
+    if (!employeeId) throw new Error('employeeId is required.');
+    const label = (input.employeeLabel ?? employeeId).trim() || employeeId;
+
+    let changeSetId: string | undefined;
+    await this.mutateProject(id, (project) => {
+      if (project.status === 'running') throw new Error('Project is already running.');
+      const plan = ensureProjectPlan(project);
+      const target =
+        [...project.tasks].reverse().find(
+          (task) => task.employeeId === employeeId && task.status !== 'superseded',
+        ) ??
+        project.tasks.find(
+          (task) => task.employeeId === employeeId && task.status !== 'superseded',
+        );
+      if (!target) throw new Error('Selected employee is not a project member.');
+
+      const now = Date.now();
+      target.objective = `${target.objective}\n\n本轮项目指令：${content}`;
+      const invalidated = invalidateTaskCascade(project.tasks, target.id, {
+        planVersion: plan.version,
+      });
+
+      const changeSet = createChangeSet({
+        kind: 'instruction',
+        summary: `@${label}: ${content.slice(0, 120)}`,
+        targetTaskIds: [target.id],
+        invalidatedTaskIds: invalidated,
+        planVersionBefore: plan.version,
+        planVersionAfter: plan.version,
+      });
+      pushChangeSet(project, changeSet);
+      changeSetId = changeSet.id;
+
+      project.messages.push({
+        id: randomUUID(),
+        role: 'user',
+        content: `@${label} ${content}`,
+        employeeId,
+        taskId: target.id,
+        createdAt: now,
+        changeSetId: changeSet.id,
+      });
+      project.messages.push({
+        id: randomUUID(),
+        role: 'system',
+        content:
+          invalidated.length > 1
+            ? `ChangeSet 已应用：失效 ${label} 及 ${invalidated.length - 1} 个下游节点（stale）。上游已完成任务保留；调度器将按 DAG 增量重跑。`
+            : `ChangeSet 已应用：失效 ${label}（无下游依赖）。调度器将增量重跑该节点。`,
+        createdAt: Date.now(),
+        changeSetId: changeSet.id,
+      });
+      project.summary = undefined;
+    });
+
+    const result = await this.confirmProject(id, {
+      ...confirmInput,
+      changeSetId,
+    });
+    return result;
   }
 
   async getProject(id: string): Promise<Project | null> {
@@ -357,23 +567,27 @@ export class ProjectService {
   async confirmProject(id: string, input: ConfirmProjectInput = {}): Promise<{ project: Project; run: ProjectRun } | null> {
     const out = await this.mutateProject(id, async (project) => {
       if (project.status === 'running') throw new Error('Project is already running.');
-      if (project.status === 'draft' && project.tasks.length === 0) throw new Error('Project has no tasks to run.');
+      const plan = ensureProjectPlan(project);
+      applyPlanningStrategy(project.mode, project.tasks.filter((task) => task.status !== 'superseded'));
+      validateProjectTaskGraph(project.tasks);
+      const activeTasks = project.tasks.filter((task) => task.status !== 'superseded');
+      if (project.status === 'draft' && activeTasks.length === 0) throw new Error('Project has no tasks to run.');
       const now = Date.now();
       const projectRun: ProjectRun = {
         id: randomUUID(),
         projectId: project.id,
         startedAt: now,
         status: 'running',
-        taskIds: project.tasks.map((task) => task.id),
+        taskIds: activeTasks.map((task) => task.id),
+        planVersion: plan.version,
+        changeSetId: input.changeSetId,
       };
       project.activeRunId = projectRun.id;
       project.status = 'running';
       project.summary = undefined;
       for (const task of project.tasks) {
-        // Completed tasks are kept; everything else (draft/failed/cancelled)
-        // is re-queued so a re-schedule ("再次调度") can recover a project that
-        // was cancelled or stalled.
-        if (task.status === 'completed') continue;
+        // Keep completed + superseded; everything else is re-queued for this Run.
+        if (task.status === 'completed' || task.status === 'superseded') continue;
         task.status = 'queued';
         task.error = undefined;
         task.attempts = 0;
@@ -482,6 +696,7 @@ export class ProjectService {
     if (!resumeContext) return { resumed: false };
     if (approval?.capability === 'network-access') this.grantNetworkHostToContext(resumeContext, approval.summary);
     const resumed = await this.startTask(input.projectId, task, resumeContext);
+    this.notifySchedule(input.projectId);
     return { resumed };
   }
 
@@ -506,12 +721,55 @@ export class ProjectService {
   }
 
   /* ------------------------------------------------------------------ *
-   * Scheduler internals
+   * Scheduler internals (event-driven, P2)
    * ------------------------------------------------------------------ */
 
+  private notifySchedule(projectId: string): void {
+    this.scheduleEpoch.set(projectId, (this.scheduleEpoch.get(projectId) ?? 0) + 1);
+    const waiters = this.scheduleWaiters.get(projectId);
+    if (!waiters?.size) return;
+    for (const wake of waiters) wake();
+    waiters.clear();
+  }
+
+  private waitForScheduleSignal(
+    projectId: string,
+    timeoutMs: number,
+    seenEpoch: number,
+  ): Promise<'signal' | 'timeout'> {
+    if ((this.scheduleEpoch.get(projectId) ?? 0) > seenEpoch) return Promise.resolve('signal');
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (reason: 'signal' | 'timeout') => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const set = this.scheduleWaiters.get(projectId);
+        set?.delete(onSignal);
+        resolve(reason);
+      };
+      const onSignal = () => finish('signal');
+      const timer = setTimeout(() => finish('timeout'), timeoutMs);
+      let set = this.scheduleWaiters.get(projectId);
+      if (!set) {
+        set = new Set();
+        this.scheduleWaiters.set(projectId, set);
+      }
+      set.add(onSignal);
+      // Re-check after registration to close the race with notifySchedule.
+      if ((this.scheduleEpoch.get(projectId) ?? 0) > seenEpoch) finish('signal');
+    });
+  }
+
   private async runScheduler(projectId: string, projectRunId: string, input: ConfirmProjectInput): Promise<void> {
-    await this.drain(projectId, projectRunId, input);
-    await this.maybeFinish(projectId, projectRunId);
+    try {
+      await this.drain(projectId, projectRunId, input);
+      await this.maybeFinish(projectId, projectRunId);
+    } finally {
+      this.scheduleWaiters.delete(projectId);
+      this.scheduleEpoch.delete(projectId);
+      this.launchingTasks.delete(projectId);
+    }
   }
 
   private async isAlive(projectId: string, projectRunId: string): Promise<boolean> {
@@ -530,91 +788,134 @@ export class ProjectService {
     return (await this.runStatusOf(task)) === 'waiting-approval';
   }
 
+  private async resolveTaskContext(
+    task: ProjectTask,
+    input: ConfirmProjectInput,
+  ): Promise<ChatRunContext | undefined> {
+    let runContext = input.runContextByTask?.[task.id] ?? input.defaultContext;
+    if (!runContext && this.contextResolver) {
+      try {
+        runContext = (await this.contextResolver(task)) ?? undefined;
+      } catch {
+        runContext = undefined;
+      }
+    }
+    return runContext;
+  }
+
+  /**
+   * Run ready tasks up to `slots`, awaiting this batch to settle (P2 hybrid):
+   * completion is deterministic; approval parking wakes the drain via notifySchedule.
+   */
+  private async runReadyBatch(
+    projectId: string,
+    projectRunId: string,
+    input: ConfirmProjectInput,
+    ready: ProjectTask[],
+    slots: number,
+  ): Promise<number> {
+    if (slots <= 0 || !ready.length) return 0;
+    const batch = ready.slice(0, slots);
+    let launching = this.launchingTasks.get(projectId);
+    if (!launching) {
+      launching = new Set();
+      this.launchingTasks.set(projectId, launching);
+    }
+    for (const task of batch) launching.add(task.id);
+    await Promise.allSettled(
+      batch.map(async (task) => {
+        try {
+          if (!(await this.isAlive(projectId, projectRunId))) return;
+          const runContext = await this.resolveTaskContext(task, input);
+          if (!runContext) {
+            await this.mutateProject(projectId, (fresh) => {
+              const target = fresh.tasks.find((item) => item.id === task.id);
+              if (target) {
+                target.status = 'failed';
+                target.error = '缺少该任务的运行上下文（模型/Skill 配置）。请先在桌面端配置模型或指定默认上下文。';
+              }
+            });
+            return;
+          }
+          const maxAttempts = task.contract?.maxAttempts;
+          if (maxAttempts && task.attempts >= maxAttempts) {
+            await this.mutateProject(projectId, (fresh) => {
+              const target = fresh.tasks.find((item) => item.id === task.id);
+              if (target) {
+                target.status = 'failed';
+                target.error = `已达到最大尝试次数（${maxAttempts}）。`;
+              }
+            });
+            return;
+          }
+          await this.startTask(projectId, task, runContext);
+        } finally {
+          this.launchingTasks.get(projectId)?.delete(task.id);
+          this.notifySchedule(projectId);
+        }
+      }),
+    );
+    return batch.length;
+  }
+
   private async drain(projectId: string, projectRunId: string, input: ConfirmProjectInput): Promise<void> {
     for (;;) {
       const project = await this.getProject(projectId);
       if (!project || !(await this.isAlive(projectId, projectRunId))) return;
-      const mode = project.mode;
-      const limit = mode === 'parallel' || mode === 'dag' ? DEFAULT_TASK_CONCURRENCY : 1;
+      const limit = concurrencyForStrategy(project.mode);
+      const launching = this.launchingTasks.get(projectId) ?? new Set();
 
       const parked = new Map<string, ProjectTask>();
       const running: ProjectTask[] = [];
       const queued: ProjectTask[] = [];
       for (const task of project.tasks) {
+        if (task.status === 'superseded') continue;
         if (task.status === 'running' && (await this.isParked(task))) parked.set(task.id, task);
-        else if (task.status === 'running') running.push(task);
+        else if (task.status === 'running' || launching.has(task.id)) running.push(task);
         else if (task.status === 'queued') queued.push(task);
       }
 
       const ready: ProjectTask[] = [];
-      if (mode === 'waterfall' || mode === 'discussion') {
-        for (const task of project.tasks) {
-          if (task.status === 'completed' || task.status === 'cancelled') continue;
-          if (task.status === 'failed') {
-            await this.mutateProject(projectId, (fresh) => {
-              for (const later of fresh.tasks) {
-                if (later.status === 'queued') {
-                  later.status = 'failed';
-                  later.error = '前置任务失败，无法继续。';
-                }
-              }
-            });
-            return;
-          }
-          if (parked.has(task.id) || task.status === 'running') break;
-          if (task.status === 'queued') {
-            ready.push(task);
-            break;
-          }
-        }
-      } else {
-        for (const task of queued) {
-          const depsOk = (task.dependsOn ?? []).every((depId) => {
-            const dep = project.tasks.find((item) => item.id === depId);
-            if (!dep) return true;
-            return dep.status === 'completed' || dep.status === 'cancelled';
+      for (const task of queued) {
+        if (launching.has(task.id)) continue;
+        const depsOk = (task.dependsOn ?? []).every((depId) => {
+          const dep = project.tasks.find((item) => item.id === depId);
+          if (!dep) return true;
+          return isDependencySatisfied(dep.status);
+        });
+        if (!depsOk) continue;
+        const blockedByFailure = (task.dependsOn ?? []).some((depId) => {
+          const dep = project.tasks.find((item) => item.id === depId);
+          return dep?.status === 'failed';
+        });
+        if (blockedByFailure) {
+          await this.mutateProject(projectId, (fresh) => {
+            const target = fresh.tasks.find((item) => item.id === task.id);
+            if (target && target.status === 'queued') {
+              target.status = 'failed';
+              target.error = '前置任务失败，无法继续。';
+            }
           });
-          if (depsOk) {
-            ready.push(task);
-            if (running.length + ready.length >= limit) break;
-          }
+          continue;
         }
+        ready.push(task);
       }
 
-      if (ready.length > 0) {
-        await Promise.allSettled(
-          ready.map(async (task) => {
-            let runContext = input.runContextByTask?.[task.id] ?? input.defaultContext;
-            if (!runContext && this.contextResolver) {
-              try {
-                runContext = (await this.contextResolver(task)) ?? undefined;
-              } catch {
-                runContext = undefined;
-              }
-            }
-            if (!runContext) {
-              await this.mutateProject(projectId, (fresh) => {
-                const target = fresh.tasks.find((item) => item.id === task.id);
-                if (target) {
-                  target.status = 'failed';
-                  target.error = '缺少该任务的运行上下文（模型/Skill 配置）。请先在桌面端配置模型或指定默认上下文。';
-                }
-              });
-              return;
-            }
-            await this.startTask(projectId, task, runContext);
-          }),
-        );
-        continue;
-      }
-
-      if (running.length > 0) {
-        await this.waitRunningSettle(projectId, projectRunId, running);
+      const slots = Math.max(0, limit - running.filter((task) => !parked.has(task.id)).length);
+      if (ready.length > 0 && slots > 0) {
+        await this.runReadyBatch(projectId, projectRunId, input, ready, slots);
         continue;
       }
 
       if (parked.size > 0) {
-        await this.waitForApprovalResolution(projectId, projectRunId);
+        const epoch = this.scheduleEpoch.get(projectId) ?? 0;
+        await this.waitForScheduleSignal(projectId, this.runTimeoutMs + 60_000, epoch);
+        continue;
+      }
+
+      if (running.length > 0) {
+        const epoch = this.scheduleEpoch.get(projectId) ?? 0;
+        await this.waitForScheduleSignal(projectId, 15_000, epoch);
         continue;
       }
 
@@ -623,42 +924,12 @@ export class ProjectService {
           for (const task of fresh.tasks) {
             if (task.status === 'queued') {
               task.status = 'failed';
-              task.error = '存在循环依赖，无法继续。';
+              task.error = '存在循环依赖或无法满足的前置条件，无法继续。';
             }
           }
         });
       }
       return;
-    }
-  }
-
-  private async waitRunningSettle(projectId: string, projectRunId: string, running: ProjectTask[]) {
-    const deadline = Date.now() + this.runTimeoutMs + 60_000;
-    while (Date.now() < deadline && (await this.isAlive(projectId, projectRunId))) {
-      let settled = 0;
-      for (const task of running) {
-        const status = await this.runStatusOf(task);
-        if (!status || status !== 'running') settled += 1;
-      }
-      if (settled === running.length) return;
-      await new Promise((resolve) => setTimeout(resolve, TASK_SETTLE_POLL_MS));
-    }
-  }
-
-  private async waitForApprovalResolution(projectId: string, projectRunId: string) {
-    const deadline = Date.now() + this.runTimeoutMs + 300_000;
-    while (Date.now() < deadline && (await this.isAlive(projectId, projectRunId))) {
-      const project = await this.getProject(projectId);
-      if (!project) return;
-      let parked = false;
-      for (const task of project.tasks) {
-        if (task.status === 'running' && (await this.isParked(task))) {
-          parked = true;
-          break;
-        }
-      }
-      if (!parked) return;
-      await new Promise((resolve) => setTimeout(resolve, PARKED_POLL_MS));
     }
   }
 
@@ -673,14 +944,18 @@ export class ProjectService {
         if (await this.isParked(task)) parkedIds.add(task.id);
       }
       const busy = project.tasks.some(
-        (task) => task.status === 'queued' || (task.status === 'running' && !parkedIds.has(task.id)),
+        (task) =>
+          task.status === 'queued' ||
+          task.status === 'stale' ||
+          (task.status === 'running' && !parkedIds.has(task.id)),
       );
       if (busy || parkedIds.size > 0) return { summaryContext: undefined, needsSummary: false };
 
       const activeRunId = project.activeRunId;
       const summaryContext = this.summaryContextByRun.get(activeRunId);
-      const hasFailures = project.tasks.some((task) => task.status === 'failed');
-      const allDone = project.tasks.every((task) => task.status === 'completed' || task.status === 'cancelled');
+      const active = project.tasks.filter((task) => task.status !== 'superseded');
+      const hasFailures = active.some((task) => task.status === 'failed');
+      const allDone = active.every((task) => isTerminalTaskStatus(task.status));
 
       const status: ProjectRun['status'] = hasFailures ? 'failed' : allDone ? 'completed' : 'cancelled';
       const run = await readJson<ProjectRun>(this.store, this.projectRunKey(activeRunId));
@@ -703,19 +978,47 @@ export class ProjectService {
 
   /** Execute one task attempt. Returns false when the run is no longer valid. */
   private async startTask(projectId: string, task: ProjectTask, context: ChatRunContext): Promise<boolean> {
+    const projectSnap = await this.getProject(projectId);
+    const planVersion = projectSnap?.plan?.version ?? 1;
+    const nextAttempt = (projectSnap?.tasks.find((item) => item.id === task.id)?.attempts ?? task.attempts) + 1;
+    const attemptKey = buildAttemptKey(task.id, planVersion, nextAttempt);
+
+    // P3 idempotency: if this attempt key already completed, skip re-execution.
+    const existing = projectSnap?.tasks.find((item) => item.id === task.id);
+    if (existing?.lastAttemptKey === attemptKey && existing.runId) {
+      const prior = await this.engine.load(existing.runId);
+      if (prior?.status === 'completed') {
+        await this.mutateProject(projectId, (latest) => {
+          const target = latest.tasks.find((item) => item.id === task.id);
+          if (target && target.status !== 'completed') {
+            target.status = 'completed';
+            target.error = undefined;
+          }
+        });
+        this.notifySchedule(projectId);
+        return true;
+      }
+    }
+
     const runId = randomUUID();
     const abortHolder: { controller?: AbortController } = {};
     const out = await this.mutateProject(projectId, (project) => {
       if (project.status !== 'running' || !project.activeRunId) return { started: false };
       const current = project.tasks.find((item) => item.id === task.id);
-      if (!current || current.status === 'cancelled') return { started: false };
+      if (!current || current.status === 'cancelled' || current.status === 'superseded') return { started: false };
+      // Another pulse may have claimed this task already.
+      if (current.status === 'running' && current.runId && current.lastAttemptKey === attemptKey) {
+        return { started: false };
+      }
       abortHolder.controller = new AbortController();
       this.taskAborts.set(task.id, abortHolder.controller);
       current.status = 'running';
-      current.attempts += 1;
+      current.attempts = nextAttempt;
       current.startedAt = Date.now();
       current.error = undefined;
       current.runId = runId;
+      current.lastAttemptKey = attemptKey;
+      current.planVersion = planVersion;
       return { started: true };
     });
     if (!out?.result.started) return false;
@@ -723,11 +1026,23 @@ export class ProjectService {
 
     const currentTask = (await this.getProject(projectId))?.tasks.find((item) => item.id === task.id);
     const project = await this.getProject(projectId);
+    const promptTask = currentTask ?? task;
+    const dependencyEntries: Array<{ title: string; content: string }> = [];
+    for (const depId of promptTask.dependsOn ?? []) {
+      const dep = project?.tasks.find((item) => item.id === depId);
+      if (!dep || dep.status !== 'completed') continue;
+      const transcript = await this.taskTranscript(dep);
+      dependencyEntries.push({
+        title: dep.title,
+        content: transcript?.transcript?.trim() || '',
+      });
+    }
+    const userContent = `${fitObjective(promptTask.objective)}${buildDependencyBlock(dependencyEntries)}`;
     const request = {
       ...context,
       runId,
       ...(project?.workspacePath ? { projectWorkspacePath: project.workspacePath } : {}),
-      messages: [{ role: 'user' as const, content: (currentTask ?? task).objective }],
+      messages: [{ role: 'user' as const, content: userContent }],
     };
     let run: RunRecord;
     try {
@@ -760,8 +1075,6 @@ export class ProjectService {
         target.status = 'running';
         target.error = '任务等待审批后继续。';
       } else if ((run.artifacts?.length ?? 0) > 0) {
-        // Deliverables already shipped (publish/register) — don't surface as「需要处理」
-        // just because the model later hit maxSteps / soft tool failures.
         target.status = 'completed';
         target.error = undefined;
       } else {
@@ -770,6 +1083,7 @@ export class ProjectService {
       }
       this.hub.publish(`project:${latest.id}`, { type: 'project.task', projectId: latest.id, taskId: task.id, status: target.status, runId: run.id });
     });
+    this.notifySchedule(projectId);
     return true;
   }
 
@@ -777,13 +1091,16 @@ export class ProjectService {
   private async runSummaryAfterFinish(projectId: string, context: ChatRunContext): Promise<void> {
     const project = await this.getProject(projectId);
     if (!project) return;
-    const parts: string[] = [];
+    const entries: Array<{ title: string; content: string }> = [];
     for (const task of project.tasks) {
       if (task.status !== 'completed') continue;
       const transcript = await this.taskTranscript(task);
-      const text = transcript?.transcript.trim();
-      parts.push(`### ${task.title}\n${text || '(无文本输出)'}`);
+      entries.push({
+        title: task.title,
+        content: transcript?.transcript?.trim() || '(无文本输出)',
+      });
     }
+    const evidence = buildSummaryEvidence(entries);
     const messageId = randomUUID();
     await this.mutateProject(projectId, (fresh) => {
       fresh.messages.push({ id: messageId, role: 'assistant', content: '', createdAt: Date.now(), taskId: 'summary' });
@@ -793,7 +1110,7 @@ export class ProjectService {
       messages: [
         {
           role: 'user' as const,
-          content: `项目目标：${project.goal}\n\n已完成子任务结果（仅作参考）：\n${parts.join('\n\n')}\n\n请汇总最终交付。不要虚构失败任务的信息。`,
+          content: `项目目标：${project.goal}\n\n已完成子任务结果（已按预算提配截断，仅作参考）：\n${evidence}\n\n请汇总最终交付。不要虚构失败任务的信息。`,
         },
       ],
     };

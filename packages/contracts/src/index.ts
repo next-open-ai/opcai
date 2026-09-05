@@ -49,6 +49,26 @@ export const AgentSkillRuntimeSchema = z.object({
 });
 export type AgentSkillRuntime = z.infer<typeof AgentSkillRuntimeSchema>;
 
+/** Normalized token counters for one LLM call or one run aggregate. */
+export const TokenUsageSchema = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative().optional(),
+  cacheWriteTokens: z.number().int().nonnegative().optional(),
+  reasoningTokens: z.number().int().nonnegative().optional(),
+  totalTokens: z.number().int().nonnegative(),
+});
+export type TokenUsage = z.infer<typeof TokenUsageSchema>;
+
+/** Non-secret model / channel identity attached to usage events. */
+export const RunModelRefSchema = z.object({
+  provider: z.string().min(1),
+  chatModel: z.string().min(1),
+  baseUrl: z.string().optional(),
+  providerLabel: z.string().max(120).optional(),
+});
+export type RunModelRef = z.infer<typeof RunModelRefSchema>;
+
 export const AgentEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('run.started'), runId: z.string() }),
   z.object({ type: z.literal('message.delta'), runId: z.string(), text: z.string() }),
@@ -66,6 +86,14 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
   }),
   z.object({ type: z.literal('search.sources'), runId: z.string(), provider: z.string(), sources: z.array(z.object({ title: z.string(), url: z.string().url(), source: z.string().optional() })).max(10) }),
   z.object({ type: z.literal('tool.approval_required'), runId: z.string(), skillId: z.string(), capability: z.enum(['workspace-write', 'script-execution', 'network-access']), summary: z.string() }),
+  z.object({
+    type: z.literal('run.usage'),
+    runId: z.string(),
+    usage: TokenUsageSchema,
+    model: RunModelRefSchema.optional(),
+    /** 0-based LLM step within the run when known. */
+    stepIndex: z.number().int().nonnegative().optional(),
+  }),
   z.object({ type: z.literal('run.completed'), runId: z.string() }),
   z.object({ type: z.literal('run.failed'), runId: z.string(), message: z.string() }),
   z.object({
@@ -83,6 +111,8 @@ export const ModelConfigSchema = z.object({
   provider: ProviderIdSchema,
   baseUrl: z.string().url().optional(),
   chatModel: z.string().min(1),
+  /** Human label of the provider connection / channel (never a secret). */
+  providerLabel: z.string().max(120).optional(),
   disableThinking: z.boolean().optional(),
   /**
    * When true, DashScope-compatible chat requests inject `enable_search: true`

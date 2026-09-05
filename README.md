@@ -24,7 +24,7 @@ channel gateway ─── HTTP / SSE ─────────┘   (Telegram 
 | --- | --- |
 | Digital employees | Responsibility/authorization units with configurable model, Skills, runtime prefs and permission tiers |
 | Skills (progressive disclosure) | Authorize → `SKILL.md` on demand → resources/scripts within an isolated run workspace |
-| Project orchestration | Draft → human confirm → server scheduler (parallel / waterfall / DAG) across multiple employees; resumable approval per task |
+| Project orchestration | Goal → **Plan vN** (DAG) → confirm → **Run**; follow-ups apply a **ChangeSet** (stale cascade); roster changes bump Plan and keep reusable completed nodes |
 | Resumable approvals | Tool approval parks a run (`waiting-approval`); deciding it re-runs the same turn automatically |
 | Session rolling memory | Per-session `memory.summary` + watermark; auto-summarize over budget, flush on leave; transcript stays source of truth |
 | Dual project workspaces | Process files stay in per-run agent workspaces; final deliverables use `publish_to_project` into the shared project tree |

@@ -8,6 +8,7 @@ import { employeeDisplayName } from '../../app/employees';
 import ProviderInstancesEditor from './ProviderInstancesEditor.vue';
 import EnvironmentSettingsCard from './EnvironmentSettingsCard.vue';
 import ConfiguredModelsEditor from './ConfiguredModelsEditor.vue';
+import UsageStatsPanel from './UsageStatsPanel.vue';
 import { searchProviderIds, useSearchConfig, type SearchProviderId } from '../../app/search-config';
 import { knowledgeProviderMeta, useKnowledgeConfig } from '../../app/kb-config';
 import { useNotify } from '../../app/notify';
@@ -26,7 +27,7 @@ const {
 const notify = useNotify();
 const dirty = ref(false);
 const languageLabel: Record<Locale, string> = { 'zh-CN': '简体中文', 'en-US': 'English' };
-type SettingsTab = 'appearance' | 'providers' | 'models' | 'search' | 'knowledge' | 'environment' | 'general';
+type SettingsTab = 'appearance' | 'providers' | 'models' | 'search' | 'knowledge' | 'usage' | 'environment' | 'general';
 const tab = ref<SettingsTab>('providers');
 const tabs: Array<{ id: SettingsTab; labelKey: string }> = [
   { id: 'appearance', labelKey: 'settings.tabAppearance' },
@@ -34,6 +35,7 @@ const tabs: Array<{ id: SettingsTab; labelKey: string }> = [
   { id: 'models', labelKey: 'settings.tabModels' },
   { id: 'search', labelKey: 'settings.tabSearch' },
   { id: 'knowledge', labelKey: 'settings.tabKnowledge' },
+  { id: 'usage', labelKey: 'settings.tabUsage' },
   { id: 'environment', labelKey: 'settings.tabEnvironment' },
   { id: 'general', labelKey: 'settings.tabGeneral' },
 ];
@@ -266,6 +268,10 @@ function resetSearchEndpoint(id: SearchProviderId) {
     <section v-else-if="tab === 'environment'" class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
       <h2 class="mb-4 text-[17px] font-bold">{{ t('settings.tabEnvironment') }}</h2>
       <EnvironmentSettingsCard @open-environment="emit('openEnvironment')" @open-check="emit('openCheck')" />
+    </section>
+
+    <section v-else-if="tab === 'usage'" class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">
+      <UsageStatsPanel />
     </section>
 
     <section v-else class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6">

@@ -15,6 +15,7 @@ export type OrcEvent =
   | { type: 'run.artifact'; runId: string; artifact: { path: string } }
   | { type: 'project.file.published'; runId: string; path: string; projectPath: string; projectId?: string }
   | { type: 'run.sources'; runId: string; sources: RunRecord['sources'] }
+  | { type: 'run.usage'; runId: string; sessionId: string; usage: NonNullable<RunRecord['usage']>; model?: RunRecord['model'] }
   | { type: 'run.settled'; runId: string; sessionId: string; status: RunStatus; error?: string }
   /* chat sessions */
   | { type: 'session.updated'; sessionId: string }

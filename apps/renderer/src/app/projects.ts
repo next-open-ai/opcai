@@ -19,8 +19,36 @@ export type ProjectTaskStatus =
   | "running"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "stale"
+  | "superseded";
 export type ProjectMode = "waterfall" | "parallel" | "discussion" | "dag";
+
+export interface ProjectTaskContract {
+  outputs?: string[];
+  acceptance?: string;
+  timeoutMs?: number;
+  maxAttempts?: number;
+}
+
+export interface ProjectPlan {
+  version: number;
+  createdAt: number;
+  strategy: ProjectMode;
+  taskIds: string[];
+  note?: string;
+}
+
+export interface ProjectChangeSet {
+  id: string;
+  createdAt: number;
+  kind: "instruction" | "replan" | "invalidate";
+  summary: string;
+  targetTaskIds: string[];
+  invalidatedTaskIds: string[];
+  planVersionBefore: number;
+  planVersionAfter: number;
+}
 
 export interface ProjectTask {
   id: string;
@@ -40,6 +68,8 @@ export interface ProjectTask {
   /** Server-side run id of the current/last attempt (maps SSE events → task). */
   runId?: string;
   error?: string;
+  contract?: ProjectTaskContract;
+  planVersion?: number;
 }
 
 export interface ProjectMessage {
@@ -80,6 +110,9 @@ export interface Project {
   updatedAt: number;
   activeRunId?: string;
   summary?: string;
+  plan?: ProjectPlan;
+  planHistory?: ProjectPlan[];
+  changeSets?: ProjectChangeSet[];
   /**
    * M0: true when this project lives on the orchestration server
    * (`/api/orch/projects`) — server owns scheduling/persistence and the page

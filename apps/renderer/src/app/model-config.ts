@@ -355,10 +355,17 @@ export function apiKeyForRequest(config: ProviderConfig) {
 
 export function toModelPayload(config: ProviderConfig, options?: { enableSearch?: boolean }) {
   return {
-    ...config,
-    baseUrl: config.baseUrl || undefined,
+    provider: config.provider,
+    chatModel: config.chatModel,
     apiKey: apiKeyForRequest(config),
+    baseUrl: config.baseUrl || undefined,
+    providerLabel: config.providerLabel || undefined,
+    disableThinking: config.disableThinking || undefined,
     enableSearch: Boolean(options?.enableSearch) && config.supportsBuiltinWebSearch,
+    imageModel: config.imageModel || undefined,
+    embeddingModel: config.embeddingModel || undefined,
+    asrModel: config.asrModel || undefined,
+    ttsModel: config.ttsModel || undefined,
   };
 }
 

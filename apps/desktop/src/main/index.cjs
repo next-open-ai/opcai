@@ -977,63 +977,61 @@ async function waitForApi() {
   throw new Error('OPCAI local API did not become ready.');
 }
 
-function fitWindowToNearestDisplay(win) {
-  if (!win || win.isDestroyed() || win.isFullScreen()) return;
+/** Only nudge if the window is completely off every screen; never clamp mid-drag. */
+function ensureWindowOnScreen(win) {
+  if (!win || win.isDestroyed() || win.isFullScreen() || win.isMaximized()) return;
   const bounds = win.getBounds();
-  const display = screen.getDisplayMatching(bounds);
-  const area = display.workArea;
-  const minW = Math.min(win.getMinimumSize()[0] || 640, area.width);
-  const minH = Math.min(win.getMinimumSize()[1] || 480, area.height);
-  let { x, y, width, height } = bounds;
-  width = Math.min(Math.max(width, minW), area.width);
-  height = Math.min(Math.max(height, minH), area.height);
-  x = Math.min(Math.max(x, area.x), area.x + area.width - width);
-  y = Math.min(Math.max(y, area.y), area.y + area.height - height);
-  if (x !== bounds.x || y !== bounds.y || width !== bounds.width || height !== bounds.height) {
-    win.setBounds({ x, y, width, height }, false);
-  }
+  const displays = screen.getAllDisplays();
+  const onScreen = displays.some((display) => {
+    const a = display.workArea;
+    return bounds.x < a.x + a.width && bounds.x + bounds.width > a.x
+      && bounds.y < a.y + a.height && bounds.y + bounds.height > a.y;
+  });
+  if (onScreen) return;
+  const area = screen.getPrimaryDisplay().workArea;
+  win.setBounds({
+    x: area.x + 48,
+    y: area.y + 48,
+    width: Math.min(bounds.width, Math.max(640, area.width - 96)),
+    height: Math.min(bounds.height, Math.max(480, area.height - 96)),
+  }, false);
 }
 
 async function createWindow() {
   await waitForApi();
-  // Start as a normal movable window (not near-fullscreen / not Space-fullscreen).
-  // macOS: fullscreenable:false makes the green button maximize in-place so the
-  // window can still be dragged to another display; Space fullscreen cannot.
+  // Near work-area size on launch; do not clamp position on every `moved`
+  // (that blocks dragging across monitors).
   const workArea = screen.getPrimaryDisplay().workArea;
-  const width = Math.min(1280, Math.max(960, Math.round(workArea.width * 0.72)));
-  const height = Math.min(860, Math.max(640, Math.round(workArea.height * 0.78)));
+  const margin = 24;
+  const width = Math.max(640, workArea.width - margin * 2);
+  const height = Math.max(480, workArea.height - margin * 2);
   mainWindow = new BrowserWindow({
-    x: workArea.x + Math.round((workArea.width - width) / 2),
-    y: workArea.y + Math.round((workArea.height - height) / 2),
+    x: workArea.x + margin,
+    y: workArea.y + margin,
     width,
     height,
-    // Half of a 1440-wide laptop is ~720px; keep mins below that for Split View / snap.
     minWidth: 640,
     minHeight: 480,
     resizable: true,
     movable: true,
     maximizable: true,
     minimizable: true,
-    fullscreenable: process.platform !== 'darwin',
+    fullscreenable: true,
     fullscreen: false,
     show: false,
     webPreferences: { preload: path.join(__dirname, '../preload/index.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  if (process.platform === 'darwin') {
-    // Prefer maximize over native fullscreen Space (blocks dragging across displays).
-    mainWindow.setFullScreenable(false);
-  }
-  let fitTimer = null;
-  const scheduleFit = () => {
-    if (fitTimer) clearTimeout(fitTimer);
-    fitTimer = setTimeout(() => fitWindowToNearestDisplay(mainWindow), 80);
+  // After the user finishes dragging, only rescue a fully off-screen window.
+  let settleTimer = null;
+  const scheduleEnsureVisible = () => {
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => ensureWindowOnScreen(mainWindow), 400);
   };
-  mainWindow.on('moved', scheduleFit);
-  mainWindow.on('resized', scheduleFit);
-  screen.on('display-metrics-changed', scheduleFit);
+  mainWindow.on('moved', scheduleEnsureVisible);
+  screen.on('display-metrics-changed', scheduleEnsureVisible);
   mainWindow.on('closed', () => {
-    if (fitTimer) clearTimeout(fitTimer);
-    screen.removeListener('display-metrics-changed', scheduleFit);
+    if (settleTimer) clearTimeout(settleTimer);
+    screen.removeListener('display-metrics-changed', scheduleEnsureVisible);
   });
   mainWindow.webContents.on('did-fail-load', (_event, code, description, validatedUrl) => {
     console.error(`[renderer] failed to load (${code}): ${description} (${validatedUrl})`);
@@ -1054,7 +1052,6 @@ async function createWindow() {
   // and leave a hidden process with no visible window. Loading has completed
   // at this point, so show the shell deterministically.
   if (mainWindow.isFullScreen()) mainWindow.setFullScreen(false);
-  fitWindowToNearestDisplay(mainWindow);
   mainWindow.show();
 }
 

@@ -28,7 +28,7 @@ export type CollaborationDelivery = 'synthesize' | 'direct';
 export interface CollaborationRun { employeeId: EmployeeId; task: string; status: 'running' | 'completed' | 'failed'; summary: string; activities: ToolActivity[]; error?: string; }
 export interface Message { id: string; role: 'user' | 'assistant'; content: string; activities?: ToolActivity[]; approvals?: ToolApproval[]; assets?: Asset[]; sources?: Array<SearchSource & { provider: string }>; collaborations?: CollaborationRun[]; collaborationDelivery?: CollaborationDelivery; }
 export interface Conversation { id: string; title: string; employeeId: EmployeeId; messages: Message[]; updatedAt: number; serverSessionId?: string; }
-export interface ProjectTaskDraft { title: string; objective: string; employeeId: EmployeeId; skillIds: string[]; }
+export interface ProjectTaskDraft { title: string; objective: string; employeeId: EmployeeId; skillIds: string[]; dependsOn?: number[]; contract?: { outputs?: string[]; acceptance?: string; timeoutMs?: number; maxAttempts?: number } };
 export interface ProjectTaskTranscript { assistantContent: string; activities: ToolActivity[]; approvals: ToolApproval[]; assets: Array<{ id: string; name: string; sizeBytes: number; runId?: string }>; runId?: string; }
 
 /** Keep in sync with agent-core deliverable contract: only output/ is archived. */
@@ -784,23 +784,116 @@ export function useWorkspace() {
     });
     return transcript;
   };
-  const generateProjectDraft = async (goal: string, model: ProviderConfig): Promise<ProjectTaskDraft[]> => {
-    let output = '';
-    const roster = employees.value.map((item) => item.id).join('|') || 'general|research|code|administrator';
-    const instruction = `You are OPCAI's project coordinator. Decompose the goal below into 2-5 independent, parallelizable tasks. Return ONLY a JSON array. Each item must be {"title": string, "objective": string, "employeeId": one of [${roster}], "skillIds": string[]}. Do not create dependent tasks. Goal: ${goal}`;
-    await streamChat({ profile: { id: 'project-coordinator', name: 'Project coordinator', instructions: 'Create a concise execution draft. Output valid JSON only.', toolIds: [] }, messages: [{ role: 'user', content: instruction }], model: toModelPayload(model), skills: [], searchProviders: runtimeProviders(), maxSteps: DEFAULT_MAX_STEPS }, (delta) => { output += delta; });
+  const generateProjectDraft = async (
+    goal: string,
+    model: ProviderConfig,
+    options?: { employeeIds?: EmployeeId[]; preferredMode?: import('./projects.js').ProjectMode },
+  ): Promise<import('./project-planning.js').ProjectDraftResult> => {
+    const { analyzeModeFit } = await import('./project-planning.js');
+    type ProjectMode = import('./project-planning.js').PlanningMode;
+    const preferredMode: ProjectMode = options?.preferredMode ?? 'parallel';
+    const allowedList = (options?.employeeIds?.length
+      ? options.employeeIds.filter((id) => employees.value.some((item) => item.id === id))
+      : employees.value.map((item) => item.id));
+    const roster = allowedList.join('|') || 'general|research|code|administrator';
+    const allowed = new Set<EmployeeId>(allowedList.length ? allowedList : ['general', 'research', 'code', 'administrator']);
+
+    const modeGuide: Record<ProjectMode, string> = {
+      waterfall: 'Prefer a linear chain: each task depends on the previous index only.',
+      parallel: 'Prefer independent tasks with empty dependsOn; no edges.',
+      discussion: 'Prefer 2+ independent viewpoint tasks, then one integrator that depends on all of them.',
+      dag: 'Prefer an explicit DAG with meaningful fan-in/fan-out dependsOn.',
+    };
+
+    // Phase 1 — structure only (roles + edges).
+    let structureOut = '';
+    const structurePrompt = `You are OPCAI's project coordinator (phase 1: structure). Preferred collaboration mode: ${preferredMode}. ${modeGuide[preferredMode]} If the goal cannot honestly fit that mode, still propose the best graph and set suggestedMode accordingly. Return ONLY JSON: {"suggestedMode":"waterfall|parallel|discussion|dag","rationale":string,"tasks":[{"title":string,"employeeId": one of [${roster}],"dependsOn":number[]}]}. 2-5 tasks. dependsOn are 0-based indices of prior tasks. Goal: ${goal}`;
+    await streamChat({
+      profile: { id: 'project-coordinator-structure', name: 'Project coordinator', instructions: 'Output valid JSON only.', toolIds: [] },
+      messages: [{ role: 'user', content: structurePrompt }],
+      model: toModelPayload(model),
+      skills: [],
+      searchProviders: runtimeProviders(),
+      maxSteps: DEFAULT_MAX_STEPS,
+    }, (delta) => { structureOut += delta; });
+
+    type StructureTask = { title: string; employeeId: EmployeeId; dependsOn: number[] };
+    let structureTasks: StructureTask[] = [];
+    let llmSuggested: ProjectMode | undefined;
+    let llmRationale = '';
     try {
-      const json = output.match(/\[[\s\S]*\]/)?.[0] ?? output;
+      const json = structureOut.match(/\{[\s\S]*\}/)?.[0] ?? structureOut;
+      const parsed = JSON.parse(json) as {
+        suggestedMode?: string;
+        rationale?: string;
+        tasks?: Array<Partial<StructureTask>>;
+      };
+      if (parsed.suggestedMode === 'waterfall' || parsed.suggestedMode === 'parallel' || parsed.suggestedMode === 'discussion' || parsed.suggestedMode === 'dag') {
+        llmSuggested = parsed.suggestedMode;
+      }
+      llmRationale = String(parsed.rationale || '').slice(0, 400);
+      structureTasks = (parsed.tasks ?? []).slice(0, 5).map((item, index) => ({
+        title: String(item.title || `任务 ${index + 1}`).slice(0, 80),
+        employeeId: allowed.has(item.employeeId as EmployeeId) ? item.employeeId as EmployeeId : (allowedList[0] ?? 'general'),
+        dependsOn: Array.isArray(item.dependsOn)
+          ? item.dependsOn.filter((value): value is number => typeof value === 'number' && value >= 0 && value < index)
+          : [],
+      }));
+    } catch { /* fall through to template-ish structure */ }
+
+    if (!structureTasks.length) {
+      structureTasks = (allowedList.length ? allowedList : (['research', 'general', 'code'] as EmployeeId[])).slice(0, 3).map((employeeId, index) => ({
+        title: index === 0 ? '任务分析' : index === 1 ? '方案与产出' : '质量检查',
+        employeeId,
+        dependsOn: preferredMode === 'parallel' ? [] : (index ? [index - 1] : []),
+      }));
+    }
+
+    // Phase 2 — fill objectives + contracts for the fixed structure.
+    let detailOut = '';
+    const detailPrompt = `You are OPCAI's project coordinator (phase 2: objectives). Fill objectives for this fixed task structure. Return ONLY a JSON array aligned 1:1 with the structure (same length/order). Each item: {"objective":string,"skillIds":string[],"contract"?:{"outputs"?:string[],"acceptance"?:string,"maxAttempts"?:number}}. Structure: ${JSON.stringify(structureTasks)}. Goal: ${goal}`;
+    await streamChat({
+      profile: { id: 'project-coordinator-detail', name: 'Project coordinator', instructions: 'Output valid JSON array only.', toolIds: [] },
+      messages: [{ role: 'user', content: detailPrompt }],
+      model: toModelPayload(model),
+      skills: [],
+      searchProviders: runtimeProviders(),
+      maxSteps: DEFAULT_MAX_STEPS,
+    }, (delta) => { detailOut += delta; });
+
+    let details: Array<{ objective: string; skillIds: string[]; contract?: ProjectTaskDraft['contract'] }> = [];
+    try {
+      const json = detailOut.match(/\[[\s\S]*\]/)?.[0] ?? detailOut;
       const parsed = JSON.parse(json) as Array<Partial<ProjectTaskDraft>>;
-      const allowed = new Set<EmployeeId>(employees.value.map((item) => item.id));
-      const cleaned = parsed.slice(0, 5).map((item, index) => ({ title: String(item.title || `任务 ${index + 1}`).slice(0, 80), objective: String(item.objective || goal).slice(0, 2000), employeeId: allowed.has(item.employeeId as EmployeeId) ? item.employeeId as EmployeeId : 'general', skillIds: Array.isArray(item.skillIds) ? item.skillIds.filter((id): id is string => typeof id === 'string').slice(0, 12) : [] }));
-      if (cleaned.length) return cleaned;
-    } catch { /* A conservative local draft remains preferable to blocking the user. */ }
-    return [
-      { title: '任务分析', objective: `分析目标、范围、关键约束与验收标准：${goal}`, employeeId: 'research', skillIds: [] },
-      { title: '方案与产出', objective: `围绕目标提出可执行方案，并生成所需产出：${goal}`, employeeId: 'general', skillIds: [] },
-      { title: '质量检查', objective: `检查方案的完整性、风险和可执行性，并给出改进建议：${goal}`, employeeId: 'code', skillIds: [] },
-    ];
+      details = parsed.slice(0, structureTasks.length).map((item) => ({
+        objective: String(item.objective || goal).slice(0, 2000),
+        skillIds: Array.isArray(item.skillIds) ? item.skillIds.filter((id): id is string => typeof id === 'string').slice(0, 12) : [],
+        contract: item.contract,
+      }));
+    } catch { /* defaults below */ }
+
+    const tasks: ProjectTaskDraft[] = structureTasks.map((item, index) => ({
+      title: item.title,
+      objective: details[index]?.objective || `围绕目标推进「${item.title}」：${goal}`,
+      employeeId: item.employeeId,
+      skillIds: details[index]?.skillIds ?? [],
+      dependsOn: item.dependsOn,
+      contract: details[index]?.contract,
+    }));
+
+    const fit = analyzeModeFit(preferredMode, tasks);
+    // Prefer structural inference; LLM suggestedMode is advisory when it disagrees with graph.
+    const suggestedMode = fit.suggestedMode !== preferredMode ? fit.suggestedMode : (llmSuggested ?? fit.suggestedMode);
+    const modeFitsPreferred = suggestedMode === preferredMode || preferredMode === 'dag';
+    return {
+      tasks,
+      preferredMode,
+      suggestedMode: modeFitsPreferred ? preferredMode : suggestedMode,
+      modeFitsPreferred,
+      modeRationale: modeFitsPreferred
+        ? (llmRationale || fit.modeRationale)
+        : (llmRationale || fit.modeRationale),
+    };
   };
   const approveAndRetry = async (conversationId: string, approval: ToolApproval, scope: 'session' | 'always', model: ProviderConfig) => {
     const conversation = conversations.value.find((item) => item.id === conversationId);

@@ -238,6 +238,11 @@ export const orchestrationRoutes: FastifyPluginAsync = async (app) => {
     return { run };
   });
 
+  app.get('/usage', async () => {
+    const stats = await orch.usageStats();
+    return { stats };
+  });
+
   /* ------------------------------------------------------------------ *
    * Projects
    * ------------------------------------------------------------------ */
@@ -288,6 +293,57 @@ export const orchestrationRoutes: FastifyPluginAsync = async (app) => {
     });
     if (!result) return fail(reply, new Error('Project not found.'));
     return result;
+  });
+
+  /** Coordinator replan after roster changes (add/remove members). */
+  app.post('/projects/:projectId/replan', async (request, reply) => {
+    const projectId = String((request.params as Record<string, string>).projectId);
+    const body = (request.body ?? {}) as { tasks?: CreateProjectDraftInput['tasks']; note?: string };
+    if (!Array.isArray(body.tasks) || !body.tasks.length) {
+      return fail(reply, new Error('tasks are required.'));
+    }
+    try {
+      const project = await orch.projects.replanProject(projectId, {
+        tasks: body.tasks,
+        note: body.note,
+      });
+      if (!project) return fail(reply, new Error('Project not found.'));
+      return { project };
+    } catch (error) {
+      return fail(reply, error instanceof Error ? error : new Error('Replan failed.'));
+    }
+  });
+
+  /** Follow-up instruction → scheduler (target task + downstream deps). */
+  app.post('/projects/:projectId/instructions', async (request, reply) => {
+    const projectId = String((request.params as Record<string, string>).projectId);
+    const body = (request.body ?? {}) as {
+      employeeId?: string;
+      content?: string;
+      employeeLabel?: string;
+    } & ConfirmProjectInput;
+    if (!body.employeeId || !body.content?.trim()) {
+      return fail(reply, new Error('employeeId and content are required.'));
+    }
+    try {
+      const result = await orch.projects.dispatchInstruction(
+        projectId,
+        {
+          employeeId: body.employeeId,
+          content: body.content,
+          employeeLabel: body.employeeLabel,
+        },
+        {
+          runContextByTask: body.runContextByTask,
+          defaultContext: body.defaultContext,
+          summaryContext: body.summaryContext,
+        },
+      );
+      if (!result) return fail(reply, new Error('Project not found.'));
+      return result;
+    } catch (error) {
+      return fail(reply, error instanceof Error ? error : new Error('Dispatch failed.'));
+    }
   });
 
   app.post('/projects/:projectId/cancel', async (request, reply) => {

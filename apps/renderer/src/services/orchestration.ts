@@ -16,7 +16,15 @@ const apiBase = () =>
  * ------------------------------------------------------------------ */
 
 export type ServerProjectStatus = 'draft' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type ServerTaskStatus = 'draft' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type ServerTaskStatus =
+  | 'draft'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'stale'
+  | 'superseded';
 export type ServerProjectMode = 'waterfall' | 'parallel' | 'discussion' | 'dag';
 export type GrantCapability = 'workspace-write' | 'script-execution' | 'network-access';
 
@@ -62,6 +70,80 @@ export interface ServerRunRecord {
   artifacts: ServerRunArtifact[];
   sources: Array<{ title: string; url: string; source?: string }>;
   cancelReason?: 'user' | 'timeout';
+  model?: {
+    provider: string;
+    chatModel: string;
+    baseUrl?: string;
+    providerLabel?: string;
+  };
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+    steps: Array<{
+      at: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      reasoningTokens?: number;
+      totalTokens: number;
+    }>;
+  };
+}
+
+export interface ServerUsageBucket {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  runCount: number;
+}
+
+export interface ServerUsageStats {
+  totals: ServerUsageBucket;
+  byModel: Array<ServerUsageBucket & {
+    key: string;
+    provider: string;
+    chatModel: string;
+    baseUrl?: string;
+    providerLabel?: string;
+  }>;
+  byProject: Array<ServerUsageBucket & { projectId: string; name: string }>;
+  byChat: Array<ServerUsageBucket & { sessionId: string; title: string }>;
+  byDay: Array<ServerUsageBucket & { period: string }>;
+  byWeek: Array<ServerUsageBucket & { period: string }>;
+  byMonth: Array<ServerUsageBucket & { period: string }>;
+  recent: Array<{
+    runId: string;
+    sessionId: string;
+    kind: 'chat' | 'project-task';
+    taskId?: string;
+    startedAt: number;
+    finishedAt?: number;
+    status: ServerRunRecord['status'];
+    provider?: string;
+    chatModel?: string;
+    baseUrl?: string;
+    providerLabel?: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    reasoningTokens: number;
+    totalTokens: number;
+  }>;
+  rollup?: {
+    id: string;
+    periodStart: number;
+    periodEnd: number;
+    mergedRunCount: number;
+  };
 }
 
 export interface ServerTask {
@@ -78,6 +160,13 @@ export interface ServerTask {
   finishedAt?: number;
   runId?: string;
   error?: string;
+  contract?: {
+    outputs?: string[];
+    acceptance?: string;
+    timeoutMs?: number;
+    maxAttempts?: number;
+  };
+  planVersion?: number;
 }
 
 export interface ServerMessage {
@@ -87,6 +176,26 @@ export interface ServerMessage {
   employeeId?: string;
   taskId?: string;
   createdAt: number;
+  changeSetId?: string;
+}
+
+export interface ServerProjectPlan {
+  version: number;
+  createdAt: number;
+  strategy: ServerProjectMode;
+  taskIds: string[];
+  note?: string;
+}
+
+export interface ServerProjectChangeSet {
+  id: string;
+  createdAt: number;
+  kind: 'instruction' | 'replan' | 'invalidate';
+  summary: string;
+  targetTaskIds: string[];
+  invalidatedTaskIds: string[];
+  planVersionBefore: number;
+  planVersionAfter: number;
 }
 
 export interface ServerProject {
@@ -103,6 +212,9 @@ export interface ServerProject {
   activeRunId?: string;
   summary?: string;
   coordinator?: { provider: string; model: string };
+  plan?: ServerProjectPlan;
+  planHistory?: ServerProjectPlan[];
+  changeSets?: ServerProjectChangeSet[];
 }
 
 export interface ServerProjectRun {
@@ -114,6 +226,8 @@ export interface ServerProjectRun {
   taskIds: string[];
   summary?: string;
   error?: string;
+  planVersion?: number;
+  changeSetId?: string;
 }
 
 /* ------------------------------------------------------------------ *
@@ -196,6 +310,33 @@ export async function confirmProject(id: string): Promise<{ project: ServerProje
   const result = await request<{ project: ServerProject; run: ServerProjectRun }>(
     `/projects/${encodeURIComponent(id)}/confirm`,
     { method: 'POST', body: JSON.stringify({}) },
+  );
+  return result;
+}
+
+/** Rebuild task graph after member roster changes. */
+export async function replanProject(
+  id: string,
+  input: {
+    tasks: Array<{ id?: string; title: string; objective: string; employeeId: string; skillIds: string[]; dependsOn?: string[] }>;
+    note?: string;
+  },
+): Promise<ServerProject> {
+  const result = await request<{ project: ServerProject }>(
+    `/projects/${encodeURIComponent(id)}/replan`,
+    { method: 'POST', body: JSON.stringify(input) },
+  );
+  return result.project;
+}
+
+/** Follow-up instruction through the scheduler (resets target + downstream). */
+export async function dispatchProjectInstruction(
+  id: string,
+  input: { employeeId: string; content: string; employeeLabel?: string },
+): Promise<{ project: ServerProject; run: ServerProjectRun }> {
+  const result = await request<{ project: ServerProject; run: ServerProjectRun }>(
+    `/projects/${encodeURIComponent(id)}/instructions`,
+    { method: 'POST', body: JSON.stringify(input) },
   );
   return result;
 }
@@ -330,6 +471,11 @@ export async function chatPendingApprovals(id: string): Promise<ServerRunRecord[
 export async function sessionRuns(id: string): Promise<ServerRunRecord[]> {
   const result = await request<{ runs: ServerRunRecord[] }>(`/sessions/${encodeURIComponent(id)}/runs`);
   return result.runs;
+}
+
+export async function fetchUsageStats(): Promise<ServerUsageStats> {
+  const result = await request<{ stats: ServerUsageStats }>('/usage');
+  return result.stats;
 }
 
 export async function resolveChatApproval(
