@@ -7,6 +7,552 @@ export async function getHealth(): Promise<HealthStatus> {
   return response.json() as Promise<HealthStatus>;
 }
 
+export async function getServerModelConfig() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/model`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Model settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerModelConfig(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/model`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? {}),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save model settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerSearchConfig() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/search`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Search settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerSearchConfig(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/search`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? {}),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save search settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerKnowledgeProviderConfig() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/knowledge/providers`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Knowledge provider settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerKnowledgeProviderConfig(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/knowledge/providers`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? {}),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save knowledge provider settings failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerKnowledgeBases() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/knowledge/bases`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Knowledge bases failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerKnowledgeBases(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/knowledge/bases`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? []),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save knowledge bases failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerMcpConnections() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/mcp/connections`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `MCP connections failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerMcpConnections(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/mcp/connections`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? []),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save MCP connections failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerCapabilitySkills() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/capabilities/skills`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Capability skills failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerCapabilitySkills(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/capabilities/skills`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? []),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save capability skills failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function getServerCapabilityPolicies() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/capabilities/policies`);
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Capability policies failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function saveServerCapabilityPolicies(value: unknown) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/settings/capabilities/policies`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value ?? []),
+  });
+  const body = await response.json().catch(() => ({})) as { message?: string };
+  if (!response.ok) throw new Error(body.message || `Save capability policies failed: ${response.status}`);
+  return body as unknown;
+}
+
+export async function discoverSkills(query: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/discover?${new URLSearchParams({ q: query })}`);
+  const body = await response.json().catch(() => ({})) as {
+    items?: Array<{ reference?: string; source?: string; slug?: string; name?: string; description?: string; installs?: string; url?: string }>;
+    hasMore?: boolean;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Skill discovery failed: ${response.status}`);
+  return {
+    items: Array.isArray(body.items) ? body.items.map((item) => ({
+      reference: String(item.reference || ''),
+      source: String(item.source || ''),
+      slug: String(item.slug || ''),
+      name: String(item.name || ''),
+      description: String(item.description || ''),
+      installs: String(item.installs || ''),
+      url: String(item.url || ''),
+    })) : [],
+    hasMore: Boolean(body.hasMore),
+  };
+}
+
+export async function installSkillPackage(reference: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/install`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reference }),
+  });
+  const body = await response.json().catch(() => ({})) as {
+    manifest?: { path?: string; content?: string } | null;
+    output?: string;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Skill install failed: ${response.status}`);
+  return {
+    output: String(body.output || ''),
+    manifest: body.manifest && typeof body.manifest === 'object'
+      ? {
+        path: String(body.manifest.path || ''),
+        content: String(body.manifest.content || ''),
+      }
+      : null,
+  };
+}
+
+export async function importGitSkill(url: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/import-git`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  const body = await response.json().catch(() => ({})) as {
+    manifests?: Array<{ path?: string; content?: string }>;
+    skipped?: string[];
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Skill git import failed: ${response.status}`);
+  return {
+    manifests: Array.isArray(body.manifests)
+      ? body.manifests.map((item) => ({
+        path: String(item.path || ''),
+        content: String(item.content || ''),
+      }))
+      : [],
+    skipped: Array.isArray(body.skipped) ? body.skipped.map((item) => String(item || '')) : [],
+  };
+}
+
+export async function importSkillZip(input: { filename: string; base64: string }) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/import-zip`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as {
+    manifest?: { path?: string; content?: string } | null;
+    importedFiles?: number;
+    source?: string;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Skill zip import failed: ${response.status}`);
+  return {
+    manifest: body.manifest && typeof body.manifest === 'object'
+      ? { path: String(body.manifest.path || ''), content: String(body.manifest.content || '') }
+      : null,
+    importedFiles: Number(body.importedFiles || 0),
+    source: String(body.source || input.filename),
+  };
+}
+
+export async function listSkillFiles(root: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/files?${new URLSearchParams({ root })}`);
+  const body = await response.json().catch(() => ({})) as {
+    items?: Array<{ path?: string; relative?: string; type?: 'directory' | 'file' }>;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Skill file list failed: ${response.status}`);
+  return Array.isArray(body.items)
+    ? body.items.map((item) => ({
+      path: String(item?.path || ''),
+      relative: String(item?.relative || ''),
+      type: item?.type === 'directory' ? 'directory' as const : 'file' as const,
+    }))
+    : [];
+}
+
+export async function readSkillFile(path: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/file?${new URLSearchParams({ path })}`);
+  const body = await response.json().catch(() => ({})) as { path?: string; content?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Skill read failed: ${response.status}`);
+  return { path: String(body.path || path), content: String(body.content || '') };
+}
+
+export async function writeSkillFile(input: { path: string; content: string }) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/file`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { path?: string; content?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Skill write failed: ${response.status}`);
+  return { path: String(body.path || input.path), content: String(body.content || input.content) };
+}
+
+export async function writeSkillDraft(input: { name: string; content: string }) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills/draft`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { path?: string; content?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Skill draft save failed: ${response.status}`);
+  return { path: String(body.path || ''), content: String(body.content || '') };
+}
+
+export async function deleteManagedSkill(path: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/skills?${new URLSearchParams({ path })}`, { method: 'DELETE' });
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; message?: string };
+  if (!response.ok) throw new Error(body.message || `Skill delete failed: ${response.status}`);
+  return Boolean(body.ok);
+}
+
+export async function createManagedWorkspace(name: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/create`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  const body = await response.json().catch(() => ({})) as { root?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Workspace create failed: ${response.status}`);
+  return String(body.root || '');
+}
+
+export async function listWorkspaceFiles(root: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/files?${new URLSearchParams({ root })}`);
+  const body = await response.json().catch(() => ([])) as Array<{ relative?: string; type?: 'directory' | 'file' }> | { message?: string };
+  if (!response.ok || !Array.isArray(body)) throw new Error((body as { message?: string }).message || `Workspace files failed: ${response.status}`);
+  return body.map((item): { relative: string; type: 'directory' | 'file' } => ({
+    relative: String(item.relative || ''),
+    type: item.type === 'directory' ? 'directory' : 'file',
+  }));
+}
+
+export async function readWorkspaceFile(root: string, relative: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/file?${new URLSearchParams({ root, relative })}`);
+  const body = await response.json().catch(() => ({})) as { relative?: string; content?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Workspace file read failed: ${response.status}`);
+  return { relative: String(body.relative || relative), content: String(body.content || '') };
+}
+
+export async function writeWorkspaceFile(root: string, relative: string, content: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/file`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ root, relative, content }),
+  });
+  const body = await response.json().catch(() => ({})) as { relative?: string; content?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Workspace file write failed: ${response.status}`);
+  return { relative: String(body.relative || relative), content: String(body.content || '') };
+}
+
+export async function syncWorkspaceRun(root: string, runId: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/sync-run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ root, runId }),
+  });
+  const body = await response.json().catch(() => ([])) as Array<{ relative?: string; type?: 'directory' | 'file' }> | { message?: string };
+  if (!response.ok || !Array.isArray(body)) throw new Error((body as { message?: string }).message || `Workspace sync failed: ${response.status}`);
+  return body.map((item): { relative: string; type: 'directory' | 'file' } => ({
+    relative: String(item.relative || ''),
+    type: item.type === 'directory' ? 'directory' : 'file',
+  }));
+}
+
+export async function materializeWorkspaceAssets(root: string, items: Array<{ assetId?: string; relativePath?: string; name?: string }>) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/materialize-assets`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ root, items }),
+  });
+  const body = await response.json().catch(() => ([])) as Array<{ relative?: string; type?: 'directory' | 'file' }> | { message?: string };
+  if (!response.ok || !Array.isArray(body)) throw new Error((body as { message?: string }).message || `Workspace materialize failed: ${response.status}`);
+  return body.map((item): { relative: string; type: 'directory' | 'file' } => ({
+    relative: String(item.relative || ''),
+    type: item.type === 'directory' ? 'directory' : 'file',
+  }));
+}
+
+export async function importWorkspaceZip(input: { root: string; filename: string; base64: string }) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/import-zip`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    source?: string;
+    importedFiles?: number;
+    files?: Array<{ relative?: string; type?: 'directory' | 'file' }>;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Workspace zip import failed: ${response.status}`);
+  return {
+    ok: Boolean(body.ok),
+    source: String(body.source || input.filename),
+    importedFiles: Number(body.importedFiles || 0),
+    files: Array.isArray(body.files) ? body.files.map((item) => ({
+      relative: String(item.relative || ''),
+      type: item.type === 'directory' ? 'directory' as const : 'file' as const,
+    })) : [],
+  };
+}
+
+export async function exportWorkspaceZip(root: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/export-zip?${new URLSearchParams({ root })}`);
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; filename?: string; base64?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Workspace zip export failed: ${response.status}`);
+  return {
+    ok: Boolean(body.ok),
+    filename: String(body.filename || 'workspace.zip'),
+    base64: String(body.base64 || ''),
+  };
+}
+
+export async function readWorkspacePreview(root: string, relative: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/workspace/preview?${new URLSearchParams({ root, relative })}`);
+  const body = await response.json().catch(() => ({})) as {
+    kind?: 'text' | 'binary';
+    name?: string;
+    relative?: string;
+    content?: string;
+    base64?: string;
+    bytes?: number;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Workspace preview failed: ${response.status}`);
+  return {
+    kind: (body.kind === 'binary' ? 'binary' : 'text') as 'text' | 'binary',
+    name: String(body.name || ''),
+    relative: body.relative ? String(body.relative) : undefined,
+    content: typeof body.content === 'string' ? body.content : undefined,
+    base64: typeof body.base64 === 'string' ? body.base64 : undefined,
+    bytes: Number(body.bytes || 0),
+  };
+}
+
+export interface AssetPayload {
+  id: string;
+  name: string;
+  relativePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  createdAt: number;
+  conversationId: string | null;
+  employeeId: string | null;
+  runId: string;
+  sha256: string;
+  projectId: string | null;
+  workspaceRelative: string | null;
+}
+
+function normalizeAsset(item: Partial<AssetPayload>): AssetPayload {
+  return {
+    id: String(item.id || ''),
+    name: String(item.name || ''),
+    relativePath: String(item.relativePath || ''),
+    mimeType: String(item.mimeType || ''),
+    sizeBytes: Number(item.sizeBytes || 0),
+    createdAt: Number(item.createdAt || 0),
+    conversationId: item.conversationId ? String(item.conversationId) : null,
+    employeeId: item.employeeId ? String(item.employeeId) : null,
+    runId: String(item.runId || ''),
+    sha256: String(item.sha256 || ''),
+    projectId: item.projectId ? String(item.projectId) : null,
+    workspaceRelative: item.workspaceRelative ? String(item.workspaceRelative) : null,
+  };
+}
+
+export async function listArchivedAssets() {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/assets`);
+  const body = await response.json().catch(() => ([])) as Array<Partial<AssetPayload>> | { message?: string };
+  if (!response.ok || !Array.isArray(body)) throw new Error((body as { message?: string }).message || `Assets list failed: ${response.status}`);
+  return body.map((item) => normalizeAsset(item));
+}
+
+export async function archiveWorkspaceArtifact(input: {
+  runId: string;
+  relativePath: string;
+  conversationId?: string;
+  employeeId?: string;
+  projectId?: string;
+}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/assets/archive`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as Partial<AssetPayload> & { message?: string };
+  if (!response.ok) throw new Error(body.message || `Asset archive failed: ${response.status}`);
+  return normalizeAsset(body);
+}
+
+export async function linkArchivedAssets(input: { projectId: string; assetIds: string[]; workspacePath?: string }) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/assets/link`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { updated?: number; copied?: number; projectId?: string; message?: string };
+  if (!response.ok) throw new Error(body.message || `Asset link failed: ${response.status}`);
+  return {
+    updated: Number(body.updated || 0),
+    copied: Number(body.copied || 0),
+    projectId: String(body.projectId || input.projectId),
+  };
+}
+
+export async function unlinkArchivedAssets(assetIds: string[]) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/assets/unlink`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ assetIds }),
+  });
+  const body = await response.json().catch(() => ({})) as { updated?: number; message?: string };
+  if (!response.ok) throw new Error(body.message || `Asset unlink failed: ${response.status}`);
+  return { updated: Number(body.updated || 0) };
+}
+
+export async function readArchivedAssetPreview(assetId: string) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/assets/preview?${new URLSearchParams({ assetId })}`);
+  const body = await response.json().catch(() => ({})) as {
+    kind?: 'text' | 'binary';
+    name?: string;
+    content?: string;
+    base64?: string;
+    bytes?: number;
+    mimeType?: string;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Asset preview failed: ${response.status}`);
+  return {
+    kind: (body.kind === 'binary' ? 'binary' : 'text') as 'text' | 'binary',
+    name: String(body.name || ''),
+    content: typeof body.content === 'string' ? body.content : undefined,
+    base64: typeof body.base64 === 'string' ? body.base64 : undefined,
+    bytes: Number(body.bytes || 0),
+    mimeType: typeof body.mimeType === 'string' ? body.mimeType : undefined,
+  };
+}
+
+export function workspaceContentUrl(root: string, relative: string, options: { download?: boolean } = {}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const params = new URLSearchParams({ root, relative, ...(options.download ? { download: '1' } : {}) });
+  return `${apiBase}/api/workspace/content?${params.toString()}`;
+}
+
+export function archivedAssetContentUrl(assetId: string, options: { download?: boolean } = {}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const params = new URLSearchParams({ assetId, ...(options.download ? { download: '1' } : {}) });
+  return `${apiBase}/api/assets/content?${params.toString()}`;
+}
+
 export interface RuntimeSkill {
   id: string; name: string; description: string; mode: 'available' | 'default'; rootPath?: string; instructions?: string;
   resources: Array<{ path: string; content: string }>;
@@ -396,4 +942,115 @@ export async function testMcpConnection(connection: McpConnectionPayload, timeou
     tools,
     durationMs: Number(body.durationMs) || 0,
   };
+}
+
+export async function testProviderConnection(input: {
+  type: string;
+  baseUrl?: string;
+  apiKey?: string;
+}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/providers/test`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; message?: string };
+  if (!response.ok || body.ok === false) throw new Error(body.message || `Provider test failed: ${response.status}`);
+  return { ok: true as const, message: body.message || '连接成功。' };
+}
+
+export async function listProviderModels(input: {
+  type: string;
+  baseUrl?: string;
+  apiKey?: string;
+}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/providers/models`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { models?: unknown[]; message?: string };
+  if (!response.ok) throw new Error(body.message || `List provider models failed: ${response.status}`);
+  return Array.isArray(body.models) ? body.models.map((item) => String(item || '')).filter(Boolean) : [];
+}
+
+export async function pullOllamaModel(input: {
+  baseUrl?: string;
+  modelName: string;
+}) {
+  const apiBase = window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+  const response = await fetch(`${apiBase}/api/providers/ollama/pull`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; status?: string; message?: string };
+  if (!response.ok || body.ok === false) throw new Error(body.message || `Ollama pull failed: ${response.status}`);
+  return body.status || 'success';
+}
+
+export type RemoteChannelSecrets = {
+  telegram?: { botToken?: string };
+  feishu?: { appSecret?: string };
+  relay?: { token?: string };
+};
+
+export type RemoteChannelMeta = {
+  version?: number;
+  defaultEmployeeId?: string;
+  allowlist?: string[];
+  channels?: {
+    telegram?: { enabled?: boolean };
+    feishu?: { enabled?: boolean; appId?: string };
+    relay?: { enabled?: boolean; baseUrl?: string; deviceId?: string };
+  };
+};
+
+function remoteApiBase() {
+  return window.location.protocol === 'file:' ? 'http://127.0.0.1:4318' : '';
+}
+
+export async function getRemoteSettings() {
+  const response = await fetch(`${remoteApiBase()}/api/remote/settings`);
+  const body = await response.json().catch(() => ({})) as {
+    meta?: RemoteChannelMeta;
+    secrets?: RemoteChannelSecrets;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(body.message || `Remote settings failed: ${response.status}`);
+  return {
+    meta: (body.meta && typeof body.meta === 'object' ? body.meta : {}) as RemoteChannelMeta,
+    secrets: (body.secrets && typeof body.secrets === 'object' ? body.secrets : {}) as RemoteChannelSecrets,
+  };
+}
+
+export async function saveRemoteSettings(payload: { meta: RemoteChannelMeta; secrets: RemoteChannelSecrets }) {
+  const response = await fetch(`${remoteApiBase()}/api/remote/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await response.json().catch(() => ({})) as { ok?: boolean; meta?: RemoteChannelMeta; message?: string };
+  if (!response.ok) throw new Error(body.message || `Remote settings save failed: ${response.status}`);
+  return { ok: Boolean(body.ok), meta: (body.meta && typeof body.meta === 'object' ? body.meta : {}) as RemoteChannelMeta };
+}
+
+export async function getRemoteGatewayStatus() {
+  const response = await fetch(`${remoteApiBase()}/api/remote/gateway/status`);
+  const body = await response.json().catch(() => ({})) as { running?: boolean; pid?: number | null; message?: string };
+  if (!response.ok) throw new Error(body.message || `Remote gateway status failed: ${response.status}`);
+  return { running: Boolean(body.running), pid: body.pid ?? null };
+}
+
+export async function restartRemoteGateway() {
+  const response = await fetch(`${remoteApiBase()}/api/remote/gateway/restart`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  const body = await response.json().catch(() => ({})) as { running?: boolean; pid?: number | null; message?: string };
+  if (!response.ok) throw new Error(body.message || `Remote gateway restart failed: ${response.status}`);
+  return { running: Boolean(body.running), pid: body.pid ?? null };
 }

@@ -1,5 +1,5 @@
 import { computed, ref } from 'vue';
-import { streamChat, type RuntimeSkill, type ToolActivity, type ToolApproval, type SearchSource } from '../services/api.js';
+import { listSkillFiles, readSkillFile, streamChat, type RuntimeSkill, type ToolActivity, type ToolApproval, type SearchSource } from '../services/api.js';
 import * as orch from '../services/orchestration.js';
 import type { ProviderConfig } from './model-config.js';
 import { toModelPayload, useModelConfig } from './model-config.js';
@@ -103,7 +103,8 @@ function profileInstructions(employee: Employee, extra = '') {
         : employee.id === 'administrator' ? 'Focus on permissions, safety, runtime boundaries, and governance risk.'
           : employee.id === 'general' ? 'Focus on clear answers, writing quality, and practical next steps.'
             : 'Be helpful, accurate, and concise.');
-  return `You are OPCAI's digital employee "${role}" (${employee.id}). ${focus} Reply in the user's language. ${extra}`.trim();
+  const roleBrief = employee.description?.trim() ? ` Role brief: ${employee.description.trim()}` : '';
+  return `You are OPCAI's digital employee "${role}" (${employee.id}).${roleBrief} ${focus} Reply in the user's language. ${extra}`.trim();
 }
 
 function collaboratorFocus(employee: Employee) {
@@ -136,7 +137,7 @@ export function useWorkspace() {
   void loadSearchConfig();
   const { get: getEmployeePrefs, load: loadEmployeePrefs } = useEmployeeRuntimePrefs();
   void loadEmployeePrefs();
-  const { runtimePayload: mcpRuntimePayload, load: loadMcpConfig } = useMcpConfig();
+  const { runtimePayload: mcpRuntimePayload, load: loadMcpConfig, connections: mcpConnectionsState } = useMcpConfig();
   void loadMcpConfig();
   const { runtimePayload: kbRuntimePayload, load: loadKnowledgeConfig } = useKnowledgeConfig();
   void loadKnowledgeConfig();
@@ -281,6 +282,7 @@ export function useWorkspace() {
     userMessage: Message,
     assistantMessage: Message,
     text: string,
+    model: ProviderConfig,
   ) {
     const sessionId = await ensureServerSession(conversation, text);
     const previous = serverActiveRuns.get(conversation.id);
@@ -321,7 +323,38 @@ export function useWorkspace() {
     );
     serverActiveRuns.set(conversation.id, { sessionId, unsubscribe });
     try {
-      const result = await orch.sendChatMessage(sessionId, { content: text, employeeId: conversation.employeeId });
+      await loadMcpConfig({ force: mcpConnectionsState.value.length === 0 });
+      const employee = employees.value.find((item) => item.id === conversation.employeeId) ?? currentEmployee.value;
+      const onlineSearch = getEmployeePrefs(employee.id).searchMode !== 'off';
+      const opts = runOptionsFor(employee.id, onlineSearch);
+      const skills = await skillRuntimeFor(employee.id);
+      const runModel = modelForEmployee(employee.id, model) ?? model;
+      const context = {
+        profile: {
+          id: employee.id,
+          name: labelEmployee(employee),
+          toolIds: skills.map((skill) => skill.id),
+          instructions: profileInstructions(employee),
+        },
+        model: toModelPayload(runModel, { enableSearch: opts.enableBuiltinSearch }),
+        skills,
+        searchProviders: opts.searchProviders,
+        mcpConnections: opts.mcpConnections,
+        knowledgeBases: opts.knowledgeBases,
+        maxSteps: opts.maxSteps,
+        runTimeoutMs: opts.runTimeoutMs,
+        mcpToolTimeoutMs: opts.mcpToolTimeoutMs,
+      };
+      if (!context.mcpConnections.length) {
+        console.warn('[opcai] chat context has 0 MCP connectors; server may backfill from KV');
+      } else {
+        console.info(`[opcai] chat context MCP connectors: ${context.mcpConnections.map((item) => item.name).join(', ')}`);
+      }
+      const result = await orch.sendChatMessage(sessionId, {
+        content: text,
+        employeeId: conversation.employeeId,
+        context,
+      });
       const runId = result.runId;
       currentRunId = runId;
       await waitForServerSettled(sessionId, runId, abort);
@@ -418,13 +451,15 @@ export function useWorkspace() {
       let resources: RuntimeSkill['resources'] = [];
       if (skill.path) {
         try {
-          instructions = (await window.opcaiDesktop?.readSkillDraft(skill.path))?.content.slice(0, 24_000);
-          const files = await window.opcaiDesktop?.listSkillFiles(skill.path) ?? [];
+          instructions = (await readSkillFile(skill.path)).content.slice(0, 24_000);
+          const files = await listSkillFiles(skill.path);
           const readable = files.filter((file) => file.type === 'file' && file.relative !== 'SKILL.md' && /\.(md|txt|json|ya?ml)$/i.test(file.relative)).slice(0, 20);
           resources = (await Promise.all(readable.map(async (file) => {
-            try { const result = await window.opcaiDesktop?.readSkillFile(file.path); return result ? { path: file.relative, content: result.content.slice(0, 48_000) } : null; } catch { return null; }
+            try { const result = await readSkillFile(file.path); return { path: file.relative, content: result.content.slice(0, 48_000) }; } catch { return null; }
           }))).filter((item): item is { path: string; content: string } => item !== null);
         } catch { /* Metadata-only Skills remain safely usable in the catalog. */ }
+      } else if (skill.instructions) {
+        instructions = skill.instructions.slice(0, 24_000);
       }
       const rootPath = skill.path?.replace(/[\\/][^\\/]+$/, '');
       return {
@@ -534,7 +569,7 @@ export function useWorkspace() {
       const runAbortCtl = new AbortController();
       activeRunAbort = runAbortCtl;
       try {
-        const outcome = await serverChatTurn(conversation, userMessage, assistantMessage, text);
+        const outcome = await serverChatTurn(conversation, userMessage, assistantMessage, text, model);
         return outcome;
       } catch (cause) {
         if (isAbortError(cause)) {

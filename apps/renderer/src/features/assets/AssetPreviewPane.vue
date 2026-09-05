@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { markdownToHtml, type PreviewKind } from '../../app/project-files';
 
 const props = defineProps<{
+  desktopShell?: boolean;
   title: string;
   storageLabel: string;
   metaLines?: string[];
@@ -42,8 +43,8 @@ const iframeUrl = computed(() => ((props.kind === 'html' || props.kind === 'pdf'
       </div>
       <div v-if="showActions" class="flex shrink-0 flex-wrap gap-2">
         <button class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs font-semibold hover:bg-[var(--surface-muted)]" type="button" @click="emit('refresh')">刷新预览</button>
-        <button class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs font-semibold hover:bg-[var(--surface-muted)]" type="button" @click="emit('openBrowser')">用系统应用打开</button>
-        <button class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs font-semibold hover:bg-[var(--surface-muted)]" type="button" @click="emit('reveal')">在 Finder 中显示</button>
+        <button class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs font-semibold hover:bg-[var(--surface-muted)]" type="button" @click="emit('openBrowser')">{{ props.desktopShell ? '用系统应用打开' : '浏览器打开' }}</button>
+        <button class="rounded-lg border border-[var(--border)] px-2.5 py-1.5 text-xs font-semibold hover:bg-[var(--surface-muted)]" type="button" @click="emit('reveal')">{{ props.desktopShell ? '在 Finder 中显示' : '复制链接' }}</button>
         <button class="rounded-lg bg-[var(--accent)] px-2.5 py-1.5 text-xs font-semibold text-white" type="button" @click="emit('download')">下载</button>
       </div>
     </header>
@@ -77,7 +78,7 @@ const iframeUrl = computed(() => ((props.kind === 'html' || props.kind === 'pdf'
         class="h-full overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-[12px] leading-5 text-[var(--text)]"
       >{{ text }}</pre>
       <div v-else class="grid h-full place-items-center px-6 text-center text-sm text-[var(--muted)]">
-        此格式暂不支持内嵌预览，可点「用系统应用打开」或下载后查看。
+        此格式暂不支持内嵌预览，可点「{{ props.desktopShell ? '用系统应用打开' : '浏览器打开' }}」或下载后查看。
       </div>
     </div>
   </aside>

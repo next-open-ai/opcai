@@ -12,6 +12,7 @@ import {
 } from '../../app/model-config';
 
 import { useNotify } from '../../app/notify';
+import { testProviderConnection } from '../../services/api';
 
 const props = defineProps<{
   instances: ProviderInstance[];
@@ -56,8 +57,7 @@ async function testInstance(instance: ProviderInstance) {
   testingId.value = instance.id;
   testMessage.value = { ...testMessage.value, [instance.id]: { ok: false, text: t('settings.providerTesting') } };
   try {
-    if (!window.opcaiDesktop?.testProvider) throw new Error(t('notify.error.desktopOnly'));
-    const result = await window.opcaiDesktop.testProvider({
+    const result = await testProviderConnection({
       type: instance.type,
       baseUrl: instance.baseUrl,
       apiKey: instance.apiKey,

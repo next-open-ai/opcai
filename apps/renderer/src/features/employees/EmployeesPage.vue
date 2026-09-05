@@ -276,6 +276,7 @@ function toggleMcp(id: string) {
   draftMcpIds.value = draftMcpIds.value.includes(id)
     ? draftMcpIds.value.filter((item) => item !== id)
     : [...draftMcpIds.value, id];
+  void persistMcpSelection();
 }
 
 function openMcpPicker() {
@@ -289,13 +290,24 @@ function toggleMcpPickerDraft(id: string) {
     : [...mcpPickerDraft.value, id];
 }
 
+async function persistMcpSelection() {
+  if (!selected.value) return;
+  try {
+    await setPrefs(selected.value, { mcpIds: [...draftMcpIds.value] });
+  } catch (cause) {
+    notify.error(cause, 'notify.saveFailed');
+  }
+}
+
 function confirmMcpPicker() {
   draftMcpIds.value = [...mcpPickerDraft.value];
   mcpPickerOpen.value = false;
+  void persistMcpSelection().then(() => notify.success('notify.employeeRuntimeSaved'));
 }
 
 function removeSelectedMcp(id: string) {
   draftMcpIds.value = draftMcpIds.value.filter((item) => item !== id);
+  void persistMcpSelection();
 }
 
 function toggleKnowledgeBase(id: string) {
@@ -736,7 +748,7 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
           <button class="grid h-8 w-8 place-items-center rounded-lg text-xl text-[var(--muted)] hover:bg-[var(--surface-muted)]" type="button" @click="closeForm">×</button>
         </header>
 
-        <form class="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5" @submit.prevent="saveProfile">
+        <form id="employee-profile-form" class="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5" @submit.prevent="saveProfile">
           <div class="space-y-4">
             <label class="block text-xs font-semibold text-[var(--muted)]">
               <span>{{ t('employee.formName') }}</span>
@@ -810,7 +822,7 @@ watch(employeeModelSupportsBuiltinSearch, (ok) => {
 
         <footer class="flex items-center justify-end gap-2 border-t border-[var(--border)] px-6 py-4">
           <button class="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-semibold text-[var(--muted)] hover:bg-[var(--surface-muted)]" type="button" @click="closeForm">{{ t('common.cancel') }}</button>
-          <button class="rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50" type="submit" :disabled="savingProfile">
+          <button class="rounded-xl bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50" type="submit" form="employee-profile-form" :disabled="savingProfile">
             {{ savingProfile ? t('employee.saving') : t('employee.saveProfile') }}
           </button>
         </footer>

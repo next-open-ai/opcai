@@ -10,7 +10,7 @@ import { modeLabel } from "../../app/project-planning.js";
 import { employeeDisplayName } from "../../app/employees.js";
 import type { ProviderConfig, ProviderId } from "../../app/model-config.js";
 import { useModelConfig } from "../../app/model-config.js";
-import type { ToolActivity, ToolApproval } from "../../services/api.js";
+import { createManagedWorkspace, materializeWorkspaceAssets, syncWorkspaceRun, type ToolActivity, type ToolApproval } from "../../services/api.js";
 import { useCapabilities } from "../../app/capabilities.js";
 import { readStored, writeStored } from "../../app/storage.js";
 import {
@@ -24,6 +24,7 @@ import {
 import { buildDependencyBlock, buildSummaryEvidence, fitObjective } from "../../app/context-budget.js";
 import ProjectConversationWorkspace from "./ProjectConversationWorkspace.vue";
 import * as orch from "../../services/orchestration.js";
+import { isDesktopShell } from "../../app/platform.js";
 
 type Transcript = {
   assistantContent: string;
@@ -273,7 +274,7 @@ async function hydrateManagedTask(
   }
   if (project.workspacePath && run.id) {
     try {
-      await window.opcaiDesktop?.syncProjectWorkspace(project.workspacePath, run.id);
+      await syncWorkspaceRun(project.workspacePath, run.id);
     } catch {
       /* keep going even if folder sync fails */
     }
@@ -579,6 +580,11 @@ const cancelling = new Set<string>();
 const selected = computed(
   () => projects.value.find((item) => item.id === selectedId.value) ?? null,
 );
+const selectedProject = computed(() => selected.value);
+function currentSelectedProject(): Project {
+  if (!selectedProject.value) throw new Error("No selected project.");
+  return selectedProject.value;
+}
 const detailTask = computed(
   () =>
     selected.value?.tasks.find((task) => task.id === detailTaskId.value) ??
@@ -882,11 +888,13 @@ async function confirmCreate() {
     error.value = "请完善项目目标和所有任务。";
     return;
   }
-  const workspacePath = await window.opcaiDesktop?.createProjectWorkspace({
-    name: name.value,
-    parentDirectory: workspaceParent.value || undefined,
-  });
-  if (!workspacePath) {
+  const workspacePath = isDesktopShell()
+    ? await window.opcaiDesktop?.createProjectWorkspace({
+      name: name.value,
+      parentDirectory: workspaceParent.value || undefined,
+    })
+    : await createManagedWorkspace(name.value);
+  if (isDesktopShell() && !workspacePath) {
     error.value = "无法创建项目空间目录。";
     return;
   }
@@ -896,7 +904,7 @@ async function confirmCreate() {
     name: name.value,
     goal: goal.value,
     mode: mode.value,
-    workspacePath,
+    workspacePath: workspacePath ?? '',
     coordinator: {
       provider: coordinator.value.provider,
       model: coordinator.value.chatModel,
@@ -923,6 +931,7 @@ async function confirmCreate() {
   autoStartIfDraft(adopted);
 }
 async function chooseWorkspaceParent() {
+  if (!isDesktopShell()) return;
   const selected = await window.opcaiDesktop?.pickProjectDirectory();
   if (selected) workspaceParent.value = selected;
 }
@@ -1055,9 +1064,13 @@ async function executeTask(project: Project, task: ProjectTask) {
     });
     if (project.workspacePath) {
       const runIds = [...new Set([transcript.runId, ...transcript.assets.map((asset) => asset.runId)].filter((id): id is string => Boolean(id)))];
-      for (const runId of runIds) await window.opcaiDesktop?.syncProjectWorkspace(project.workspacePath, runId);
+      for (const runId of runIds) await syncWorkspaceRun(project.workspacePath, runId);
       if (!runIds.length && transcript.assets.length) {
-        await window.opcaiDesktop?.materializeProjectAssets?.(project.workspacePath, transcript.assets.map((asset) => asset.id));
+        await materializeWorkspaceAssets(project.workspacePath, transcript.assets.map((asset) => ({
+          assetId: asset.id,
+          relativePath: asset.name,
+          name: asset.name,
+        })));
       }
     }
     message.content = transcript.assistantContent;
@@ -1475,11 +1488,11 @@ onBeforeUnmount(() => {
           </div>
           <div class="p-6">
             <ol class="mb-7 flex items-center gap-2 text-xs font-semibold">
-              <template v-for="step in [1, 2, 3]" :key="step">
+              <div v-for="step in [1, 2, 3]" :key="step" class="contents">
                 <span :class="['grid h-6 w-6 place-items-center rounded-full', createStep >= step ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)] text-[var(--muted)]']">{{ step }}</span>
                 <span :class="createStep >= step ? 'text-[var(--text)]' : 'text-[var(--muted)]'">{{ step === 1 ? '选模板' : step === 2 ? '信息与规划' : '确认方案' }}</span>
                 <i v-if="step < 3" class="h-px w-8 bg-[var(--border)]" />
-              </template>
+              </div>
             </ol>
 
             <!-- ① 模板 -->
@@ -1561,10 +1574,11 @@ onBeforeUnmount(() => {
                   <div class="min-w-0">
                     <p class="text-[11px] font-bold tracking-wide text-[var(--muted)]">项目空间</p>
                     <p class="mt-1 break-all text-xs leading-5 text-[var(--text)]">
-                      {{ workspaceParent || '默认保存到 ~/.opcai/projects/项目名称-随机标识' }}
+                      {{ isDesktopShell() ? (workspaceParent || '默认保存到 ~/.opcai/projects/项目名称-随机标识') : '将创建服务端托管项目空间（默认位于 ~/.opcai/projects/项目名称-随机标识）。' }}
                     </p>
                   </div>
                   <button
+                    v-if="isDesktopShell()"
                     class="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs font-semibold hover:border-[var(--accent)]/50"
                     type="button"
                     @click="chooseWorkspaceParent"
@@ -1572,7 +1586,9 @@ onBeforeUnmount(() => {
                     {{ workspaceParent ? '更换' : '选择目录' }}
                   </button>
                 </div>
-                <p class="mt-2 text-[11px] text-[var(--muted)]">当前模板：{{ template.name }} · 交付物将写入该目录</p>
+                <p class="mt-2 text-[11px] text-[var(--muted)]">
+                  当前模板：{{ template.name }} · {{ isDesktopShell() ? '交付物将写入该目录' : '交付物将写入服务端托管工作区，并可导入/导出 zip' }}
+                </p>
               </div>
 
               <div class="flex flex-col gap-3 border-t border-[var(--border)] pt-4 sm:flex-row sm:items-end sm:justify-between">
@@ -1713,18 +1729,18 @@ onBeforeUnmount(() => {
         <!-- 项目对话工作台（已选择） -->
         <section v-else-if="tab === 'projects' && selected" class="min-h-0 flex-1 flex flex-col">
           <ProjectConversationWorkspace
-            :project="selected!"
+            :project="currentSelectedProject()"
             :employees="employees"
             :template-name="templates.find((item) => item.id === selected?.mode)?.name ?? '项目'"
             :running="selected?.status === 'running' || rosterBusy"
             :file-tree-epoch="fileTreeEpoch"
             @back="selectedId = null"
-            @start="run(selected!)"
-            @cancel="cancel(selected!)"
-            @remove="deleteProject(selected!); selectedId = null;"
-            @dispatch="dispatchProjectInstruction(selected!, $event)"
-            @add-member="addProjectMember(selected!, $event)"
-            @remove-member="removeProjectMember(selected!, $event)"
+            @start="selected ? run(selected) : undefined"
+            @cancel="selected ? cancel(selected) : undefined"
+            @remove="selected ? deleteProject(selected) : undefined; selectedId = null;"
+            @dispatch="selected ? dispatchProjectInstruction(selected, $event) : undefined"
+            @add-member="selected ? addProjectMember(selected, $event) : undefined"
+            @remove-member="selected ? removeProjectMember(selected, $event) : undefined"
           />
         </section>
 

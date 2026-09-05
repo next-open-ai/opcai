@@ -3,7 +3,7 @@ import os from 'node:os';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { JsonFileStore, Orchestrator, createScriptedRunner, type AgentRunner, type OrcEvent } from '@opcai/orchestrator';
 import type { ChatRunContext, ConfirmProjectInput, CreateProjectDraftInput, ProjectTask, ResolveProjectApprovalInput } from '@opcai/orchestrator';
-import { resolveTaskContext } from './context-assembler.js';
+import { resolveEmployeeMcpConnections, resolveTaskContext } from './context-assembler.js';
 
 /**
  * Orchestration module (M0): hosts the headless orchestrator inside the API
@@ -69,6 +69,13 @@ export function getOrchestrator(): Orchestrator {
       ...(runner ? { runner } : {}),
       contextResolver,
       chatContextResolver,
+      chatMcpConnectionsResolver: async (employeeId: string) => {
+        try {
+          return await resolveEmployeeMcpConnections(store, employeeId);
+        } catch {
+          return [];
+        }
+      },
     });
     // Fire-and-forget: settle runs left `running` by a previous process exit.
     void instance.recoverOnBoot().catch((error) => {

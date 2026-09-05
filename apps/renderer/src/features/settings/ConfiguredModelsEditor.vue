@@ -12,6 +12,7 @@ import {
   type ModelCapability,
   type ProviderInstance,
 } from '../../app/model-config';
+import { listProviderModels } from '../../services/api';
 
 const props = defineProps<{
   instances: ProviderInstance[];
@@ -136,8 +137,7 @@ async function fetchRemoteModels() {
   remoteLoading.value = true;
   remoteError.value = '';
   try {
-    if (!window.opcaiDesktop?.listProviderModels) throw new Error('仅桌面端支持拉取模型列表');
-    remoteModels.value = await window.opcaiDesktop.listProviderModels({
+    remoteModels.value = await listProviderModels({
       type: instance.type,
       baseUrl: instance.baseUrl,
       apiKey: instance.apiKey,

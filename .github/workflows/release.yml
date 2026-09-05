@@ -9,7 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (uses packageManager-pinned pnpm)
+        run: corepack enable
+      - name: Verify pnpm version
+        run: pnpm --version
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build workspace
+        run: pnpm build
+      - name: Enforce size budget
+        run: pnpm size:check
+      - name: Smoke-test web runtime
+        run: pnpm web:smoke
+      - name: Build root Docker image
+        run: docker build -t opcai-release:${{ github.ref_name }} .
+
   package:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:

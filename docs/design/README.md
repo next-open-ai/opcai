@@ -3,6 +3,11 @@
 > 与实现同源维护。**当前权威架构**见 [architecture.md](architecture.md)；
 > 通道网关各里程碑记录实现、验收与真机步骤。
 
+运行模式、Web/Docker 退化行为与部署链路说明见：
+
+- [../runtime-modes.md](../runtime-modes.md)
+- [../deployment.md](../deployment.md)
+
 ## 文档列表
 
 | 文档 | 内容 | 状态 |

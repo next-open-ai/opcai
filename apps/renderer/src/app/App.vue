@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { getHealth } from '../services/api';
 import AppSidebar from './AppSidebar.vue';
 import ChatWorkspace from '../features/chat/ChatWorkspace.vue';
@@ -24,6 +24,7 @@ import { useCapabilities } from './capabilities';
 import { useAutomations, type Automation } from './automations';
 import { useEmployeeRuntimePrefs } from './employee-prefs';
 import { useSearchConfig } from './search-config';
+import { useMcpConfig } from './mcp-config';
 import { useNotify } from './notify';
 
 const { t, loadLocale } = useI18n();
@@ -36,8 +37,13 @@ const { load: loadCapabilities } = useCapabilities();
 const { load: loadAutomations, startScheduler } = useAutomations();
 const { load: loadEmployeePrefs } = useEmployeeRuntimePrefs();
 const { load: loadSearchConfig } = useSearchConfig();
+const { load: loadMcpConfig, probeStartupMcps } = useMcpConfig();
 const notify = useNotify();
 const showEnvCheckDialog = ref(false);
+const activeChatEmployee = computed(() =>
+  (activeConversation.value && employees.value.find((item) => item.id === activeConversation.value?.employeeId))
+  || currentEmployee.value,
+);
 let stopScheduler: (() => void) | undefined;
 const runScheduledAutomation = async (automation: Automation) => {
   const model = (automation.modelId ? modelById(automation.modelId) : undefined) ?? modelForProvider(automation.provider);
@@ -52,7 +58,42 @@ async function openProjectFromAssets(projectId: string) {
   await writeStored('projects.focus-id', projectId);
   setView('projects');
 }
-onMounted(async () => { await Promise.all([loadModelConfig(), loadWorkspace(), loadTheme(), loadLocale(), loadCapabilities(), loadAutomations(), loadEmployeePrefs(), loadSearchConfig()]); stopScheduler = startScheduler(runScheduledAutomation); sidebarCollapsed.value = (await readStored('ui.sidebar-collapsed')) === 'true'; try { await getHealth(); serviceReady.value = true; } catch { serviceReady.value = false; } void setupEnvironmentCheck(); });
+onMounted(async () => {
+  await Promise.all([
+    loadModelConfig(),
+    loadWorkspace(),
+    loadTheme(),
+    loadLocale(),
+    loadCapabilities(),
+    loadAutomations(),
+    loadEmployeePrefs(),
+    loadSearchConfig(),
+    loadMcpConfig(),
+  ]);
+  stopScheduler = startScheduler(runScheduledAutomation);
+  sidebarCollapsed.value = (await readStored('ui.sidebar-collapsed')) === 'true';
+  try {
+    await getHealth();
+    serviceReady.value = true;
+    void probeStartupMcps()
+      .then((summary) => {
+        if (summary.total > 0) {
+          notify.info(
+            'capabilities.mcpStartupProbeTitle',
+            t('capabilities.mcpStartupProbe', {
+              total: summary.total,
+              passed: summary.passed,
+              failed: summary.failed,
+            }),
+          );
+        }
+      })
+      .catch(() => undefined);
+  } catch {
+    serviceReady.value = false;
+  }
+  void setupEnvironmentCheck();
+});
 /** 打开带实时进度的环境检查弹窗并执行。keepOpenOnClean=true 时即使全部通过也保留结果。 */
 async function runCheckInDialog(keepOpenOnClean: boolean) {
   showEnvCheckDialog.value = true;
@@ -61,6 +102,14 @@ async function runCheckInDialog(keepOpenOnClean: boolean) {
     setTimeout(() => { showEnvCheckDialog.value = false; }, 900);
   }
   return report;
+}
+/** 启动时静默体检：全程不弹窗；仅当发现 error/warn 时再打开结果弹窗。 */
+async function runStartupEnvironmentCheck() {
+  const report = await runEnvironmentCheck();
+  if (!report) return;
+  if (report.summary.error > 0 || report.summary.warn > 0) {
+    showEnvCheckDialog.value = true;
+  }
 }
 async function setupEnvironmentCheck() {
   try {
@@ -72,7 +121,7 @@ async function setupEnvironmentCheck() {
     if (stored == null) await writeStored('env.check-on-startup', '1');
     const startupEnabled = stored !== '0';
     if (!firstRun && !startupEnabled) return;
-    void runCheckInDialog(false);
+    void runStartupEnvironmentCheck();
   } catch { /* 环境检查失败不应阻塞启动 */ }
 }
 function openEnvDetails() {
@@ -87,7 +136,7 @@ function toggleSidebar() { sidebarCollapsed.value = !sidebarCollapsed.value; voi
   <div class="flex h-screen min-h-[600px] overflow-hidden bg-[var(--background)] text-[var(--text)]">
     <AppSidebar :collapsed="sidebarCollapsed" :view="view" :conversations="conversations" :active-conversation-id="activeConversation?.id ?? null" :service-ready="serviceReady" @toggle="toggleSidebar" @navigate="setView" @new-chat="startChat()" @select-conversation="selectConversation" @delete-conversation="deleteConversation" />
     <main :class="['relative min-w-0 flex-1 bg-[var(--background)]', view === 'chat' || view === 'capabilities' || view === 'knowledge' || view === 'assets' || view === 'automations' || view === 'projects' ? 'overflow-hidden' : 'overflow-auto']">
-      <ChatWorkspace v-if="view === 'chat'" :employee="currentEmployee" :selected-employee-id="currentEmployeeId" :employees="employees" :conversation="activeConversation" :model-configured="configured" :model="modelConfig" :available-models="availableChatModels" :chat-endpoint-token="chatEndpointToken" :permission-tier="permissionTier" :send-message="async (content, collaboratorIds, collaborationDelivery, onlineSearch) => { await addMessage(content, modelConfig, { collaboratorIds, collaborationDelivery, onlineSearch }); }" :abort-message="() => { abortActiveRun(); }" :approve="(conversationId, approval, scope) => approveAndRetry(conversationId, approval, scope, modelConfig)" @select-endpoint="selectChatEndpoint" @select-employee="selectEmployee" @set-permission-tier="setPermissionTier" @clear-conversation="clearConversation" @open-assets="setView('assets')" @open-settings="setView('settings')" />
+      <ChatWorkspace v-if="view === 'chat'" :employee="activeChatEmployee" :selected-employee-id="activeConversation?.employeeId || currentEmployeeId" :employees="employees" :conversation="activeConversation" :model-configured="configured" :model="modelConfig" :available-models="availableChatModels" :chat-endpoint-token="chatEndpointToken" :permission-tier="permissionTier" :send-message="async (content, collaboratorIds, collaborationDelivery, onlineSearch) => { await addMessage(content, modelConfig, { collaboratorIds, collaborationDelivery, onlineSearch }); }" :abort-message="() => { abortActiveRun(); }" :approve="(conversationId, approval, scope) => approveAndRetry(conversationId, approval, scope, modelConfig)" @select-endpoint="selectChatEndpoint" @select-employee="startChat" @set-permission-tier="setPermissionTier" @clear-conversation="clearConversation" @open-assets="setView('assets')" @open-settings="setView('settings')" />
       <EmployeesPage
         v-else-if="view === 'employees'"
         :employees="employees"

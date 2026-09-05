@@ -10,3 +10,4 @@ stage/
 .env.*
 !.env.example
 .stage/
+.tmp/

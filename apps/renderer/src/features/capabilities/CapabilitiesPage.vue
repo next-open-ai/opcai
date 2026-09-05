@@ -1,19 +1,22 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onMounted, ref } from 'vue';
 import { useI18n } from '../../app/i18n';
-import { defaultSkillExecution, useCapabilities, type SkillRecord, type SkillSource } from '../../app/capabilities';
-import { streamChat } from '../../services/api';
+import { defaultSkillExecution, isBaselineCatalogSkill, useCapabilities, type SkillRecord, type SkillSource } from '../../app/capabilities';
+import { deleteManagedSkill, discoverSkills, importGitSkill, importSkillZip, installSkillPackage, readSkillFile, streamChat, writeSkillDraft } from '../../services/api';
 import { useModelConfig, toModelPayload } from '../../app/model-config';
 import SkillAuthoringList from './SkillAuthoringList.vue';
 import McpConnectorsPanel from './McpConnectorsPanel.vue';
+import { isDesktopShell } from '../../app/platform.js';
 const SkillEditorWorkspace = defineAsyncComponent(() => import('./SkillEditorWorkspace.vue'));
 
 type RegistrySkill = { reference: string; source: string; slug: string; name: string; description: string; installs: string; url: string };
 const { t } = useI18n(); const { skills, policies, load, saveSkills, removeSkill, setExecutionPolicy } = useCapabilities(); const { activeConfig, configured, load: loadModels } = useModelConfig();
 const domain = ref<'skills' | 'mcp'>('skills');
 const tab = ref<'catalog' | 'discover' | 'create'>('catalog');
-const query = ref(''); const discoverQuery = ref(''); const results = ref<RegistrySkill[]>([]); const searching = ref(false); const searchError = ref(''); const selected = ref<RegistrySkill | null>(null); const libraryDetail = ref<SkillRecord | null>(null); const executionHosts = ref(''); const editingSkill = ref<SkillRecord | null>(null); const editorInitialContent = ref(''); const editorInitialRequest = ref(''); const packageRef = ref(''); const gitState = ref(''); const importingGit = ref(false); const creatorOpen = ref(false); const creatorBusy = ref(false); const creatorError = ref(''); const creatorReply = ref(''); const creatorRequest = ref(''); const newSkillName = ref(''); const newSkillDescription = ref(''); const existingSkillId = ref('new'); const draft = ref<{ name: string; content: string } | null>(null);
+const query = ref(''); const categoryFilter = ref('all'); const discoverQuery = ref(''); const results = ref<RegistrySkill[]>([]); const searching = ref(false); const searchError = ref(''); const selected = ref<RegistrySkill | null>(null); const libraryDetail = ref<SkillRecord | null>(null); const executionHosts = ref(''); const editingSkill = ref<SkillRecord | null>(null); const editorInitialContent = ref(''); const editorInitialRequest = ref(''); const packageRef = ref(''); const gitState = ref(''); const importingGit = ref(false); const creatorOpen = ref(false); const creatorBusy = ref(false); const creatorError = ref(''); const creatorReply = ref(''); const creatorRequest = ref(''); const newSkillName = ref(''); const newSkillDescription = ref(''); const existingSkillId = ref('new'); const draft = ref<{ name: string; content: string } | null>(null);
 const installProgress = ref<{ name: string; label: string; percent: number } | null>(null);
+const importManifestText = ref('');
+const zipInput = ref<HTMLInputElement | null>(null);
 
 function switchDomain(next: 'skills' | 'mcp') {
   domain.value = next;
@@ -22,20 +25,104 @@ function switchDomain(next: 'skills' | 'mcp') {
 function setSkillTab(next: string) {
   if (next === 'catalog' || next === 'discover' || next === 'create') tab.value = next;
 }
-const shownSkills = computed(() => skills.value.filter((skill) => `${skill.name} ${skill.description}`.toLowerCase().includes(query.value.toLowerCase()))); const localSkills = computed(() => skills.value.filter((skill) => skill.source !== 'builtin')); const authoringSkills = computed(() => skills.value.filter((skill) => skill.source === 'local' && Boolean(skill.path))); const fullSearchUrl = computed(() => `https://skills.sh/search?q=${encodeURIComponent(discoverQuery.value.trim())}`);
+function skillCategory(skill: SkillRecord) {
+  return skill.tags?.[0] || (skill.source === 'builtin' ? '平台' : skill.source);
+}
+const categories = computed(() => {
+  const counts = new Map<string, number>();
+  for (const skill of skills.value) {
+    const key = skillCategory(skill);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh'));
+});
+const catalogStats = computed(() => {
+  const all = skills.value;
+  return {
+    total: all.length,
+    baseline: all.filter((skill) => isBaselineCatalogSkill(skill.id) || (skill.source === 'builtin' && !skill.systemOnly)).length,
+    local: all.filter((skill) => skill.source === 'local' || skill.source === 'registry').length,
+    granted: policies.value.filter((item) => item.mode !== 'disabled').length,
+  };
+});
+const shownSkills = computed(() => {
+  const q = query.value.trim().toLowerCase();
+  return skills.value
+    .filter((skill) => {
+      if (categoryFilter.value !== 'all' && skillCategory(skill) !== categoryFilter.value) return false;
+      if (!q) return true;
+      return `${skill.name} ${skill.description} ${skill.tags?.join(' ') || ''}`.toLowerCase().includes(q);
+    })
+    .sort((a, b) => {
+      const aBase = isBaselineCatalogSkill(a.id) || a.source === 'builtin' ? 0 : 1;
+      const bBase = isBaselineCatalogSkill(b.id) || b.source === 'builtin' ? 0 : 1;
+      if (aBase !== bBase) return aBase - bBase;
+      return a.name.localeCompare(b.name, 'zh');
+    });
+});
+const localSkills = computed(() => skills.value.filter((skill) => skill.source !== 'builtin')); const authoringSkills = computed(() => skills.value.filter((skill) => skill.source === 'local' && Boolean(skill.path))); const fullSearchUrl = computed(() => `https://skills.sh/search?q=${encodeURIComponent(discoverQuery.value.trim())}`);
+function skillInitial(name: string) {
+  const trimmed = name.trim();
+  return trimmed ? trimmed.slice(0, 1).toUpperCase() : '?';
+}
+function skillAccent(skill: SkillRecord) {
+  if (isBaselineCatalogSkill(skill.id)) return 'from-sky-500 to-indigo-500';
+  if (skill.source === 'local') return 'from-emerald-500 to-teal-600';
+  if (skill.source === 'registry') return 'from-violet-500 to-fuchsia-600';
+  return 'from-slate-500 to-slate-700';
+}
 function canonical(value: string) { return value.trim().replace(/^['"]|['"]$/g, '').toLowerCase(); }
 function manifestToSkill(manifest: { path: string; content: string }, source: SkillRecord['source']): SkillRecord | null { const block = manifest.content.match(/^---\r?\n([\s\S]*?)\r?\n---/); if (!block) return null; const field = (name: string) => block[1].match(new RegExp(`^${name}:\\s*(.+)$`, 'm'))?.[1]?.trim().replace(/^['"]|['"]$/g, ''); const name = field('name'); const description = field('description'); return name && description ? { id: `${source}:${canonical(name)}`, name, description, source, status: 'ready', risk: 'low', path: manifest.path, tags: [source], execution: defaultSkillExecution() } : null; }
 async function upsert(skill: SkillRecord) { const index = skills.value.findIndex((item) => item.source !== 'builtin' && canonical(item.name) === canonical(skill.name)); if (index >= 0) skills.value[index] = { ...skills.value[index], ...skill, id: skills.value[index].id }; else skills.value.push(skill); await saveSkills(); }
 async function refresh() { await load(); }
-async function discover() { if (discoverQuery.value.trim().length < 2) return; searching.value = true; searchError.value = ''; results.value = []; try { results.value = (await window.opcaiDesktop?.findSkills(discoverQuery.value.trim(), 3))?.items ?? []; if (!results.value.length) searchError.value = t('capabilities.noResults'); } catch (error) { searchError.value = error instanceof Error ? error.message : String(error); } finally { searching.value = false; } }
+async function discover() { if (discoverQuery.value.trim().length < 2) return; searching.value = true; searchError.value = ''; results.value = []; try { results.value = (await discoverSkills(discoverQuery.value.trim())).items ?? []; if (!results.value.length) searchError.value = t('capabilities.noResults'); } catch (error) { searchError.value = error instanceof Error ? error.message : String(error); } finally { searching.value = false; } }
 async function importLocal() { const manifest = await window.opcaiDesktop?.pickSkill(); if (!manifest) return; const skill = manifestToSkill(manifest, 'local'); if (!skill) { gitState.value = t('capabilities.invalidManifest'); return; } await upsert(skill); gitState.value = t('capabilities.localImported'); }
+async function importPastedSkill() {
+  const content = importManifestText.value.trim();
+  if (!content) return;
+  const parsed = manifestToSkill({ path: '', content }, 'local');
+  if (!parsed) {
+    gitState.value = t('capabilities.invalidManifest');
+    return;
+  }
+  const saved = await writeSkillDraft({ name: canonical(parsed.name), content });
+  await upsert({ ...parsed, path: saved.path });
+  importManifestText.value = '';
+  gitState.value = t('capabilities.localImported');
+}
+async function importZipFile(file: File) {
+  gitState.value = '正在上传并导入 Skill zip…';
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  const chunk = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+  }
+  const result = await importSkillZip({ filename: file.name, base64: btoa(binary) });
+  const skill = result.manifest ? manifestToSkill(result.manifest, 'local') : null;
+  if (!skill) throw new Error(t('capabilities.invalidManifest'));
+  await upsert(skill);
+  gitState.value = `已导入 ${result.importedFiles} 个文件：${skill.name}`;
+}
+async function handleZipPicked(event: Event) {
+  const input = event.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) return;
+  try {
+    await importZipFile(file);
+  } catch (error) {
+    gitState.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (input) input.value = '';
+  }
+}
 async function importGit() {
   if (!packageRef.value.trim() || importingGit.value) return;
   importingGit.value = true;
   gitState.value = t('capabilities.gitImporting');
   try {
     await runInstallProgress(packageRef.value.trim(), async () => {
-      const result = await window.opcaiDesktop?.importGitSkill(packageRef.value.trim());
+      const result = await importGitSkill(packageRef.value.trim());
       for (const manifest of result?.manifests ?? []) {
         const skill = manifestToSkill(manifest, 'local');
         if (skill) await upsert(skill);
@@ -63,7 +150,7 @@ async function createWithAdministrator() {
   try {
     let existing = '';
     const target = skills.value.find((skill) => skill.id === existingSkillId.value);
-    if (target?.path) existing = (await window.opcaiDesktop?.readSkillDraft(target.path))?.content || '';
+    if (target?.path) existing = (await readSkillFile(target.path)).content || '';
     const prompt = `You are OPCAI's System Administrator. Apply Skill Creator principles: understand concrete use, keep instructions concise, use progressive disclosure, and use lowercase hyphen name. Return ONLY JSON {"name":"...","content":"full SKILL.md"}. SKILL.md frontmatter must only include name and description. Request: ${creatorRequest.value}${existing ? `\nExisting skill:\n${existing}` : ''}`;
     await streamChat({ profile: { id: 'administrator', name: 'System Administrator', toolIds: ['skill-authoring'], instructions: 'Create safe, concise skills.' }, messages: [{ role: 'user', content: prompt }], model: toModelPayload(activeConfig.value) }, (delta) => { creatorReply.value += delta; });
     draft.value = parseDraft(creatorReply.value);
@@ -102,7 +189,7 @@ async function installSelected() {
   const target = selected.value;
   try {
     await runInstallProgress(target.name, async () => {
-      const response = await window.opcaiDesktop?.installSkill(target.reference);
+      const response = await installSkillPackage(target.reference);
       const skill = response?.manifest
         ? manifestToSkill(response.manifest, 'registry')
         : {
@@ -124,8 +211,11 @@ async function installSelected() {
   }
 }
 
-async function deleteSkill(skill: SkillRecord | null) { if (!skill) return; if (window.confirm(t('capabilities.deleteConfirm', { name: skill.name }))) { if (skill.path) await window.opcaiDesktop?.deleteManagedSkill(skill.path); await removeSkill(skill.id); libraryDetail.value = null; } }
+async function deleteSkill(skill: SkillRecord | null) { if (!skill) return; if (window.confirm(t('capabilities.deleteConfirm', { name: skill.name }))) { if (skill.path) await deleteManagedSkill(skill.path); await removeSkill(skill.id); libraryDetail.value = null; } }
 function openLibraryDetail(skill: SkillRecord) { skill.execution ??= defaultSkillExecution(); libraryDetail.value = skill; executionHosts.value = skill.execution.allowedNetworkHosts.join(', '); }
+function isCatalogBuiltin(skill: SkillRecord) {
+  return skill.source === 'builtin' || isBaselineCatalogSkill(skill.id);
+}
 async function saveExecutionPolicy() {
   if (!libraryDetail.value) return;
   const current = libraryDetail.value.execution ?? defaultSkillExecution();
@@ -229,36 +319,144 @@ onMounted(() => { void refresh(); void loadModels(); });
       <div v-if="domain === 'mcp'" class="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
         <McpConnectorsPanel />
       </div>
-      <div v-else-if="tab === 'catalog'" class="flex min-h-0 flex-1 flex-col">
-        <div class="mb-3 flex shrink-0 flex-wrap items-center justify-between gap-3">
-          <input v-model="query" class="w-full max-w-sm rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm" :placeholder="t('capabilities.search')" />
-          <p class="text-xs text-[var(--muted)]">{{ t('capabilities.catalogCount', { count: shownSkills.length }) }} · {{ t('capabilities.progressiveHint') }}</p>
-        </div>
-        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
-          <div class="grid grid-cols-1 gap-3 pb-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-            <article
-              v-for="skill in shownSkills"
-              :key="skill.id"
-              class="group flex flex-col rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3.5 transition hover:-translate-y-0.5 hover:border-[var(--accent)]/30 hover:shadow-[0_8px_24px_-12px_rgba(15,23,42,0.25)]"
-            >
-              <div class="flex items-start justify-between gap-2">
-                <h2 class="min-w-0 flex-1 truncate text-sm font-bold leading-snug tracking-[-.01em]">{{ skill.name }}</h2>
-                <span :class="skillSourceBadgeClass(skill.source)">{{ skillSourceLabel(skill.source) }}</span>
-              </div>
-              <p class="mt-1.5 line-clamp-2 text-[12px] leading-relaxed text-[var(--muted)]">{{ skill.description }}</p>
-              <div class="mt-2.5 flex flex-wrap items-center gap-1.5 text-[10px]">
-                <span :class="['rounded-md px-1.5 py-0.5 font-semibold', riskTone(skill.risk)]">{{ riskLabel(skill.risk) }}</span>
-                <span class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 font-medium text-[var(--muted)]">{{ t('capabilities.grantCount', { count: grantCount(skill.id) }) }}</span>
-                <span v-for="chip in capabilityChips(skill).slice(0, 2)" :key="chip" class="rounded-md bg-[var(--accent-soft)]/60 px-1.5 py-0.5 font-medium text-[var(--accent)]">{{ chip }}</span>
-                <span v-for="tag in (skill.tags || []).slice(0, 2)" :key="tag" class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 text-[var(--muted)]">{{ tag }}</span>
-              </div>
-              <div class="mt-auto flex items-center gap-2 pt-3">
-                <button type="button" class="rounded-md border border-[var(--border)] px-2.5 py-1.5 text-[11px] font-semibold hover:bg-[var(--surface-muted)]" @click="openLibraryDetail(skill)">{{ t('capabilities.details') }}</button>
-                <button v-if="skill.source !== 'builtin'" type="button" class="rounded-md px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-500/10" @click="deleteSkill(skill)">{{ t('capabilities.delete') }}</button>
-                <span class="ml-auto text-[10px] text-[var(--muted)] opacity-0 transition group-hover:opacity-100">{{ skill.status }}</span>
-              </div>
-            </article>
+      <div v-else-if="tab === 'catalog'" class="flex min-h-0 flex-1 flex-col gap-4">
+        <div class="grid shrink-0 gap-3 sm:grid-cols-4">
+          <div class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+            <p class="text-[10px] font-bold uppercase tracking-[.12em] text-[var(--muted)]">{{ t('capabilities.statTotal') }}</p>
+            <p class="mt-1 text-2xl font-bold tabular-nums tracking-tight">{{ catalogStats.total }}</p>
           </div>
+          <div class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+            <p class="text-[10px] font-bold uppercase tracking-[.12em] text-[var(--muted)]">{{ t('capabilities.statBaseline') }}</p>
+            <p class="mt-1 text-2xl font-bold tabular-nums tracking-tight text-[var(--accent)]">{{ catalogStats.baseline }}</p>
+          </div>
+          <div class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+            <p class="text-[10px] font-bold uppercase tracking-[.12em] text-[var(--muted)]">{{ t('capabilities.statInstalled') }}</p>
+            <p class="mt-1 text-2xl font-bold tabular-nums tracking-tight">{{ catalogStats.local }}</p>
+          </div>
+          <div class="rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+            <p class="text-[10px] font-bold uppercase tracking-[.12em] text-[var(--muted)]">{{ t('capabilities.statGrants') }}</p>
+            <p class="mt-1 text-2xl font-bold tabular-nums tracking-tight">{{ catalogStats.granted }}</p>
+          </div>
+        </div>
+
+        <div class="flex min-h-0 flex-1 flex-col gap-4 xl:flex-row">
+          <div class="flex min-h-0 min-w-0 flex-1 flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
+            <div class="flex shrink-0 flex-col gap-3 border-b border-[var(--border)] p-4">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 class="text-sm font-bold tracking-[-.01em]">{{ t('capabilities.catalog') }}</h2>
+                  <p class="mt-0.5 text-[11px] text-[var(--muted)]">{{ t('capabilities.catalogCount', { count: shownSkills.length }) }} · {{ t('capabilities.progressiveHint') }}</p>
+                </div>
+                <input v-model="query" class="w-full max-w-xs rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2 text-sm" :placeholder="t('capabilities.search')" />
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  :class="['rounded-lg px-2.5 py-1.5 text-[11px] font-semibold transition', categoryFilter === 'all' ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)] text-[var(--muted)] hover:text-[var(--foreground)]']"
+                  @click="categoryFilter = 'all'"
+                >
+                  {{ t('capabilities.filterAll') }}
+                </button>
+                <button
+                  v-for="[cat, count] in categories"
+                  :key="cat"
+                  type="button"
+                  :class="['rounded-lg px-2.5 py-1.5 text-[11px] font-semibold transition', categoryFilter === cat ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-muted)] text-[var(--muted)] hover:text-[var(--foreground)]']"
+                  @click="categoryFilter = cat"
+                >
+                  {{ cat }} · {{ count }}
+                </button>
+              </div>
+            </div>
+
+            <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-2">
+              <p v-if="!shownSkills.length" class="px-3 py-16 text-center text-sm text-[var(--muted)]">{{ t('capabilities.emptySkills') }}</p>
+              <div v-else class="grid gap-1.5">
+                <button
+                  v-for="skill in shownSkills"
+                  :key="skill.id"
+                  type="button"
+                  :class="[
+                    'group flex w-full items-start gap-3 rounded-xl border px-3 py-3 text-left transition',
+                    libraryDetail?.id === skill.id
+                      ? 'border-[var(--accent)] bg-[var(--accent-soft)]/35 shadow-sm ring-1 ring-[var(--accent)]/15'
+                      : 'border-transparent hover:border-[var(--border)] hover:bg-[var(--surface-muted)]/70',
+                  ]"
+                  @click="openLibraryDetail(skill)"
+                >
+                  <div :class="['grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-gradient-to-br text-sm font-extrabold text-white shadow-sm', skillAccent(skill)]">
+                    {{ skillInitial(skill.name) }}
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex items-start justify-between gap-2">
+                      <h3 class="truncate text-[13px] font-bold tracking-[-.01em]">{{ skill.name }}</h3>
+                      <div class="flex shrink-0 items-center gap-1">
+                        <span v-if="isBaselineCatalogSkill(skill.id)" class="rounded-md bg-[var(--accent)]/12 px-1.5 py-0.5 text-[10px] font-bold text-[var(--accent)]">{{ t('capabilities.skillBaselineBadge') }}</span>
+                        <span :class="skillSourceBadgeClass(skill.source)">{{ skillSourceLabel(skill.source) }}</span>
+                      </div>
+                    </div>
+                    <p class="mt-1 line-clamp-2 text-[12px] leading-relaxed text-[var(--muted)]">{{ skill.description }}</p>
+                    <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+                      <span class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 font-medium text-[var(--muted)]">{{ skillCategory(skill) }}</span>
+                      <span :class="['rounded-md px-1.5 py-0.5 font-semibold', riskTone(skill.risk)]">{{ riskLabel(skill.risk) }}</span>
+                      <span class="rounded-md bg-[var(--surface-muted)] px-1.5 py-0.5 font-medium text-[var(--muted)]">{{ t('capabilities.grantCount', { count: grantCount(skill.id) }) }}</span>
+                      <span v-for="chip in capabilityChips(skill).slice(0, 2)" :key="chip" class="rounded-md bg-[var(--accent-soft)]/60 px-1.5 py-0.5 font-medium text-[var(--accent)]">{{ chip }}</span>
+                    </div>
+                  </div>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <aside class="flex w-full shrink-0 flex-col xl:w-[360px]">
+            <section v-if="libraryDetail" class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)]">
+              <div class="border-b border-[var(--border)] p-5">
+                <div class="flex items-start gap-3">
+                  <div :class="['grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-gradient-to-br text-base font-extrabold text-white', skillAccent(libraryDetail)]">
+                    {{ skillInitial(libraryDetail.name) }}
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <p class="text-[10px] font-extrabold tracking-[.12em] text-[var(--accent)]">{{ skillSourceLabel(libraryDetail.source).toUpperCase() }}</p>
+                    <h2 class="mt-1 text-lg font-bold tracking-[-.02em]">{{ libraryDetail.name }}</h2>
+                    <p class="mt-2 text-sm leading-relaxed text-[var(--muted)]">{{ libraryDetail.description }}</p>
+                  </div>
+                </div>
+                <div class="mt-4 flex flex-wrap gap-1.5 text-[11px]">
+                  <span v-if="isBaselineCatalogSkill(libraryDetail.id)" class="rounded-md bg-[var(--accent)]/12 px-2 py-1 font-bold text-[var(--accent)]">{{ t('capabilities.skillBaselineBadge') }}</span>
+                  <span :class="['rounded-md px-2 py-1 font-semibold', riskTone(libraryDetail.risk)]">{{ riskLabel(libraryDetail.risk) }}</span>
+                  <span class="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[var(--muted)]">{{ skillCategory(libraryDetail) }}</span>
+                  <span class="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[var(--muted)]">{{ t('capabilities.grantCount', { count: grantCount(libraryDetail.id) }) }}</span>
+                  <span v-for="chip in capabilityChips(libraryDetail)" :key="chip" class="rounded-md bg-[var(--accent-soft)] px-2 py-1 text-[var(--accent)]">{{ chip }}</span>
+                </div>
+              </div>
+
+              <div class="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
+                <section v-if="libraryDetail.instructions" class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/50 p-4">
+                  <p class="text-[11px] font-bold uppercase tracking-wide text-[var(--muted)]">{{ t('capabilities.instructionsPreview') }}</p>
+                  <p class="mt-2 text-xs leading-relaxed text-[var(--foreground)] whitespace-pre-wrap">{{ libraryDetail.instructions }}</p>
+                </section>
+                <section class="rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4">
+                  <p class="text-sm font-bold">{{ t('capabilities.executionTitle') }}</p>
+                  <p class="mt-1 text-xs leading-relaxed text-[var(--muted)]">{{ t('capabilities.executionHelp') }}</p>
+                  <label class="mt-3 flex items-center gap-2 text-sm"><input v-model="libraryDetail.execution.allowWorkspaceWrite" type="checkbox" />{{ t('capabilities.allowWrite') }}</label>
+                  <label class="mt-2 flex items-center gap-2 text-sm"><input v-model="libraryDetail.execution.allowScriptExecution" type="checkbox" />{{ t('capabilities.allowScript') }}</label>
+                  <label class="mt-3 block text-sm">{{ t('capabilities.allowedHosts') }}<input v-model="executionHosts" class="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm" placeholder="api.github.com, example.com" /></label>
+                  <button class="mt-3 rounded-lg border border-[var(--accent)] px-3 py-2 text-sm font-semibold text-[var(--accent)]" type="button" @click="saveExecutionPolicy">{{ t('capabilities.saveExecution') }}</button>
+                </section>
+                <p class="text-[11px] leading-relaxed text-[var(--muted)]">{{ t('capabilities.assignHint') }}</p>
+              </div>
+
+              <div class="flex gap-2 border-t border-[var(--border)] p-4">
+                <button v-if="libraryDetail.path" class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold" type="button" @click="openCreator(libraryDetail)">{{ t('capabilities.editWithAdmin') }}</button>
+                <button v-if="!isCatalogBuiltin(libraryDetail)" class="rounded-lg px-3 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-500/10" type="button" @click="deleteSkill(libraryDetail)">{{ t('capabilities.delete') }}</button>
+                <button class="ml-auto rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold text-[var(--muted)]" type="button" @click="libraryDetail = null">{{ t('capabilities.closeDetail') }}</button>
+              </div>
+            </section>
+            <section v-else class="flex flex-1 flex-col justify-center rounded-2xl border border-dashed border-[var(--border)] bg-[var(--surface)]/60 px-6 py-10 text-center">
+              <p class="text-sm font-bold">{{ t('capabilities.catalogDetailEmptyTitle') }}</p>
+              <p class="mt-2 text-xs leading-relaxed text-[var(--muted)]">{{ t('capabilities.catalogDetailEmptyHelp') }}</p>
+            </section>
+          </aside>
         </div>
       </div>
       <div v-else-if="tab === 'discover'" class="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
@@ -295,8 +493,19 @@ onMounted(() => { void refresh(); void loadModels(); });
         <div class="mt-6 grid gap-3 md:grid-cols-2">
           <article class="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
             <h3 class="text-sm font-bold">{{ t('capabilities.importLocalTitle') }}</h3>
-            <p class="mt-1 text-xs text-[var(--muted)]">{{ t('capabilities.importLocalHelp') }}</p>
-            <button class="mt-3 rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-semibold" @click="importLocal">{{ t('capabilities.importSkill') }}</button>
+            <p class="mt-1 text-xs text-[var(--muted)]">推荐上传完整 Skill 目录的 `.zip` 包，这样会连同 `scripts/`、`references/`、`assets/` 一起导入。仅导入 `SKILL.md` 适合临时草稿，不适合完整 Skill 包。</p>
+            <input ref="zipInput" class="hidden" type="file" accept=".zip,application/zip" @change="handleZipPicked" />
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-semibold" @click="zipInput?.click()">上传 Skill zip 包</button>
+              <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-semibold disabled:opacity-50" :disabled="!isDesktopShell()" @click="importLocal">仅导入 SKILL.md</button>
+            </div>
+            <p class="mt-2 text-[11px] text-[var(--muted)]">如果只有一个 `SKILL.md` 草稿，没有 zip 包，也可以在下方直接粘贴 manifest 内容。</p>
+            <div v-if="!isDesktopShell()" class="mt-3 grid gap-2">
+              <textarea v-model="importManifestText" rows="8" class="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] px-3 py-2 text-xs font-mono" placeholder="粘贴完整 SKILL.md 内容（含 --- frontmatter ---）" />
+              <button class="justify-self-start rounded-lg border border-[var(--border)] px-3 py-2 text-xs font-semibold disabled:opacity-50" :disabled="!importManifestText.trim()" @click="importPastedSkill">
+                直接导入粘贴的 SKILL.md
+              </button>
+            </div>
           </article>
           <article class="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
             <h3 class="text-sm font-bold">{{ t('capabilities.importGitTitle') }}</h3>
@@ -311,42 +520,18 @@ onMounted(() => { void refresh(); void loadModels(); });
       </div>
       <SkillAuthoringList v-else-if="tab === 'create'" class="min-h-0 flex-1 overflow-y-auto overscroll-contain" :skills="authoringSkills" @create="createSkillWorkspace" @open="openEditor" @remove="deleteSkill" />
     </div>
-  <div v-if="selected || libraryDetail" class="fixed inset-0 z-30 grid place-items-center bg-slate-950/35 p-5" @click.self="selected = null; libraryDetail = null">
+  <div v-if="selected" class="fixed inset-0 z-30 grid place-items-center bg-slate-950/35 p-5" @click.self="selected = null">
     <article class="w-full max-w-lg rounded-2xl bg-[var(--surface)] p-6 shadow-2xl">
-      <button class="float-right text-xl" @click="selected = null; libraryDetail = null">×</button>
-      <template v-if="selected">
-        <p class="text-xs font-bold text-[var(--accent)]">{{ selected.source }}</p>
-        <h2 class="mt-2 text-2xl font-bold">{{ selected.name }}</h2>
-        <p class="mt-4 text-sm leading-relaxed text-[var(--muted)]">{{ selected.description }}</p>
-        <div class="mt-4 flex flex-wrap gap-2 text-xs">
-          <span :class="['rounded-md bg-[var(--surface-muted)] px-2 py-1 font-semibold', heatTone(selected.installs)]">{{ heatLabel(selected.installs) }}</span>
-          <span class="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[var(--muted)]">↓ {{ selected.installs }} {{ t('capabilities.installs') }}</span>
-          <span class="rounded-md bg-[var(--accent-soft)] px-2 py-1 font-medium text-[var(--accent)]">{{ t('capabilities.rankHot') }}</span>
-        </div>
-        <button class="mt-6 rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-60" :disabled="!!installProgress" @click="installSelected">{{ installProgress ? t('capabilities.installing') : t('capabilities.installAndReview') }}</button>
-      </template>
-      <template v-else-if="libraryDetail">
-        <p class="text-xs font-bold text-[var(--accent)]">{{ skillSourceLabel(libraryDetail.source) }}</p>
-        <h2 class="mt-2 text-2xl font-bold">{{ libraryDetail.name }}</h2>
-        <p class="mt-4 text-sm leading-relaxed text-[var(--muted)]">{{ libraryDetail.description }}</p>
-        <div class="mt-3 flex flex-wrap gap-1.5 text-[11px]">
-          <span :class="['rounded-md px-2 py-1 font-semibold', riskTone(libraryDetail.risk)]">{{ riskLabel(libraryDetail.risk) }}</span>
-          <span class="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[var(--muted)]">{{ t('capabilities.grantCount', { count: grantCount(libraryDetail.id) }) }}</span>
-          <span v-for="chip in capabilityChips(libraryDetail)" :key="chip" class="rounded-md bg-[var(--accent-soft)] px-2 py-1 text-[var(--accent)]">{{ chip }}</span>
-        </div>
-        <section v-if="libraryDetail.path" class="mt-5 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)] p-4">
-          <p class="text-sm font-bold">执行权限</p>
-          <p class="mt-1 text-xs leading-relaxed text-[var(--muted)]">默认拒绝副作用。产物仅写入本次运行的独立工作区；脚本只可来自 scripts/。</p>
-          <label class="mt-3 flex items-center gap-2 text-sm"><input v-model="libraryDetail.execution.allowWorkspaceWrite" type="checkbox" />允许写入运行工作区</label>
-          <label class="mt-2 flex items-center gap-2 text-sm"><input v-model="libraryDetail.execution.allowScriptExecution" type="checkbox" />允许执行 scripts/ 中脚本</label>
-          <label class="mt-3 block text-sm">允许访问的 HTTPS 域名（逗号分隔）<input v-model="executionHosts" class="mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm" placeholder="api.github.com, example.com" /></label>
-          <button class="mt-3 rounded-lg border border-[var(--accent)] px-3 py-2 text-sm font-semibold text-[var(--accent)]" @click="saveExecutionPolicy">保存执行权限</button>
-        </section>
-        <div class="mt-6 flex gap-2">
-          <button class="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold" @click="openCreator(libraryDetail); libraryDetail = null">{{ t('capabilities.editWithAdmin') }}</button>
-          <button class="rounded-lg px-3 py-2 text-sm font-semibold text-rose-600" @click="deleteSkill(libraryDetail)">{{ t('capabilities.delete') }}</button>
-        </div>
-      </template>
+      <button class="float-right text-xl" type="button" @click="selected = null">×</button>
+      <p class="text-xs font-bold text-[var(--accent)]">{{ selected.source }}</p>
+      <h2 class="mt-2 text-2xl font-bold">{{ selected.name }}</h2>
+      <p class="mt-4 text-sm leading-relaxed text-[var(--muted)]">{{ selected.description }}</p>
+      <div class="mt-4 flex flex-wrap gap-2 text-xs">
+        <span :class="['rounded-md bg-[var(--surface-muted)] px-2 py-1 font-semibold', heatTone(selected.installs)]">{{ heatLabel(selected.installs) }}</span>
+        <span class="rounded-md bg-[var(--surface-muted)] px-2 py-1 text-[var(--muted)]">↓ {{ selected.installs }} {{ t('capabilities.installs') }}</span>
+        <span class="rounded-md bg-[var(--accent-soft)] px-2 py-1 font-medium text-[var(--accent)]">{{ t('capabilities.rankHot') }}</span>
+      </div>
+      <button class="mt-6 rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-60" :disabled="!!installProgress" @click="installSelected">{{ installProgress ? t('capabilities.installing') : t('capabilities.installAndReview') }}</button>
     </article>
   </div>
   <div v-if="installProgress" class="fixed inset-0 z-50 grid place-items-center bg-slate-950/50 p-5 backdrop-blur-[2px]">

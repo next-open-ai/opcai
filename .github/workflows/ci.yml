@@ -2,12 +2,16 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +22,79 @@ jobs:
         run: corepack enable
       - name: Verify pnpm version
         run: pnpm --version
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm build
-      - run: pnpm size:check
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck workspace
+        run: pnpm typecheck
+      - name: Build workspace
+        run: pnpm build
+      - name: Enforce size budget
+        run: pnpm size:check
+
+  web-runtime-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (uses packageManager-pinned pnpm)
+        run: corepack enable
+      - name: Verify pnpm version
+        run: pnpm --version
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build workspace
+        run: pnpm build
+      - name: Smoke-test web runtime
+        run: pnpm web:smoke
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (uses packageManager-pinned pnpm)
+        run: corepack enable
+      - name: Verify pnpm version
+        run: pnpm --version
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build workspace
+        run: pnpm build
+      - name: Build root Docker image
+        run: docker build -t opcai-ci:${{ github.sha }} .
+
+  desktop-package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: macos-arm64
+            expected_extension: dmg
+          - os: windows-latest
+            artifact: windows-x64
+            expected_extension: exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable Corepack (uses packageManager-pinned pnpm)
+        run: corepack enable
+      - name: Verify pnpm version
+        run: pnpm --version
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Package ${{ matrix.artifact }}
+        run: pnpm package
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      - name: Verify packaged installer
+        shell: bash
+        run: |
+          find apps/desktop/release -type f -name "*.${{ matrix.expected_extension }}" -print -quit | grep -q .

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from '../../app/i18n.js';
+import { getRemoteGatewayStatus, getRemoteSettings, restartRemoteGateway, saveRemoteSettings } from '../../services/api.js';
 
 /**
  * P1「远程办公 / 连接」门户。
@@ -39,13 +40,13 @@ function parseList(text: string): string[] {
 }
 
 async function refreshStatus() {
-  const status = await window.opcaiDesktop?.gatewayStatus?.().catch(() => ({ running: false, pid: null }));
+  const status = await getRemoteGatewayStatus().catch(() => ({ running: false, pid: null }));
   gatewayRunning.value = Boolean(status?.running);
   gatewayPid.value = status?.pid ?? null;
 }
 
 async function load() {
-  const settings = await window.opcaiDesktop?.getChannelSettings?.().catch(() => undefined);
+  const settings = await getRemoteSettings().catch(() => undefined);
   const meta = (settings?.meta ?? {}) as ChannelMetaShape;
   const secrets = settings?.secrets ?? {};
   tgEnabled.value = Boolean(meta.channels?.telegram?.enabled);
@@ -79,7 +80,7 @@ async function save() {
         relay: {},
       },
     };
-    const result = await window.opcaiDesktop?.saveChannelSettings?.(payload);
+    const result = await saveRemoteSettings(payload);
     if (!result?.ok) throw new Error('保存失败：主进程未响应。');
     message.value = '已保存。重启网关后生效。';
     await refreshStatus();
@@ -92,7 +93,7 @@ async function restart() {
   error.value = '';
   message.value = '';
   try {
-    const result = await window.opcaiDesktop?.gatewayRestart?.();
+    const result = await restartRemoteGateway();
     gatewayRunning.value = Boolean(result?.running);
     gatewayPid.value = result?.pid ?? null;
     message.value = gatewayRunning.value ? '网关已重启（运行中）。' : '网关未运行（未启用任何通道或配置为空）。';

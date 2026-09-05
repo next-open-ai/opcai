@@ -4,7 +4,7 @@ import * as monaco from 'monaco-editor/esm/vs/editor/editor.api';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import 'monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution';
 import type { SkillRecord } from '../../app/capabilities';
-import { streamChat } from '../../services/api';
+import { listSkillFiles, readSkillFile, streamChat, writeSkillDraft, writeSkillFile } from '../../services/api';
 import { useModelConfig, toModelPayload } from '../../app/model-config';
 
 type FileEntry = { path: string; relative: string; type: 'directory' | 'file' };
@@ -49,10 +49,10 @@ function createEditor() {
   editor.onDidChangeModelContent(() => { current.value = editor?.getValue() || ''; });
 }
 function setEditorContent(value: string, file = selectedFile.value) { current.value = value; selectedFile.value = file; if (editor) { monaco.editor.setModelLanguage(editor.getModel()!, language(file)); editor.setValue(value); } }
-async function loadFiles() { if (!props.skill.path) return; files.value = await window.opcaiDesktop?.listSkillFiles(props.skill.path) || []; }
+async function loadFiles() { if (!props.skill.path) return; files.value = await listSkillFiles(props.skill.path); }
 async function selectFile(entry: FileEntry) {
   if (entry.type === 'directory' || entry.relative === selectedFile.value || !entry.path) return;
-  try { const result = await window.opcaiDesktop?.readSkillFile(entry.path); if (result) { selectedPath.value = result.path; setEditorContent(result.content, entry.relative); } } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause); }
+  try { const result = await readSkillFile(entry.path); selectedPath.value = result.path; setEditorContent(result.content, entry.relative); } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause); }
 }
 async function openDiff() { await nextTick(); if (!diffHost.value) return; diff?.dispose(); diff = monaco.editor.createDiffEditor(diffHost.value, { theme: 'vs', automaticLayout: true, readOnly: true, minimap: { enabled: false }, renderSideBySide: true }); diff.setModel({ original: monaco.editor.createModel(current.value, language(selectedFile.value)), modified: monaco.editor.createModel(proposed.value, language(selectedFile.value)) }); }
 async function restoreEditor() { showDiff.value = false; await nextTick(); editor?.dispose(); editor = undefined; createEditor(); }
@@ -80,14 +80,25 @@ async function persist(value = current.value) {
   saving.value = true; error.value = '';
   try {
     if (isDraft.value || selectedFile.value === 'SKILL.md') {
-      const name = skillName(value); const manifest = await window.opcaiDesktop?.writeSkillDraft({ name, content: value }); if (!manifest) throw new Error('Unable to save SKILL.md.');
-      isDraft.value = false; selectedPath.value = manifest.path; files.value = await window.opcaiDesktop?.listSkillFiles(manifest.path) || [];
+      const name = skillName(value); const manifest = await writeSkillDraft({ name, content: value });
+      isDraft.value = false; selectedPath.value = manifest.path; files.value = await listSkillFiles(manifest.path);
       emit('saved', { ...props.skill, id: `local:${name}`, name, path: manifest.path, source: 'local', description: description(value) });
-    } else if (selectedPath.value) await window.opcaiDesktop?.writeSkillFile(selectedPath.value, value);
+    } else if (selectedPath.value) await writeSkillFile({ path: selectedPath.value, content: value });
   } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause); }
   finally { saving.value = false; }
 }
-async function acceptDiff() { await persist(proposed.value); current.value = proposed.value; const root = selectedPath.value.replace(/[\\/][^\\/]+$/, ''); for (const file of pendingFiles.value) await window.opcaiDesktop?.writeSkillFile(`${root}/${file.relative}`, file.content); await loadFiles(); proposed.value = ''; pendingFiles.value = []; diff?.dispose(); diff = undefined; await restoreEditor(); }
+async function acceptDiff() {
+  await persist(proposed.value);
+  current.value = proposed.value;
+  const root = selectedPath.value.replace(/[\\/][^\\/]+$/, '');
+  for (const file of pendingFiles.value) await writeSkillFile({ path: `${root}/${file.relative}`, content: file.content });
+  await loadFiles();
+  proposed.value = '';
+  pendingFiles.value = [];
+  diff?.dispose();
+  diff = undefined;
+  await restoreEditor();
+}
 async function rejectDiff() { proposed.value = ''; pendingFiles.value = []; diff?.dispose(); diff = undefined; await restoreEditor(); }
 onMounted(async () => { current.value = props.initialContent || `---\nname: ${props.skill.name}\ndescription: ${props.skill.description}\n---\n\n# ${props.skill.name}\n`; await nextTick(); createEditor(); await loadFiles(); await generateInitial(); });
 onBeforeUnmount(() => { editor?.dispose(); diff?.dispose(); });

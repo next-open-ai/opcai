@@ -10,6 +10,13 @@
 
 OPCAI 是一套桌面级 Agent 工作台：其中的“数字员工”可以对话、运行**项目编排**、使用 **Skills**、检索**知识库 / MCP 连接 / 联网搜索**，并且能通过**本地通道网关**被外部 IM（Telegram / 飞书）乃至**远程中继终端**调度。与常见“聊天壳 + 状态都在前端”的 Agent 应用不同，OPCAI 把所有重编排放进**服务端状态机**：桌面 UI、IM 通道与未来的远程终端共享同一份会话/运行/审批/项目状态。
 
+目前仓库已经同时提供四种对齐的分发 / 运行入口：
+
+- `desktop`：Electron 壳 + 本地 API + renderer + 受管 gateway
+- `web launcher`：`pnpm build && pnpm web:start`
+- `npm / CLI launcher`：`opcai start`、`opcai init`、`opcai doctor`
+- `Docker`：根 `Dockerfile` 打包的 Web runtime 闭包
+
 仓库刻意保持 Electron 壳“薄”：
 
 ```text
@@ -58,12 +65,27 @@ Vue renderer ────── HTTP / SSE ────────┘
 ```bash
 pnpm install
 pnpm dev        # 桌面开发：先构建 workspace 包，再起 Vite + Electron
+pnpm web:start  # 本地 Web launcher（需先 build）
 pnpm typecheck
 pnpm build
+pnpm web:smoke  # 对已构建的 Web runtime 做最小冒烟校验
 pnpm package    # electron-builder 打安装包
 ```
 
 在“设置 → 模型”配置 Provider 之前不会存储/使用任何模型密钥。无头/CI 冒烟脚本见 `scripts/*-smoke.mjs` 与设计文档。
+
+## Runtime 模式
+
+桌面版仍然是当前能力最完整、最推荐的运行形态。`web launcher`、`npm` 包和 `Docker` 镜像共享同一套 API + 静态 renderer runtime，但与 Electron 桌面壳并不完全等价。
+
+| 运行形态 | 状态 | 说明 |
+| --- | --- | --- |
+| Desktop | 推荐 | 完整本地优先体验，包含 Electron IPC、`safeStorage`、原生文件对话框、桌面安装包 |
+| Web launcher | 已支持 | 本机构建后通过浏览器访问，适合 CI 冒烟、无头调试、本地远程访问 |
+| npm / CLI | 已支持 | 通过 `opcai` 入口分发同一套 Web runtime |
+| Docker | 已支持但有边界 | 根镜像可构建且已纳入 CI 校验；当前遵循 Web runtime 边界，不等价于完整桌面版 |
+
+详细能力矩阵、Web/Docker 当前退化行为见 [docs/runtime-modes.md](docs/runtime-modes.md)，部署/发布链路说明见 [docs/deployment.md](docs/deployment.md)。
 
 ## 发布
 
@@ -81,6 +103,7 @@ Linux 打包暂在 CI 停用（细节见 `.github/workflows/release.yml` 注释�
 
 | 语言/主题 | 入口 |
 | --- | --- |
+| 运行模式 / 部署 | [docs/runtime-modes.md](docs/runtime-modes.md) · [docs/deployment.md](docs/deployment.md) |
 | 架构与模块 | [docs/design/architecture.md](docs/design/architecture.md)（当前权威） |
 | 设计文档索引与状态 | [docs/design/README.md](docs/design/README.md) |
 | 通道网关里程碑 | [M0](docs/design/gateway-m0.md) · [M0 验收清单](docs/design/gateway-m0-acceptance.md) · [M1](docs/design/gateway-m1.md) · [M2](docs/design/gateway-m2.md) |

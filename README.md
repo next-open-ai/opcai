@@ -10,6 +10,13 @@
 
 OPCAI is a desktop agent workspace whose agents ("digital employees") can chat, run **projects**, use **Skills**, query **knowledge bases / MCP connectors / web search**, and be driven from **external channels** (Telegram / Feishu / a remote relay) through a local gateway. Every heavy piece of orchestration lives in a **server-side state machine**, so the desktop UI, IM channels and future remote terminals all share one consistent view of sessions, runs, approvals and project scheduling.
 
+OPCAI now exposes four aligned distribution/runtime entry points:
+
+- `desktop`: Electron shell + local API + renderer + managed gateway
+- `web launcher`: `pnpm build && pnpm web:start`
+- `npm / CLI launcher`: `opcai start`, `opcai init`, `opcai doctor`
+- `Docker`: root `Dockerfile` for the packaged web runtime closure
+
 The repository deliberately keeps the Electron shell thin:
 
 ```text
@@ -57,12 +64,27 @@ Requirements: Node.js ≥ 22, pnpm ≥ 10 (pinned via `packageManager`).
 ```bash
 pnpm install
 pnpm dev        # desktop (builds workspace packages, starts Vite + Electron)
+pnpm web:start  # local web launcher (build first)
 pnpm typecheck
 pnpm build
+pnpm web:smoke  # smoke-check the built web runtime
 pnpm package    # electron-builder installers
 ```
 
 No model credentials are stored or used until you configure a provider in **Settings → Models**. Headless/CI smoke scripts are also provided (see `scripts/*-smoke.mjs` and the design docs).
+
+## Runtime modes
+
+Desktop remains the most complete runtime. The web launcher, npm package and Docker image all share the same API + static-renderer runtime, but they are not identical to the Electron shell.
+
+| Runtime | Status | Notes |
+| --- | --- | --- |
+| Desktop | Recommended | Full local-first experience, Electron IPC, `safeStorage`, native dialogs, packaged installers |
+| Web launcher | Supported | Runs the built API + renderer locally in a browser; good for CI smoke and headless/local access |
+| npm / CLI | Supported | Ships the same web launcher runtime through `opcai` |
+| Docker | Supported with current limitations | Root image is buildable and CI-validated; current behavior follows the web runtime rather than full desktop parity |
+
+See [docs/runtime-modes.md](docs/runtime-modes.md) for the detailed capability matrix and current degradation behavior, and [docs/deployment.md](docs/deployment.md) for build/release/deployment notes.
 
 ## Release
 
@@ -80,6 +102,7 @@ Linux packaging stays disabled in CI for now (see the workflow comments in `.git
 
 | Language | Index |
 | --- | --- |
+| Runtime / deployment | [docs/runtime-modes.md](docs/runtime-modes.md) · [docs/deployment.md](docs/deployment.md) |
 | 中文 | [docs/design/architecture.md](docs/design/architecture.md) · [docs/design README](docs/design/README.md) · [网关设计](docs/design/gateway-m0.md) (M0) / [M1](docs/design/gateway-m1.md) / [M2](docs/design/gateway-m2.md) |
 | English | See the feature/milestone tables inside the design docs above (deep design notes are currently maintained in Chinese). |
 

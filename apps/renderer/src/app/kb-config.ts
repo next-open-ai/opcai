@@ -1,5 +1,11 @@
 import { computed, ref } from 'vue';
 import { readStored, writeStored } from './storage';
+import {
+  getServerKnowledgeBases,
+  getServerKnowledgeProviderConfig,
+  saveServerKnowledgeBases,
+  saveServerKnowledgeProviderConfig,
+} from '../services/api.js';
 
 export const knowledgeProviderIds = ['lancedb', 'bailian', 'dify', 'qdrant', 'pinecone'] as const;
 export type KnowledgeProviderId = (typeof knowledgeProviderIds)[number];
@@ -205,7 +211,10 @@ export function useKnowledgeConfig() {
   const loadProviders = async () => {
     if (providersLoaded.value) return;
     try {
-      providerSettings.value = normalizeProviderSettings(JSON.parse((await readStored(providersKey)) || '{}'));
+      const stored = window.opcaiDesktop
+        ? JSON.parse((await readStored(providersKey)) || '{}')
+        : await getServerKnowledgeProviderConfig();
+      providerSettings.value = normalizeProviderSettings(stored);
     } catch {
       providerSettings.value = defaultProviderSettings();
     }
@@ -217,7 +226,8 @@ export function useKnowledgeConfig() {
     const local = next.providers.find((item) => item.id === 'lancedb');
     if (local) local.enabled = true;
     providerSettings.value = next;
-    await writeStored(providersKey, JSON.stringify(next));
+    if (window.opcaiDesktop) await writeStored(providersKey, JSON.stringify(next));
+    else await saveServerKnowledgeProviderConfig(next);
     return next;
   };
 
@@ -225,7 +235,10 @@ export function useKnowledgeConfig() {
     await loadProviders();
     if (basesLoaded.value) return;
     try {
-      bases.value = normalizeAll(JSON.parse((await readStored(basesKey)) || '[]'));
+      const stored = window.opcaiDesktop
+        ? JSON.parse((await readStored(basesKey)) || '[]')
+        : await getServerKnowledgeBases();
+      bases.value = normalizeAll(stored);
     } catch {
       bases.value = [];
     }
@@ -253,14 +266,16 @@ export function useKnowledgeConfig() {
       }
       if (changed) {
         providerSettings.value = { ...providerSettings.value, providers: [...providerSettings.value.providers] };
-        await writeStored(providersKey, JSON.stringify(providerSettings.value));
+        if (window.opcaiDesktop) await writeStored(providersKey, JSON.stringify(providerSettings.value));
+        else await saveServerKnowledgeProviderConfig(providerSettings.value);
       }
     }
     basesLoaded.value = true;
   };
 
   const persist = async () => {
-    await writeStored(basesKey, JSON.stringify(bases.value));
+    if (window.opcaiDesktop) await writeStored(basesKey, JSON.stringify(bases.value));
+    else await saveServerKnowledgeBases(bases.value);
   };
 
   const enabledProviders = computed(() =>

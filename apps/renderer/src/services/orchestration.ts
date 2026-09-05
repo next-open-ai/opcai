@@ -440,7 +440,7 @@ export async function deleteChatSession(id: string): Promise<void> {
  * Send a chat message. `context` is optional: the server assembles the run
  * context for the session's employee (domain KV + keyring) when omitted.
  */
-export async function sendChatMessage(id: string, input: { content: string; employeeId?: string }): Promise<{ runId: string; turnId: string; attemptNo: number }> {
+export async function sendChatMessage(id: string, input: { content: string; employeeId?: string; context?: Record<string, unknown> }): Promise<{ runId: string; turnId: string; attemptNo: number }> {
   return request(`/sessions/${encodeURIComponent(id)}/messages`, { method: 'POST', body: JSON.stringify(input) });
 }
 

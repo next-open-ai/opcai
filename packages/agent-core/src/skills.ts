@@ -1,3 +1,6 @@
+import path from 'node:path';
+import os from 'node:os';
+import fs from 'node:fs';
 import { createMCPClient, type MCPClient } from '@ai-sdk/mcp';
 import { Experimental_StdioMCPTransport } from '@ai-sdk/mcp/mcp-stdio';
 import type { McpConnectionRuntime } from '@opcai/contracts';
@@ -57,6 +60,13 @@ function wrapMcpTool(tool: unknown, toolName: string, timeoutMs: number) {
   };
 }
 
+function expandUserPath(value: string): string {
+  const raw = String(value || '');
+  if (raw === '~') return os.homedir();
+  if (raw.startsWith('~/') || raw.startsWith('~\\')) return path.join(os.homedir(), raw.slice(2));
+  return raw;
+}
+
 function isStdio(connection: McpConnection | McpConnectionRuntime): connection is Extract<McpConnectionRuntime, { transport: 'stdio' }> | (McpConnection & { transport: 'stdio' }) {
   return connection.transport === 'stdio' || Boolean((connection as McpConnection).command && !(connection as McpConnection).url);
 }
@@ -75,9 +85,17 @@ export async function connectMcp(connection: McpConnection | McpConnectionRuntim
   if (isStdio(connection) || connection.transport === 'stdio') {
     const command = 'command' in connection ? String(connection.command || '').trim() : '';
     if (!command) throw new Error('Local MCP requires a command (npx / uvx / custom).');
-    const args = 'args' in connection && Array.isArray(connection.args) ? connection.args.map(String) : [];
+    const args = ('args' in connection && Array.isArray(connection.args) ? connection.args.map(String) : []).map(expandUserPath);
+    for (const arg of args) {
+      if (
+        !arg.includes(`${path.sep}.opcai${path.sep}`) && !arg.endsWith(`${path.sep}.opcai`)
+        && !arg.includes(`${path.sep}.easyai${path.sep}`) && !arg.endsWith(`${path.sep}.easyai`)
+      ) continue;
+      try { fs.mkdirSync(arg, { recursive: true }); } catch { /* ignore */ }
+    }
     const env = 'env' in connection && connection.env && typeof connection.env === 'object' ? connection.env : undefined;
-    const cwd = 'cwd' in connection && connection.cwd ? String(connection.cwd) : undefined;
+    const cwdRaw = 'cwd' in connection && connection.cwd ? String(connection.cwd) : undefined;
+    const cwd = cwdRaw ? expandUserPath(cwdRaw) : undefined;
     return createMCPClient({
       ...clientOptions,
       transport: new Experimental_StdioMCPTransport({
@@ -121,6 +139,8 @@ export async function loadMcpToolset(
   const clients: MCPClient[] = [];
   const tools: Record<string, unknown> = {};
   const labels: string[] = [];
+  const toolCatalog: string[] = [];
+  const loadErrors: string[] = [];
   for (const connection of connections ?? []) {
     if (!connection?.enabled) continue;
     const ready =
@@ -133,26 +153,38 @@ export async function loadMcpToolset(
       clients.push(client);
       const mcpTools = await client.tools();
       const prefix = sanitizeToolPrefix(connection.name || connection.id);
+      const names: string[] = [];
       for (const [name, tool] of Object.entries(mcpTools || {})) {
         const key = `mcp_${prefix}_${name}`.slice(0, 64);
+        names.push(key);
         tools[key] = wrapMcpTool(tool, key, toolTimeoutMs);
       }
       labels.push(connection.name);
-    } catch {
-      // Skip unreachable connectors; the agent can still run with remaining tools.
+      if (names.length) {
+        toolCatalog.push(`- ${connection.name}: ${names.slice(0, 24).join(', ')}${names.length > 24 ? ` (+${names.length - 24} more)` : ''}`);
+      }
+    } catch (error) {
+      loadErrors.push(`${connection.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  const instructions = clients
-    .map((client, index) => {
-      const label = labels[index] || `MCP ${index + 1}`;
-      const text = client.instructions?.trim();
-      return text ? `MCP 「${label}」使用说明：\n${text}` : '';
-    })
-    .filter(Boolean)
-    .join('\n\n');
+  const instructionParts: string[] = [];
+  if (toolCatalog.length) {
+    instructionParts.push(
+      `Available MCP tools for this run:\n${toolCatalog.join('\n')}`,
+    );
+  }
+  for (let index = 0; index < clients.length; index += 1) {
+    const client = clients[index];
+    const label = labels[index] || `MCP ${index + 1}`;
+    const text = client.instructions?.trim();
+    if (text) instructionParts.push(`MCP 「${label}」使用说明：\n${text}`);
+  }
+  if (loadErrors.length) {
+    instructionParts.push(`MCP connectors that failed to load (unavailable this run):\n${loadErrors.map((item) => `- ${item}`).join('\n')}`);
+  }
   return {
     tools: tools as Record<string, any>,
-    instructions,
+    instructions: instructionParts.join('\n\n'),
     labels,
     async close() {
       await Promise.all(clients.map(async (client) => {

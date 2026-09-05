@@ -37,6 +37,14 @@ export interface ChatSessionServiceOptions {
    * caller sees a clear "model not configured" style error.
    */
   contextResolver?: (employeeId: string) => ChatRunContext | null | Promise<ChatRunContext | null>;
+  /**
+   * MCP-only backfill when the client sends a context with empty
+   * `mcpConnections` (common when model comes from the client but MCP prefs
+   * were not loaded yet, or full contextResolver returns null without a model).
+   */
+  mcpConnectionsResolver?: (
+    employeeId: string,
+  ) => ChatRunContext['mcpConnections'] | Promise<ChatRunContext['mcpConnections']>;
 }
 
 export interface SendUserMessageInput {
@@ -63,6 +71,7 @@ export class ChatSessionService {
   private readonly hub: EventHub<OrcEvent>;
   private readonly engine: RunEngine;
   private readonly contextResolver?: ChatSessionServiceOptions['contextResolver'];
+  private readonly mcpConnectionsResolver?: ChatSessionServiceOptions['mcpConnectionsResolver'];
   /** Active run aborts per session (one run at a time, mirroring the UI). */
   private readonly activeAborts = new Map<string, AbortController>();
   private readonly runAttempts = new Map<string, number>();
@@ -72,17 +81,40 @@ export class ChatSessionService {
     this.hub = options.hub;
     this.engine = options.engine;
     this.contextResolver = options.contextResolver;
+    this.mcpConnectionsResolver = options.mcpConnectionsResolver;
   }
 
   /** Resolve a run context for an employee (caller payload first, else resolver). */
   private async resolveContextFor(employeeId: string, explicit?: ChatRunContext): Promise<ChatRunContext | null> {
-    if (explicit) return explicit;
-    if (!this.contextResolver) return null;
-    try {
-      return (await this.contextResolver(employeeId)) ?? null;
-    } catch {
-      return null;
+    let resolved: ChatRunContext | null = explicit ?? null;
+    if (!resolved && this.contextResolver) {
+      try {
+        resolved = (await this.contextResolver(employeeId)) ?? null;
+      } catch {
+        resolved = null;
+      }
     }
+    if (!resolved) return null;
+    if (!resolved.mcpConnections?.length) {
+      let mcp: ChatRunContext['mcpConnections'] = [];
+      if (this.mcpConnectionsResolver) {
+        try {
+          mcp = (await this.mcpConnectionsResolver(employeeId)) ?? [];
+        } catch {
+          mcp = [];
+        }
+      }
+      if (!mcp.length && this.contextResolver) {
+        try {
+          const fallback = (await this.contextResolver(employeeId)) ?? null;
+          mcp = fallback?.mcpConnections ?? [];
+        } catch {
+          mcp = [];
+        }
+      }
+      if (mcp.length) resolved = { ...resolved, mcpConnections: mcp };
+    }
+    return resolved;
   }
 
   private sessionKey(id: string): string {

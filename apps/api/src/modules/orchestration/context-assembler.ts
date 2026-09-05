@@ -53,7 +53,7 @@ Only claim a file was saved when the tool returned ok: true.`;
 
 interface EmployeeRow { id?: string; name?: string; instructions?: string; description?: string }
 interface SkillRow {
-  id?: string; name?: string; description?: string; mode?: string; path?: string;
+  id?: string; name?: string; description?: string; mode?: string; path?: string; instructions?: string;
   execution?: { allowWorkspaceWrite?: boolean; allowScriptExecution?: boolean; allowedNetworkHosts?: string[]; allowAllNonDestructive?: boolean };
 }
 interface PolicyRow { employeeId?: string; skillId?: string; mode?: string }
@@ -188,6 +188,7 @@ async function skillRuntimeFor(store: KeyValueStore, task: ProjectTask, tier: st
       description: skill.description ?? '',
       mode: policy.mode === 'default' ? 'default' : 'available',
       ...(skill.path ? { rootPath: (skill.path as string).replace(/[\\/][^\\/]+$/, '') } : {}),
+      ...(skill.instructions ? { instructions: String(skill.instructions).slice(0, 24_000) } : {}),
       resources: [],
       execution: {
         allowWorkspaceWrite: !readOnly && Boolean(execution.allowWorkspaceWrite),
@@ -219,11 +220,18 @@ async function skillRuntimeFor(store: KeyValueStore, task: ProjectTask, tier: st
 async function mcpConnectionsFor(store: KeyValueStore, prefs: PrefsRow): Promise<ChatRunContext['mcpConnections']> {
   const all = rows(await kvJson(store, MCP_KEY)) as Array<Record<string, unknown>>;
   const wanted = new Set(prefs.mcpIds ?? []);
-  if (wanted.size === 0) return [];
+  const AUTO_SKIP = new Set(['mcp-baseline-playwright', 'mcp-baseline-chrome-devtools']);
   const out: ChatRunContext['mcpConnections'] = [];
   for (const raw of all) {
     const id = String(raw.id ?? '');
-    if (!id || !wanted.has(id) || raw.enabled === false) continue;
+    if (!id || raw.enabled === false) continue;
+    // Explicit association restricts; empty prefs → enabled connectors minus heavy browsers.
+    if (wanted.size > 0) {
+      if (!wanted.has(id)) continue;
+    } else if (AUTO_SKIP.has(id)) {
+      continue;
+    }
+    if (raw.lastTestStatus === 'failed') continue;
     const transport = raw.transport === 'sse' || raw.transport === 'http' || raw.transport === 'stdio' ? raw.transport : 'http';
     const base = { id, name: String(raw.name ?? id), enabled: true, description: raw.description ? String(raw.description) : undefined };
     if (transport === 'stdio' && raw.command) {
@@ -239,7 +247,28 @@ async function mcpConnectionsFor(store: KeyValueStore, prefs: PrefsRow): Promise
       out.push({ ...base, transport: transport === 'sse' ? 'sse' : 'http', url: String(raw.url), ...(raw.apiKey ? { apiKey: String(raw.apiKey) } : {}) });
     }
   }
-  return out;
+  const rank = (id: string) => {
+    if (id.includes('stock') || id.includes('akshare')) return 0;
+    if (id.includes('fetch') || id.includes('memory')) return 1;
+    return 2;
+  };
+  out.sort((a, b) => rank(a.id) - rank(b.id));
+  return out.slice(0, 12);
+}
+
+/**
+ * MCP connectors for an employee (prefs association, or auto-default when empty).
+ * Independent of model resolution so chat can backfill tools even when the
+ * client already supplied the model.
+ */
+export async function resolveEmployeeMcpConnections(
+  store: KeyValueStore,
+  employeeId: string,
+): Promise<ChatRunContext['mcpConnections']> {
+  const prefsRaw = await kvJson(store, PREFS_KEY);
+  const prefsAll = prefsRaw && typeof prefsRaw === 'object' ? (prefsRaw as Record<string, unknown>) : {};
+  const prefs = (prefsAll[employeeId] ?? {}) as PrefsRow;
+  return mcpConnectionsFor(store, prefs);
 }
 
 async function knowledgeBasesFor(store: KeyValueStore, prefs: PrefsRow): Promise<ChatRunContext['knowledgeBases']> {

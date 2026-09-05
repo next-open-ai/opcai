@@ -10,6 +10,9 @@ import {
 } from "../../app/project-files.js";
 import type { Project } from "../../app/projects.js";
 import { employeeDisplayName } from "../../app/employees";
+import { isDesktopShell } from "../../app/platform.js";
+import { downloadAssetBestEffort } from "../../app/platform-actions.js";
+import { exportWorkspaceZip, importWorkspaceZip, listWorkspaceFiles, materializeWorkspaceAssets, readWorkspaceFile, syncWorkspaceRun, writeWorkspaceFile } from "../../services/api.js";
 
 const props = defineProps<{
   project: Project;
@@ -31,6 +34,7 @@ const emit = defineEmits<{
 }>();
 
 const draft = ref("");
+const desktopShell = isDesktopShell();
 const pickerOpen = ref(false);
 const mentionMenuOpen = ref(false);
 const mentionActiveIndex = ref(0);
@@ -45,6 +49,9 @@ type FileEntry = ProjectFileEntry;
 const files = ref<FileEntry[]>([]);
 const selectedFile = ref('');
 const fileContent = ref('');
+const workspaceZipInput = ref<HTMLInputElement>();
+const importingZip = ref(false);
+const exportingZip = ref(false);
 const editorHost = ref<HTMLElement>();
 const collapsedDirectories = ref(new Set<string>());
 let editor: monaco.editor.IStandaloneCodeEditor | undefined;
@@ -255,11 +262,58 @@ async function copyWorkspacePath() {
 }
 
 async function openWorkspaceFolder() {
-  if (!props.project.workspacePath || !window.opcaiDesktop) return;
+  if (!props.project.workspacePath) return;
   try {
+    if (!window.opcaiDesktop) throw new Error('desktop unavailable');
     await window.opcaiDesktop.revealProjectFile(props.project.workspacePath, '');
   } catch {
     await copyWorkspacePath();
+  }
+}
+
+async function handleWorkspaceZipPicked(event: Event) {
+  const input = event.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file || !props.project.workspacePath) return;
+  importingZip.value = true;
+  filesError.value = '';
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    let binary = '';
+    const chunk = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+    }
+    await importWorkspaceZip({ root: props.project.workspacePath, filename: file.name, base64: btoa(binary) });
+    await loadFiles({ recover: false });
+  } catch (error) {
+    filesError.value = error instanceof Error ? error.message : '导入项目 zip 失败。';
+  } finally {
+    importingZip.value = false;
+    if (input) input.value = '';
+  }
+}
+
+async function downloadWorkspaceZip() {
+  if (!props.project.workspacePath) return;
+  exportingZip.value = true;
+  filesError.value = '';
+  try {
+    const result = await exportWorkspaceZip(props.project.workspacePath);
+    const bytes = Uint8Array.from(atob(result.base64), (char) => char.charCodeAt(0));
+    const blob = new Blob([bytes], { type: 'application/zip' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = result.filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    filesError.value = error instanceof Error ? error.message : '导出项目 zip 失败。';
+  } finally {
+    exportingZip.value = false;
   }
 }
 
@@ -283,7 +337,7 @@ function fileGlyph(entry: FileEntry): { label: string; className: string } {
 }
 
 async function recoverProjectFiles() {
-  if (!props.project.workspacePath || !window.opcaiDesktop) return;
+  if (!props.project.workspacePath) return;
   const assetIds = [...new Set(totalAssets.value.map((asset) => asset.id))];
   const runIds = new Set<string>();
   for (const task of props.project.tasks) {
@@ -294,17 +348,19 @@ async function recoverProjectFiles() {
       runIds.add((asset as { runId: string }).runId);
     }
   }
-  try {
-    const catalog = await window.opcaiDesktop.listAssets();
-    for (const asset of catalog) {
-      if (assetIds.includes(asset.id) && asset.runId) runIds.add(asset.runId);
-    }
-  } catch { /* Desktop catalog is best-effort during recovery. */ }
   for (const runId of runIds) {
-    try { await window.opcaiDesktop.syncProjectWorkspace(props.project.workspacePath, runId); } catch { /* Continue other run workspaces. */ }
+    try { await syncWorkspaceRun(props.project.workspacePath, runId); } catch { /* Continue other run workspaces. */ }
   }
   if (assetIds.length) {
-    try { await window.opcaiDesktop.materializeProjectAssets(props.project.workspacePath, assetIds); } catch { /* Keep listing whatever already synced. */ }
+    try {
+      await materializeWorkspaceAssets(props.project.workspacePath, totalAssets.value
+        .filter((asset) => assetIds.includes(asset.id))
+        .map((asset) => ({
+          assetId: asset.id,
+          relativePath: asset.name,
+          name: asset.name,
+        })));
+    } catch { /* Keep listing whatever already synced. */ }
   }
 }
 
@@ -315,21 +371,16 @@ async function loadFiles(options: { recover?: boolean } = {}) {
     filesError.value = '旧项目尚未配置项目空间。';
     return;
   }
-  if (!window.opcaiDesktop) {
-    files.value = [];
-    filesError.value = '项目文件树仅在桌面应用中可用。';
-    return;
-  }
   refreshing.value = true;
   try {
     // 先把本项目各任务的运行工作区(生成的文件)同步到项目目录，再读取文件树。
     await syncRunWorkspacesIntoProject();
-    files.value = await window.opcaiDesktop.listProjectFiles(props.project.workspacePath);
+    files.value = await listWorkspaceFiles(props.project.workspacePath);
     const hasTaskRuns = props.project.tasks.some((task) => Boolean(task.runId));
     const needsRecover = options.recover !== false && !files.value.some((entry) => entry.type === 'file') && (totalAssets.value.length > 0 || hasTaskRuns);
     if (needsRecover) {
       await recoverProjectFiles();
-      files.value = await window.opcaiDesktop.listProjectFiles(props.project.workspacePath);
+      files.value = await listWorkspaceFiles(props.project.workspacePath);
     }
   } catch (error) {
     filesError.value = error instanceof Error ? error.message : '无法读取项目空间。';
@@ -340,17 +391,17 @@ async function loadFiles(options: { recover?: boolean } = {}) {
 
 /** 复制所有已运行任务的生成文件到项目目录，使左侧文件树能看到运行工作区的产物。 */
 async function syncRunWorkspacesIntoProject() {
-  if (!props.project.workspacePath || !window.opcaiDesktop) return;
+  if (!props.project.workspacePath) return;
   const runIds = [...new Set(props.project.tasks.map((task) => task.runId).filter((runId): runId is string => Boolean(runId)))];
   for (const runId of runIds) {
-    try { await window.opcaiDesktop.syncProjectWorkspace(props.project.workspacePath, runId); } catch { /* 单个运行失败不影响其它 */ }
+    try { await syncWorkspaceRun(props.project.workspacePath, runId); } catch { /* 单个运行失败不影响其它 */ }
   }
 }
 
 async function selectFile(entry: FileEntry) {
   if (entry.type === 'directory') { toggleDirectory(entry); return; }
   if (!props.project.workspacePath) return;
-  const file = await window.opcaiDesktop?.readProjectFile(props.project.workspacePath, entry.relative);
+  const file = await readWorkspaceFile(props.project.workspacePath, entry.relative);
   if (!file) return;
   selectedFile.value = entry.relative; fileContent.value = file.content;
   membersDockOpen.value = false;
@@ -365,7 +416,7 @@ function closeEditor() {
   editor = undefined;
   membersDockOpen.value = false;
 }
-async function saveFile() { if (!props.project.workspacePath || !selectedFile.value || !editor) return; const result = await window.opcaiDesktop?.writeProjectFile(props.project.workspacePath, selectedFile.value, editor.getValue()); if (result) fileContent.value = result.content; }
+async function saveFile() { if (!props.project.workspacePath || !selectedFile.value || !editor) return; const result = await writeWorkspaceFile(props.project.workspacePath, selectedFile.value, editor.getValue()); if (result) fileContent.value = result.content; }
 
 async function dispatch() {
   if (
@@ -439,7 +490,7 @@ function handleDraftKeydown(event: KeyboardEvent) {
   }
 }
 async function download(assetId: string) {
-  await window.opcaiDesktop?.saveAsset(assetId);
+  await downloadAssetBestEffort(assetId);
 }
 function openMember(employeeId: EmployeeId) {
   detailEmployeeId.value = employeeId;
@@ -588,6 +639,7 @@ onBeforeUnmount(() => {
             v-if="project.workspacePath"
             class="mb-3 rounded-xl border border-[var(--border)] bg-[var(--surface-muted)]/70 px-2.5 py-2"
           >
+            <input ref="workspaceZipInput" class="hidden" type="file" accept=".zip,application/zip" @change="handleWorkspaceZipPicked" />
             <div class="flex items-start gap-2">
               <span
                 class="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-[var(--accent-soft)] text-xs font-bold text-[var(--accent)]"
@@ -602,13 +654,25 @@ onBeforeUnmount(() => {
                 </p>
               </div>
             </div>
-            <div class="mt-2 flex items-center gap-1.5">
+            <div class="mt-2 flex flex-wrap items-center gap-1.5">
               <button
                 class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)]"
                 type="button"
-                title="在访达中打开项目目录"
+                :title="desktopShell ? '在访达中打开项目目录' : 'Web / Docker 下复制服务端项目空间路径'"
                 @click="openWorkspaceFolder"
-              >打开位置</button>
+              >{{ desktopShell ? '打开位置' : (pathCopied ? '已复制路径' : '复制路径') }}</button>
+              <button
+                class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)] disabled:opacity-50"
+                type="button"
+                :disabled="importingZip"
+                @click="workspaceZipInput?.click()"
+              >{{ importingZip ? '导入中…' : '导入 zip' }}</button>
+              <button
+                class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)] disabled:opacity-50"
+                type="button"
+                :disabled="exportingZip"
+                @click="downloadWorkspaceZip"
+              >{{ exportingZip ? '导出中…' : '导出 zip' }}</button>
               <button
                 class="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent)]"
                 type="button"
@@ -617,6 +681,9 @@ onBeforeUnmount(() => {
               >{{ pathCopied ? '已复制' : '复制路径' }}</button>
               <span v-if="fileCount" class="ml-auto text-[10px] tabular-nums text-[var(--muted)]">{{ fileCount }} 项</span>
             </div>
+            <p v-if="!desktopShell" class="mt-2 text-[10px] leading-4 text-[var(--muted)]">
+              浏览器环境下建议通过“导入 zip / 导出 zip”在本地与服务端项目空间之间同步文件；“打开位置”会退化为复制服务端路径。
+            </p>
           </div>
           <p v-else class="mb-3 px-1 text-[11px] leading-4 text-[var(--muted)]">旧项目尚未配置项目空间。</p>
 
@@ -909,12 +976,15 @@ onBeforeUnmount(() => {
             <button class="text-xs text-[var(--muted)]" type="button" @click="membersDockOpen = false">收起</button>
           </div>
           <div class="max-h-72 overflow-y-auto p-2">
-            <button
+            <div
               v-for="employee in members"
               :key="employee.id"
-              class="mb-1.5 flex w-full items-center gap-2 rounded-xl border border-[var(--border)] p-2.5 text-left hover:border-[var(--accent)]"
-              type="button"
+              class="mb-1.5 flex w-full cursor-pointer items-center gap-2 rounded-xl border border-[var(--border)] p-2.5 text-left hover:border-[var(--accent)]"
+              role="button"
+              tabindex="0"
               @click="openMember(employee.id)"
+              @keydown.enter.prevent="openMember(employee.id)"
+              @keydown.space.prevent="openMember(employee.id)"
             >
               <span class="relative grid h-8 w-8 place-items-center rounded-lg text-[10px] font-bold text-white" :style="{ background: employee.color }">
                 {{ employee.initials }}
@@ -931,7 +1001,7 @@ onBeforeUnmount(() => {
                 title="移除成员并重新规划"
                 @click="requestRemoveMember(employee.id, $event)"
               >移除</button>
-            </button>
+            </div>
             <div class="relative mt-2">
               <button
                 class="w-full rounded-xl border border-dashed border-[var(--border)] px-3 py-2 text-xs font-semibold text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-40"

@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue';
+import { getServerModelConfig, saveServerModelConfig } from '../services/api';
 
 export const providerIds = ['openai', 'anthropic', 'google', 'deepseek', 'qwen', 'ollama', 'openai-compatible'] as const;
 export type ProviderId = (typeof providerIds)[number];
@@ -332,7 +333,9 @@ function normalize(value: unknown): ModelSettings {
 
 async function load() {
   if (loaded.value) return;
-  const stored = window.opcaiDesktop ? await window.opcaiDesktop.getModelConfig() : JSON.parse(localStorage.getItem(localKey) || '{}');
+  const stored = await getServerModelConfig().catch(() =>
+    window.opcaiDesktop ? window.opcaiDesktop.getModelConfig() : JSON.parse(localStorage.getItem(localKey) || '{}'),
+  );
   const before = JSON.stringify(stored ?? {});
   const next = normalize(stored);
   settings.value = next;
@@ -340,10 +343,14 @@ async function load() {
   const after = JSON.stringify(next);
   // Persist only when migration/pruning removed invalid catalog entries.
   if (before !== after) {
-    if (window.opcaiDesktop) {
-      try { await window.opcaiDesktop.saveModelConfig(next); } catch { /* ignore */ }
-    } else {
-      localStorage.setItem(localKey, after);
+    try {
+      await saveServerModelConfig(next);
+    } catch {
+      if (window.opcaiDesktop) {
+        try { await window.opcaiDesktop.saveModelConfig(next); } catch { /* ignore */ }
+      } else {
+        localStorage.setItem(localKey, after);
+      }
     }
   }
 }
@@ -415,8 +422,12 @@ export function useModelConfig() {
   const save = async (value: ModelSettings) => {
     const plainSettings = sanitizeModelSettings(JSON.parse(JSON.stringify(normalize(value))) as ModelSettings);
     settings.value = plainSettings;
-    if (window.opcaiDesktop) await window.opcaiDesktop.saveModelConfig(plainSettings);
-    else localStorage.setItem(localKey, JSON.stringify(plainSettings));
+    try {
+      await saveServerModelConfig(plainSettings);
+    } catch {
+      if (window.opcaiDesktop) await window.opcaiDesktop.saveModelConfig(plainSettings);
+      else localStorage.setItem(localKey, JSON.stringify(plainSettings));
+    }
   };
 
   const selectChatEndpoint = async (token: string) => {

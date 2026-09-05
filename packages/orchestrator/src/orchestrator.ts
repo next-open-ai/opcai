@@ -18,6 +18,10 @@ export interface OrchestratorOptions {
   contextResolver?: (task: ProjectTask) => ChatRunContext | null | Promise<ChatRunContext | null>;
   /** Fallback chat run-context assembly by employee id (see ChatSessionService). */
   chatContextResolver?: (employeeId: string) => ChatRunContext | null | Promise<ChatRunContext | null>;
+  /** MCP-only backfill for chat when client context omits connectors. */
+  chatMcpConnectionsResolver?: (
+    employeeId: string,
+  ) => ChatRunContext['mcpConnections'] | Promise<ChatRunContext['mcpConnections']>;
 }
 
 /**
@@ -39,7 +43,13 @@ export class Orchestrator {
     this.events = new EventHub<OrcEvent>();
     const runner = options.runner ?? agentCoreRunner;
     this.engine = new RunEngine(this.store, runner, this.events, options.runTimeoutMs ?? 600_000);
-    this.chat = new ChatSessionService({ store: this.store, hub: this.events, engine: this.engine, contextResolver: options.chatContextResolver });
+    this.chat = new ChatSessionService({
+      store: this.store,
+      hub: this.events,
+      engine: this.engine,
+      contextResolver: options.chatContextResolver,
+      mcpConnectionsResolver: options.chatMcpConnectionsResolver,
+    });
     this.projects = new ProjectService({
       store: this.store,
       hub: this.events,

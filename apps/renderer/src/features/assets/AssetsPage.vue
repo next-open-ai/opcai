@@ -12,6 +12,9 @@ import {
 } from '../../app/project-files';
 import type { Conversation } from '../../app/workspace';
 import AssetPreviewPane from './AssetPreviewPane.vue';
+import { listWorkspaceFiles, readArchivedAssetPreview, readWorkspacePreview } from '../../services/api.js';
+import { isDesktopShell } from '../../app/platform.js';
+import { copyableAssetUrl, copyableWorkspaceFileUrl, downloadAssetBestEffort, downloadWorkspaceFileBestEffort, openAssetBestEffort, openWorkspaceFileBestEffort, previewAssetUrl, previewWorkspaceFileUrl, revealAssetBestEffort, revealWorkspaceFileBestEffort } from '../../app/platform-actions.js';
 
 const props = defineProps<{ conversations: Conversation[] }>();
 const emit = defineEmits<{
@@ -22,6 +25,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { assets, loading, loadAssets, linkAssetsToProject, unlinkAssetsFromProject } = useAssets();
 const { projects, load: loadProjects } = useProjects();
+const desktopShell = isDesktopShell();
 
 type LibraryMode = 'projects' | 'archive';
 type ArchiveScope = 'all' | 'unlinked' | string; // string = projectId
@@ -251,10 +255,10 @@ function clearPreview() {
 async function loadProjectTree() {
   const project = selectedProject.value;
   treeEntries.value = [];
-  if (!project?.workspacePath || !window.opcaiDesktop) return;
+  if (!project?.workspacePath) return;
   treeLoading.value = true;
   try {
-    treeEntries.value = await window.opcaiDesktop.listProjectFiles(project.workspacePath);
+    treeEntries.value = await listWorkspaceFiles(project.workspacePath);
   } catch (error) {
     previewError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -273,17 +277,16 @@ async function selectTreeEntry(entry: ProjectFileEntry) {
 async function loadProjectPreview() {
   clearPreview();
   const project = selectedProject.value;
-  if (!project?.workspacePath || !selectedRelative.value || !window.opcaiDesktop) return;
+  if (!project?.workspacePath || !selectedRelative.value) return;
   previewLoading.value = true;
   previewTitle.value = selectedRelative.value;
   previewKind.value = previewKindForName(selectedRelative.value);
   previewMeta.value = [`${project.name} · 本地项目`, project.workspacePath];
   try {
     if (previewKind.value === 'html' || previewKind.value === 'pdf') {
-      const registered = await window.opcaiDesktop.registerPreviewRoot(project.workspacePath);
-      previewHtmlUrl.value = `${registered.origin}/${selectedRelative.value.split('/').map(encodeURIComponent).join('/')}`;
+      previewHtmlUrl.value = await previewWorkspaceFileUrl(project.workspacePath, selectedRelative.value);
     } else {
-      const payload = await window.opcaiDesktop.readProjectPreview(project.workspacePath, selectedRelative.value);
+      const payload = await readWorkspacePreview(project.workspacePath, selectedRelative.value);
       previewMeta.value = [`${project.name} · 本地项目`, formatBytes(payload.bytes)];
       if (previewKind.value === 'image') {
         if (payload.base64) {
@@ -310,7 +313,7 @@ async function loadProjectPreview() {
 async function loadArchivePreview() {
   clearPreview();
   const asset = selectedAsset.value;
-  if (!asset || !window.opcaiDesktop) return;
+  if (!asset) return;
   previewLoading.value = true;
   previewTitle.value = asset.name;
   previewKind.value = previewKindForName(asset.name);
@@ -321,10 +324,9 @@ async function loadArchivePreview() {
   ];
   try {
     if (previewKind.value === 'html' || previewKind.value === 'pdf') {
-      const registered = await window.opcaiDesktop.registerAssetPreviewRoot(asset.id);
-      previewHtmlUrl.value = `${registered.origin}/${encodeURIComponent(asset.name)}`;
+      previewHtmlUrl.value = await previewAssetUrl(asset.id, asset.name);
     } else {
-      const payload = await window.opcaiDesktop.readAssetPreview(asset.id);
+      const payload = await readArchivedAssetPreview(asset.id);
       if (previewKind.value === 'image') {
         if (payload.base64) {
           previewImageUrl.value = `data:${payload.mimeType || imageMime(payload.name)};base64,${payload.base64}`;
@@ -355,27 +357,35 @@ async function refreshCurrent() {
 
 async function revealCurrent() {
   if (mode.value === 'projects' && selectedProject.value?.workspacePath && selectedRelative.value) {
-    await window.opcaiDesktop?.revealProjectFile(selectedProject.value.workspacePath, selectedRelative.value);
+    if (await revealWorkspaceFileBestEffort(selectedProject.value.workspacePath, selectedRelative.value)) return;
+    await copyText('project-link', copyableWorkspaceFileUrl(selectedProject.value.workspacePath, selectedRelative.value));
     return;
   }
-  if (selectedAsset.value) await window.opcaiDesktop?.revealAsset(selectedAsset.value.id);
+  if (selectedAsset.value) {
+    if (await revealAssetBestEffort(selectedAsset.value.id)) return;
+    await copyText('asset-link', copyableAssetUrl(selectedAsset.value.id));
+  }
 }
 
 async function downloadCurrent() {
   if (mode.value === 'archive' && selectedAsset.value) {
-    await window.opcaiDesktop?.saveAsset(selectedAsset.value.id);
+    await downloadAssetBestEffort(selectedAsset.value.id);
     return;
   }
-  await revealCurrent();
+  if (mode.value === 'projects' && selectedProject.value?.workspacePath && selectedRelative.value) {
+    await downloadWorkspaceFileBestEffort(selectedProject.value.workspacePath, selectedRelative.value);
+  }
 }
 
 async function openInBrowser() {
   try {
     if (mode.value === 'projects' && selectedProject.value?.workspacePath && selectedRelative.value) {
-      await window.opcaiDesktop?.openProjectFileInBrowser(selectedProject.value.workspacePath, selectedRelative.value);
+      await openWorkspaceFileBestEffort(selectedProject.value.workspacePath, selectedRelative.value);
       return;
     }
-    if (selectedAsset.value) await window.opcaiDesktop?.openAssetInBrowser(selectedAsset.value.id);
+    if (selectedAsset.value) {
+      await openAssetBestEffort(selectedAsset.value.id);
+    }
   } catch (error) {
     previewError.value = error instanceof Error ? error.message : String(error);
   }
@@ -509,6 +519,7 @@ onMounted(async () => {
         </div>
 
         <AssetPreviewPane
+          :desktop-shell="desktopShell"
           :title="previewTitle"
           :storage-label="t('assets.storageLocal')"
           :meta-lines="previewMeta"
@@ -590,6 +601,7 @@ onMounted(async () => {
         <div class="flex min-h-0 min-w-0 flex-[1.4] flex-col gap-3">
           <AssetPreviewPane
             class="min-h-[280px] flex-1"
+            :desktop-shell="desktopShell"
             :title="previewTitle"
             :storage-label="t('assets.storageLocalArchive')"
             :meta-lines="previewMeta"
@@ -619,7 +631,7 @@ onMounted(async () => {
               <div>
                 <dt class="text-xs text-[var(--muted)]">{{ t('assets.fromConversation') }}</dt>
                 <dd class="font-medium">
-                  <button v-if="selectedAsset.conversationId" class="text-[var(--accent)] hover:underline" type="button" @click="emit('openConversation', selectedAsset.conversationId!)">{{ conversationTitle(selectedAsset.conversationId) || t('assets.unnamedConversation') }}</button>
+                  <button v-if="selectedAsset.conversationId" class="text-[var(--accent)] hover:underline" type="button" @click="selectedAsset.conversationId ? emit('openConversation', selectedAsset.conversationId) : undefined">{{ conversationTitle(selectedAsset.conversationId) || t('assets.unnamedConversation') }}</button>
                   <span v-else>—</span>
                 </dd>
               </div>

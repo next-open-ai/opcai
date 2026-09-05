@@ -1,5 +1,12 @@
 import { ref } from 'vue';
 import { readStored, writeStored } from './storage';
+import {
+  BASELINE_MCPS,
+  MCP_SEED_KEY,
+  shouldProbeBaseline,
+  type BaselineMcpSeed,
+} from './baseline-mcps.js';
+import { getServerMcpConnections, saveServerMcpConnections, testMcpConnection } from '../services/api.js';
 
 export type McpKind = 'remote' | 'local';
 export type McpTransport = 'http' | 'sse' | 'stdio';
@@ -269,18 +276,92 @@ function toRuntime(item: McpConnection) {
 }
 
 export function useMcpConfig() {
-  const load = async () => {
-    if (loaded.value) return;
+  const load = async (options?: { force?: boolean }) => {
+    if (loaded.value && !options?.force && connections.value.length > 0) return;
     try {
-      connections.value = normalizeAll(JSON.parse((await readStored(key)) || '[]'));
+      const stored = window.opcaiDesktop
+        ? JSON.parse((await readStored(key)) || '[]')
+        : await getServerMcpConnections();
+      connections.value = normalizeAll(stored);
     } catch {
-      connections.value = [];
+      if (!loaded.value) connections.value = [];
     }
     loaded.value = true;
+    await ensureBaselineMcps();
   };
 
   const persist = async () => {
-    await writeStored(key, JSON.stringify(connections.value));
+    if (window.opcaiDesktop) await writeStored(key, JSON.stringify(connections.value));
+    else await saveServerMcpConnections(connections.value);
+  };
+
+  /** Idempotent merge of built-in MCP connectors (does not overwrite user edits). */
+  const ensureBaselineMcps = async () => {
+    const seeded = await readStored(MCP_SEED_KEY);
+    let changed = false;
+    for (const seed of BASELINE_MCPS) {
+      const existing = connections.value.find((item) => item.id === seed.id);
+      if (existing) continue;
+      const {
+        requiresCredentials: _requiresCredentials,
+        credentialEnvKeys: _credentialEnvKeys,
+        credentialArgPlaceholders: _credentialArgPlaceholders,
+        ...input
+      } = seed;
+      try {
+        await upsert(input);
+        changed = true;
+      } catch {
+        /* skip invalid seed */
+      }
+    }
+    if (!seeded) await writeStored(MCP_SEED_KEY, 'true');
+    return changed;
+  };
+
+  /**
+   * Probe baseline / never-tested enabled MCPs and persist tools metadata.
+   * Bounded concurrency so first launch does not stampede npx downloads.
+   */
+  const probeStartupMcps = async (options?: { concurrency?: number; timeoutMs?: number }) => {
+    await load();
+    const concurrency = Math.max(1, Math.min(3, options?.concurrency ?? 2));
+    const timeoutMs = options?.timeoutMs ?? 60_000;
+    const seedById = new Map(BASELINE_MCPS.map((item) => [item.id, item] as const));
+    const queue = connections.value.filter((item) => {
+      const seed = seedById.get(item.id);
+      if (seed) return shouldProbeBaseline(seed, item);
+      // Also probe other enabled never-tested connectors once.
+      return item.enabled && item.lastTestStatus !== 'passed';
+    });
+
+    let index = 0;
+    let passed = 0;
+    let failed = 0;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (index < queue.length) {
+        const current = queue[index++];
+        if (!current) break;
+        try {
+          const result = await testMcpConnection(toRuntime({ ...current, enabled: true }), timeoutMs);
+          await recordTestResult(current.id, result);
+          if (result.ok) passed += 1;
+          else failed += 1;
+        } catch (error) {
+          await recordTestResult(current.id, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          failed += 1;
+        }
+      }
+    });
+    await Promise.all(workers);
+    return {
+      total: queue.length,
+      passed,
+      failed,
+    };
   };
 
   const list = () => connections.value;
@@ -418,8 +499,17 @@ export function useMcpConfig() {
   };
 
   const runtimePayload = (ids?: string[]) => {
-    const rows = ids?.length ? byIds(ids) : associable();
-    return rows.map(toRuntime);
+    // Auto-default: useful stdio MCPs, skip heavy browser automation unless explicitly selected.
+    const AUTO_SKIP = new Set(['mcp-baseline-playwright', 'mcp-baseline-chrome-devtools']);
+    const rows = ids?.length
+      ? byIds(ids)
+      : associable().filter((item) => !AUTO_SKIP.has(item.id));
+    const rank = (id: string) => {
+      if (id.includes('stock') || id.includes('akshare')) return 0;
+      if (id.includes('fetch') || id.includes('memory')) return 1;
+      return 2;
+    };
+    return [...rows].sort((a, b) => rank(a.id) - rank(b.id)).slice(0, 8).map(toRuntime);
   };
 
   return {
@@ -435,5 +525,9 @@ export function useMcpConfig() {
     byIds,
     runtimePayload,
     toRuntime,
+    ensureBaselineMcps,
+    probeStartupMcps,
   };
 }
+
+export type { BaselineMcpSeed };
